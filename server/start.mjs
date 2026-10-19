@@ -19,8 +19,13 @@ catch (error) {
 }
 const host=process.env.HOST||'127.0.0.1'; const port=Number(process.env.PORT||4317);
 const loopback=['127.0.0.1','localhost','::1'].includes(host);
-if (!loopback && (!process.env.AVAFEM_SESSION_SECRET || !process.env.AVAFEM_CREDENTIAL_ENCRYPTION_KEY || !process.env.AVAFEM_ADMIN_TOKEN))
-  throw new Error('A network listener requires explicit session/encryption/admin secrets. Use loopback for local development.');
+// A loopback listener behind a public tunnel (PUBLIC_BASE_URL set) is internet-reachable too:
+// do not fall back to the key file that sits beside the database it encrypts.
+const exposed=!loopback || Boolean(process.env.PUBLIC_BASE_URL);
+if (exposed && (!process.env.AVAFEM_SESSION_SECRET || !process.env.AVAFEM_CREDENTIAL_ENCRYPTION_KEY || !process.env.AVAFEM_ADMIN_TOKEN))
+  throw new Error('A network listener or PUBLIC_BASE_URL tunnel requires explicit session/encryption/admin secrets from the environment or a secret manager. Use plain loopback for local development.');
+if (exposed && Buffer.byteLength(process.env.AVAFEM_CREDENTIAL_ENCRYPTION_KEY)<32)
+  throw new Error('AVAFEM_CREDENTIAL_ENCRYPTION_KEY must be at least 32 bytes of random data.');
 const app=await createApp({
   dataDir:resolve(runtime,'postgres'), connectionString:process.env.DATABASE_URL,
   config:{mode:process.env.AVAFEM_MODE||'sandbox',host,port,
