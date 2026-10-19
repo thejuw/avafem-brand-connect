@@ -53,7 +53,43 @@ export function registerPlatformRoutes(app, h) {
 
   registerMoneyRoutes(app, h, admin);
   registerBrandRoutes(app, h, admin);
+  registerCommerceRoutes(app, h, admin, actor);
   for (const extra of h.extra || []) extra(app, h);
+}
+
+function registerCommerceRoutes(app, h, admin, actor) {
+  const { platform, browserRoute, context, brandScope, data } = h;
+  const { subscriptions: subs, shipping, privacy, compliance } = platform;
+  // ---- Phase 4: subscriptions ----
+  app.get('/api/subscriptions', async r => { await admin(r); return data(await subs.list(r.query.shopperId)); });
+  app.post('/api/crm/shoppers/:id/subscriptions', async r => { const ctx = await admin(r); const s = await subs.create(r.params.id, r.body || {}); await platform.auth.audit(ctx, 'subscription.created', s.id); return data(s); });
+  app.post('/api/subscriptions/:id/status', async r => { await admin(r); return data(await subs.setStatus(r.params.id, r.body?.status)); });
+  app.get('/api/subscriptions/:id/runs', async r => { await admin(r); return data(await subs.runs(r.params.id)); });
+  app.post('/api/subscriptions/run', async r => { await admin(r); return data(await subs.runDue()); });
+  // ---- Shipping rules ----
+  app.get('/api/shipping/rules', async r => { await admin(r); return data(await shipping.rule()); });
+  app.put('/api/shipping/rules', async r => { const ctx = await admin(r); const out = await shipping.setRule(r.body || {}); await platform.auth.audit(ctx, 'shipping.rule_updated', 'default'); return data(out); });
+  app.post('/api/shipping/quote', async r => { await admin(r); return data(await shipping.quote(r.body?.items)); });
+  app.post('/api/shipping/orders/:orderId/apply', async r => { await admin(r); return data(await shipping.applyToOrder(r.params.orderId)); });
+  app.get('/api/shipping/subsidies', async r => { await admin(r); return data(await shipping.subsidyReport()); });
+  // ---- Health data / DSAR ----
+  app.get('/api/privacy/shoppers/:id/health-access-log', async r => { await admin(r); return data(await platform.health.accessLog(r.params.id)); });
+  app.post('/api/privacy/shoppers/:id/export', async r => { const ctx = await admin(r); const out = await privacy.export(r.params.id, actor(ctx)); await platform.auth.audit(ctx, 'dsar.export', r.params.id); return data(out); });
+  app.post('/api/privacy/shoppers/:id/delete', async r => { const ctx = await admin(r); const out = await privacy.erase(r.params.id, actor(ctx), r.body || {}); await platform.auth.audit(ctx, 'dsar.delete', r.params.id); return data(out); });
+  app.get('/api/privacy/requests', async r => { await admin(r); return data(await privacy.list(r.query.shopperId)); });
+  // ---- Compliance ----
+  app.post('/api/compliance/check', async r => { await browserRoute(r, 'catalog:read'); const p = r.body || {}; return data(await compliance.check({ title: String(p.title || ''), description: String(p.description || ''), category: String(p.category || ''), evidence: p.evidence || {} })); });
+  app.get('/api/products/:id/compliance', async r => { const ctx = await browserRoute(r, 'catalog:read'); const result = await compliance.check(r.params.id); if (!result || (ctx.brandId && (await platform.db.query('SELECT brand_id FROM products WHERE id=$1', [r.params.id])).rows[0]?.brand_id !== ctx.brandId)) throw Object.assign(new Error('Product not found.'), { statusCode: 404, code: 'NOT_FOUND' }); return data(result); });
+  app.post('/api/products/:id/compliance/override', async r => { const ctx = await admin(r); const out = await compliance.override(r.params.id, r.body?.reason, actor(ctx)); await platform.auth.audit(ctx, 'compliance.override', r.params.id); return data(out); });
+  app.get('/api/compliance/brands/:id', async r => { const ctx = await browserRoute(r, 'catalog:read'); return data(await compliance.scanBrand(brandScope(ctx, r.params.id))); });
+  app.get('/v1/compliance', async r => { const ctx = await context(r, { scope: 'catalog:read' }); return data(await compliance.scanBrand(ctx.brandId)); });
+  // Gate: a listing cannot be approved (go live) while it has blocking compliance findings.
+  app.addHook('preHandler', async request => {
+    if (request.method !== 'POST' || request.routeOptions?.url !== '/api/products/:id/review' || request.body?.decision !== 'approved') return;
+    const ctx = await browserRoute(request); h.requireAdmin(ctx);
+    const result = await compliance.check(request.params.id);
+    if (result && !result.canGoLive) throw Object.assign(new Error(`Compliance review required: ${result.flags.filter(f => f.severity === 'block').map(f => f.code).join(', ')}.`), { statusCode: 409, code: 'COMPLIANCE_BLOCKED' });
+  });
 }
 
 function registerBrandRoutes(app, h, admin) {
@@ -145,6 +181,8 @@ export function platformMcpTools(platform) {
     read('list_placements', 'List your paid placements, sponsored swipe cards and sampling boxes.', {}, () => { need('catalog:read'); return platform.brands.listPlacements(ctx.brandId); });
     write('request_placement', 'Request a paid placement for an approved product. Avafem approves it and issues a billing record.', { kind: zz.enum(['featured_spot', 'sponsored_swipe', 'sampling_box']), productId: zz.string(), units: zz.number().int().optional(), startsAt: zz.string().optional(), endsAt: zz.string().optional() }, 'mcp:request_placement', input => { need('catalog:write'); return platform.brands.requestPlacement(ctx.brandId, input); });
     write('upload_catalog_csv', 'Import catalog rows from CSV (Avafem columns or a Shopify product export). Products enter human review.', { csv: zz.string().min(1).max(3_000_000) }, 'mcp:upload_catalog_csv', input => { need('catalog:write'); return platform.brands.importCsv(ctx.brandId, input.csv); });
+    read('check_product_compliance', 'Screen draft listing text for disease/drug claims, missing supplement disclaimers and restricted ingredients before submitting.', { title: zz.string().max(500), description: zz.string().max(20000).optional(), category: zz.string().max(200).optional(), claims: zz.array(zz.string().max(3000)).max(100).optional(), ingredients: zz.array(zz.string().max(300)).max(300).optional() }, input => { need('catalog:read'); return platform.compliance.check({ title: input.title, description: input.description || '', category: input.category || '', evidence: { claims: (input.claims || []).map(text => ({ text, type: 'structure' })), ingredients_inci: input.ingredients || [] } }); });
+    read('get_compliance_report', 'List your products that are blocked or flagged by the listing compliance check.', {}, () => { need('catalog:read'); return platform.compliance.scanBrand(ctx.brandId); });
     for (const extra of platform.mcpExtras || []) extra({ read, write, ctx, z: zz, need });
   };
 }

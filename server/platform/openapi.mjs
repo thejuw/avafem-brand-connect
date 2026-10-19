@@ -86,6 +86,27 @@ addPaths([
   ['get', '/v1/billing', 'listBillingApi', 'payouts:read'],
   ['post', '/v1/catalog/csv', 'importCatalogCsvApi', 'catalog:write', { type: 'object', required: ['csv'] }],
 ]);
+addPaths([
+  ['get', '/api/subscriptions', 'adminListSubscriptions', 'admin'],
+  ['post', '/api/crm/shoppers/{id}/subscriptions', 'adminCreateSubscription', 'admin', { type: 'object', required: ['items', 'shipTo'] }],
+  ['post', '/api/subscriptions/{id}/status', 'adminSubscriptionStatus', 'admin', { type: 'object', required: ['status'] }],
+  ['get', '/api/subscriptions/{id}/runs', 'adminSubscriptionRuns', 'admin'],
+  ['post', '/api/subscriptions/run', 'adminRunSubscriptions', 'admin'],
+  ['get', '/api/shipping/rules', 'adminShippingRule', 'admin'],
+  ['put', '/api/shipping/rules', 'adminSetShippingRule', 'admin', { type: 'object', required: ['freeThresholdCents'] }],
+  ['post', '/api/shipping/quote', 'adminShippingQuote', 'admin', { type: 'object', required: ['items'] }],
+  ['post', '/api/shipping/orders/{orderId}/apply', 'adminApplyShippingSubsidy', 'admin'],
+  ['get', '/api/shipping/subsidies', 'adminShippingSubsidies', 'admin'],
+  ['get', '/api/privacy/shoppers/{id}/health-access-log', 'adminHealthAccessLog', 'admin'],
+  ['post', '/api/privacy/shoppers/{id}/export', 'adminDsarExport', 'admin'],
+  ['post', '/api/privacy/shoppers/{id}/delete', 'adminDsarDelete', 'admin', { type: 'object', required: ['confirm'], properties: { confirm: { const: 'DELETE' } } }],
+  ['get', '/api/privacy/requests', 'adminPrivacyRequests', 'admin'],
+  ['post', '/api/compliance/check', 'complianceCheck', 'catalog:read', { type: 'object' }],
+  ['get', '/api/products/{id}/compliance', 'productCompliance', 'catalog:read'],
+  ['post', '/api/products/{id}/compliance/override', 'adminComplianceOverride', 'admin', { type: 'object', required: ['reason'] }],
+  ['get', '/api/compliance/brands/{id}', 'brandComplianceReport', 'catalog:read'],
+  ['get', '/v1/compliance', 'brandComplianceApi', 'catalog:read'],
+]);
 export function mergePlatformPaths(doc, operation) {
   for (const [method, path, operationId, scope, body] of PLATFORM_PATHS) {
     const params = [...path.matchAll(/\{(\w+)\}/g)].map(m => ({ name: m[1], in: 'path', required: true, schema: { type: 'string' } }));

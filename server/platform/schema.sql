@@ -71,3 +71,14 @@ CREATE TABLE IF NOT EXISTS billing_records (
   id TEXT PRIMARY KEY, brand_id TEXT NOT NULL, placement_id TEXT NOT NULL UNIQUE REFERENCES placements(id), amount_cents INTEGER NOT NULL CHECK (amount_cents>=0),
   status TEXT NOT NULL CHECK (status IN ('invoiced','paid','void')), method TEXT NOT NULL DEFAULT 'invoice', created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL
 );
+CREATE TABLE IF NOT EXISTS subscriptions (
+  id TEXT PRIMARY KEY, shopper_id TEXT NOT NULL REFERENCES shoppers(id), status TEXT NOT NULL CHECK (status IN ('active','paused','past_due','cancelled')),
+  interval_days INTEGER NOT NULL CHECK (interval_days BETWEEN 7 AND 180), align_to_cycle BOOLEAN NOT NULL DEFAULT FALSE,
+  items JSONB NOT NULL, ship_to_enc TEXT, payment_ref TEXT NOT NULL, provider_ref TEXT NOT NULL, cycle_count INTEGER NOT NULL DEFAULT 0,
+  failures INTEGER NOT NULL DEFAULT 0, last_error TEXT, next_run_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS subscription_runs (id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL, cycle INTEGER NOT NULL, status TEXT NOT NULL, order_id TEXT, charge_ref TEXT, amount_cents INTEGER, error TEXT, created_at TIMESTAMPTZ NOT NULL, UNIQUE(subscription_id,cycle,status));
+CREATE TABLE IF NOT EXISTS shipping_rules (id TEXT PRIMARY KEY, free_threshold_cents INTEGER NOT NULL CHECK (free_threshold_cents>=0), enabled BOOLEAN NOT NULL DEFAULT TRUE, updated_at TIMESTAMPTZ NOT NULL);
+CREATE TABLE IF NOT EXISTS shipping_subsidies (bag_id TEXT PRIMARY KEY, order_id TEXT NOT NULL, brand_id TEXT NOT NULL, shipping_cents INTEGER NOT NULL, funded_from_commission_cents INTEGER NOT NULL, absorbed_cents INTEGER NOT NULL, created_at TIMESTAMPTZ NOT NULL);
+CREATE TABLE IF NOT EXISTS privacy_requests (id TEXT PRIMARY KEY, shopper_id TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('export','delete')), status TEXT NOT NULL, result JSONB, requested_by TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ);
+CREATE TABLE IF NOT EXISTS compliance_overrides (product_id TEXT PRIMARY KEY, reason TEXT NOT NULL, actor TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL);
