@@ -144,7 +144,7 @@ npm start            # http://127.0.0.1:4317 → "Backend & CRM" in the nav
 All platform jobs (bounded health-outbox migration, subscription renewals, Beauty Bank maturity/expiry/reversal, restock reminders,
 alert scan) run in the existing 5 s background worker and on demand via `POST /api/crm/jobs/run`.
 
-## Real PostgreSQL concurrency job (not yet verified)
+## Real PostgreSQL concurrency job
 
 The workflow defines a separate PostgreSQL 17 service job running
 `npm run test:postgres` against independent connection pools and real row locks.
@@ -153,9 +153,10 @@ Without `AVAFEM_TEST_POSTGRES_URL`, those tests are skipped; with
 to a loopback host, the exact `/avafem_concurrency` test database and no input query
 overrides/fragments. Each test creates and removes only its random schema.
 
-Docker was unavailable locally, so **real-PostgreSQL execution/CI success has not
-yet been observed**. Do not treat passing PGlite tests or a skipped PG file as a
-PostgreSQL pass. See [the runbook](admin-recovery.md#validation-and-real-postgresql-ci)
+At code commit `5e1f2ce`, [the PostgreSQL CI job](https://github.com/thejuw/avafem-brand-connect/actions/runs/39325993741/job/118311870152)
+passed **5/5 with zero skips**, including two-worker void→retry authorization
+consumption. Providers remain mocked. Docker was unavailable locally; the real-server
+result comes from CI, not a PGlite run or skipped file. See [the runbook](admin-recovery.md#validation-and-real-postgresql-ci)
 for the dedicated test command and restrictions.
 
 ## Needs live credentials / production work (not done here)

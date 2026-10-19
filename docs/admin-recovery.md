@@ -1,7 +1,7 @@
 # Admin recovery runbook
 
 This is a **sandbox operator runbook, not production or provider certification**.
-Open **Backend & CRM → Recovery desk** in the operations workspace. Brand sessions
+Open **Backend & CRM → Admin recovery → Recovery desk** in the operations workspace. Brand sessions
 and brand bearer/MCP credentials cannot use these recovery tools. Mutations require
 the authenticated admin session and CSRF protection; the server supplies the actor.
 
@@ -195,12 +195,21 @@ npm run check
 npm run build
 ```
 
+At code commit `5e1f2ce`, the complete local suite passed **711 tests, zero failures**
+in 278,704.536 ms, with five PostgreSQL cases explicitly skipped locally. Syntax
+checks and the frontend build passed. A separate synthetic browser check confirmed
+cancellation preserves an unknown-payment review hold and brand sessions cannot see
+the admin desk. Focused reruns are not additional tests to add to the full-suite count.
+
 `.github/workflows/test.yml` also defines a PostgreSQL 17 service job, Node 24 and
 `npm run test:postgres`. It exercises independent pools and real row locks for
-connector dispatch, renewal claims, credit expiry and lost-dispute/release races.
-**Docker was unavailable locally; this real-PostgreSQL job has not yet been observed
-running/passing.** The normal suite skips these tests without the dedicated URL;
-that skip is not a PostgreSQL pass.
+connector dispatch, renewal claims, credit expiry, lost-dispute/release races and
+two-worker consumption of a verified void→retry grant. At code commit `5e1f2ce`,
+[the real PostgreSQL job](https://github.com/thejuw/avafem-brand-connect/actions/runs/39325993741/job/118311870152)
+passed **5/5, zero failures and zero skips**, in 2,169.992 ms. Provider transports
+remained mocked; this is database-concurrency evidence, not real-provider acceptance.
+Docker was unavailable locally, so this real-server result comes from CI. The normal
+suite skips these tests without the dedicated URL; that skip is not a PostgreSQL pass.
 
 For an already provisioned disposable local test database matching the CI service:
 
