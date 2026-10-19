@@ -14,7 +14,9 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The expanded isolated suite reported 804 passes on the hosted runner at
+    # the old 20-minute cutoff, leaving no time for cleanup and the build.
+    timeout-minutes: 30
     steps:
       - name: Check out source without persisting credentials
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # verified v6
