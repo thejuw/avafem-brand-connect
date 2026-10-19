@@ -31,6 +31,22 @@ export async function createAuth(db, { sessionSecret, encryptionKey, issuer = 'a
     resource_id TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
   )`;
   for (const statement of schema.split(';').filter(part => part.trim())) await db.query(statement);
+  // Preserve older opaque invitation rows. Domain-separated opaque IDs permit
+  // revocation/history without exposing either bearer tokens or their hashes.
+  await db.transaction(async tx => {
+    await tx.query('ALTER TABLE brand_invites ADD COLUMN IF NOT EXISTS id TEXT');
+    await tx.query('ALTER TABLE brand_invites ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ');
+    while (true) {
+      const legacy = (await tx.query('SELECT token_hash FROM brand_invites WHERE id IS NULL LIMIT 100 FOR UPDATE')).rows;
+      if (!legacy.length) break;
+      for (const row of legacy) {
+        const opaque = createHmac('sha256', sessionSecret).update('avafem:legacy-invite-id:v1\0').update(issuer).update('\0').update(row.token_hash).digest('base64url');
+        await tx.query('UPDATE brand_invites SET id=$1 WHERE token_hash=$2 AND id IS NULL', [`invite_legacy_${opaque}`, row.token_hash]);
+      }
+    }
+    await tx.query('CREATE UNIQUE INDEX IF NOT EXISTS brand_invites_id_unique ON brand_invites(id)');
+    await tx.query('ALTER TABLE brand_invites ALTER COLUMN id SET NOT NULL');
+  });
   const now = () => clock().getTime();
   const encode = object => Buffer.from(JSON.stringify(object)).toString('base64url');
   const sign = body => createHmac('sha256', sessionSecret).update(body).digest('base64url');
@@ -118,23 +134,83 @@ export async function createAuth(db, { sessionSecret, encryptionKey, issuer = 'a
     await db.query('UPDATE api_credentials SET last_used_at=$1 WHERE id=$2', [new Date(now()), row.id]);
     return { brandId: row.brand_id, credentialId: row.id, role: 'brand', scopes, bearer: true };
   }
+  const inviteError = () => fail(401, 'INVITE_EXPIRED', 'This invitation is invalid, expired, revoked or already used.');
+  const validInviteBrand = value => typeof value === 'string' && value.length > 0 && value.length <= 100 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value);
+  const inviteSignature = (body, brandId) => createHmac('sha256', sessionSecret)
+    .update('avafem:brand-invite:v2\0').update(issuer).update('\0').update(brandId).update('\0').update(body).digest('base64url');
+  function inviteClaims(token) {
+    if (typeof token !== 'string' || token.length > 100) throw inviteError();
+    if (!token.startsWith('avfi2.')) {
+      // Existing invitations were exactly 32 random bytes encoded base64url.
+      // They remain usable only while their exact persisted hash is active.
+      if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw inviteError();
+      return null;
+    }
+    const parts = token.split('.');
+    if (parts.length !== 4 || !/^[A-Za-z0-9_-]{32}$/.test(parts[1]) || !/^[0-9a-z]{1,10}$/.test(parts[2]) || !/^[A-Za-z0-9_-]{43}$/.test(parts[3])) throw inviteError();
+    const expires = Number.parseInt(parts[2], 36);
+    if (!Number.isSafeInteger(expires) || expires.toString(36) !== parts[2] || expires * 1000 <= now()) throw inviteError();
+    return { id: `invite_${parts[1]}`, expiresAt: expires * 1000, body: parts.slice(0, 3).join('.'), signature: parts[3] };
+  }
+  function checkInvite(invite, claims) {
+    const expires = new Date(invite?.expires_at).getTime();
+    if (!invite || invite.consumed_at || invite.revoked_at || !Number.isFinite(expires) || expires <= now()
+      || (claims && (invite.id !== claims.id || expires !== claims.expiresAt || !validInviteBrand(invite.brand_id)
+        || !same(inviteSignature(claims.body, invite.brand_id), claims.signature)))) throw inviteError();
+    return invite;
+  }
+  function newInvite(brandId) {
+    if (!validInviteBrand(brandId)) throw fail(422, 'INVALID_BRAND', 'A valid brand identity is required.');
+    const nonce = random(24), expires = Math.floor(now() / 1000) + 48 * 3600;
+    const body = `avfi2.${nonce}.${expires.toString(36)}`;
+    return { id: `invite_${nonce}`, token: `${body}.${inviteSignature(body, brandId)}`, brandId, expiresAt: new Date(expires * 1000) };
+  }
+  const insertInvite = (tx, invite) => tx.query('INSERT INTO brand_invites(id,token_hash,brand_id,expires_at) VALUES($1,$2,$3,$4)',
+    [invite.id, hash(invite.token), invite.brandId, invite.expiresAt]);
   async function createInvite(brandId) {
-    const token = random(); const expiresAt = new Date(now() + 48 * 3600_000);
-    await db.query('INSERT INTO brand_invites(token_hash,brand_id,expires_at) VALUES($1,$2,$3)', [hash(token), brandId, expiresAt]);
-    return { token, brandId, expiresAt };
+    const invite = newInvite(brandId);
+    await insertInvite(db, invite);
+    return invite;
   }
   async function lookupInvite(token) {
-    const invite = (await db.query('SELECT brand_id,expires_at FROM brand_invites WHERE token_hash=$1 AND consumed_at IS NULL AND expires_at>$2', [hash(token), new Date(now())])).rows[0];
-    if (!invite) throw fail(401, 'INVITE_EXPIRED', 'This invitation has expired or has already been used.');
-    return { brandId: invite.brand_id, expiresAt: invite.expires_at };
+    const claims = inviteClaims(token);
+    return db.transaction(async tx => {
+      const invite = checkInvite((await tx.query('SELECT * FROM brand_invites WHERE token_hash=$1 FOR UPDATE', [hash(token)])).rows[0], claims);
+      return { id: invite.id, brandId: invite.brand_id, expiresAt: invite.expires_at };
+    });
   }
   async function consumeInvite(token, acceptedTermsVersion) {
+    const claims = inviteClaims(token);
     return db.transaction(async tx => {
-      const { rows } = await tx.query('SELECT * FROM brand_invites WHERE token_hash=$1 FOR UPDATE', [hash(token)]);
-      const invite = rows[0];
-      if (!invite || invite.consumed_at || new Date(invite.expires_at).getTime() <= now()) throw fail(401, 'INVITE_EXPIRED', 'This invitation has expired or has already been used.');
-      await tx.query('UPDATE brand_invites SET consumed_at=$1,accepted_terms_version=$2 WHERE token_hash=$3', [new Date(now()), acceptedTermsVersion, hash(token)]);
-      return { brandId: invite.brand_id };
+      const invite = checkInvite((await tx.query('SELECT * FROM brand_invites WHERE token_hash=$1 FOR UPDATE', [hash(token)])).rows[0], claims);
+      await tx.query('UPDATE brand_invites SET consumed_at=$1,accepted_terms_version=$2 WHERE id=$3', [new Date(now()), acceptedTermsVersion, invite.id]);
+      return { id: invite.id, brandId: invite.brand_id };
+    });
+  }
+  async function listInvites(brandId) {
+    const invites = (await db.query('SELECT id,brand_id,expires_at,consumed_at,revoked_at FROM brand_invites WHERE brand_id=$1 ORDER BY expires_at DESC,id LIMIT 100', [brandId])).rows;
+    return invites.map(invite => ({ id: invite.id, brandId: invite.brand_id, expiresAt: invite.expires_at, consumedAt: invite.consumed_at,
+      revokedAt: invite.revoked_at, status: invite.consumed_at ? 'consumed' : invite.revoked_at ? 'revoked' : new Date(invite.expires_at).getTime() <= now() ? 'expired' : 'pending' }));
+  }
+  async function revokeInvite(brandId, inviteId) {
+    return db.transaction(async tx => {
+      const invite = (await tx.query('SELECT * FROM brand_invites WHERE brand_id=$1 AND id=$2 FOR UPDATE', [brandId, inviteId])).rows[0];
+      if (!invite) throw fail(404, 'NOT_FOUND', 'Invitation not found.');
+      if (invite.consumed_at) throw fail(409, 'INVITE_ALREADY_USED', 'This invitation was already accepted; revoking an invitation does not end an existing session.');
+      if (!invite.revoked_at) await tx.query('UPDATE brand_invites SET revoked_at=$1 WHERE id=$2', [new Date(now()), invite.id]);
+      return { id: invite.id, brandId, revoked: true, replayed: Boolean(invite.revoked_at) };
+    });
+  }
+  async function replaceInvite(brandId, inviteId) {
+    return db.transaction(async tx => {
+      const previous = (await tx.query('SELECT * FROM brand_invites WHERE brand_id=$1 AND id=$2 FOR UPDATE', [brandId, inviteId])).rows[0];
+      if (!previous) throw fail(404, 'NOT_FOUND', 'Invitation not found.');
+      if (previous.consumed_at) throw fail(409, 'INVITE_ALREADY_USED', 'An accepted invitation cannot be resent.');
+      if (previous.revoked_at) throw fail(409, 'INVITE_REVOKED', 'This invitation was already revoked or replaced; use the recorded replacement rather than issuing another.');
+      const replacement = newInvite(brandId);
+      await tx.query('UPDATE brand_invites SET revoked_at=$1 WHERE id=$2', [new Date(now()), previous.id]);
+      await insertInvite(tx, replacement);
+      return replacement;
     });
   }
   async function rateLimit(brandId) {
@@ -184,7 +260,7 @@ export async function createAuth(db, { sessionSecret, encryptionKey, issuer = 'a
     if (!changed) break;
   }
   return { createSession, resolveSession, switchBrand, createCredential, listCredentials, revokeCredential,
-    issueToken, resolveBearer, createInvite, lookupInvite, consumeInvite, rateLimit, idempotent, audit, encrypt, decrypt };
+    issueToken, resolveBearer, createInvite, lookupInvite, consumeInvite, listInvites, revokeInvite, replaceInvite, rateLimit, idempotent, audit, encrypt, decrypt };
 }
 
 export function requireScope(context, scope) {

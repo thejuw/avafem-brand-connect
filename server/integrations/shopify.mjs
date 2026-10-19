@@ -333,6 +333,14 @@ export function createShopifyAdapter(config = {}) {
     return { products, pageInfo: data.products.pageInfo, shop, warnings: products.filter(p => p.variantsPageInfo?.hasNextPage).map(p => ({ productId: p.id, code: 'VARIANT_PAGINATION_REQUIRED', message: 'Additional variants remain; import this product only after fetching all variant pages.' })) };
   }
 
+  async function getStoreProfile() {
+    // Existing approved scopes only. In particular, do not request/read legal
+    // policies or branding fields that require additional merchant permissions.
+    const data=await graphql('query AvafemStoreProfile { shop { name contactEmail myshopifyDomain currencyCode } }');
+    if(data.shop?.myshopifyDomain!==shop || data.shop?.currencyCode!=='USD')throw new IntegrationError('The store profile identity or currency is invalid.',{code:'SHOPIFY_SHOP_MISMATCH',statusCode:409});
+    return {name:data.shop.name,contactEmail:data.shop.contactEmail,unavailableFields:['logoUrl','returnPolicy']};
+  }
+
   /** Complete children for one bounded product page; callers must also exhaust
    * the outer product connection before inferring deletion. read_products only.
    * Images remain the existing adapter's ImageConnection (deprecated but present
@@ -850,7 +858,7 @@ export function createShopifyAdapter(config = {}) {
     return results;
   }
 
-  return { provider: 'shopify', shop, apiVersion, status, preflight, fixtureGraphql, failureFixtureGraphql, listProducts, listCompleteProducts, getVariant, getOrderDetails, createOrder, findOrder, getFulfillments, getOrderOperations, getSuggestedRefund, createPartialFulfillment, updateTracking, createTestDeliveryEvent, createManualRefund, cancelOrder, getJob, verifyWebhook, registerWebhooks };
+  return { provider: 'shopify', shop, apiVersion, status, preflight,getStoreProfile, fixtureGraphql, failureFixtureGraphql, listProducts, listCompleteProducts, getVariant, getOrderDetails, createOrder, findOrder, getFulfillments, getOrderOperations, getSuggestedRefund, createPartialFulfillment, updateTracking, createTestDeliveryEvent, createManualRefund, cancelOrder, getJob, verifyWebhook, registerWebhooks };
 }
 
 /**

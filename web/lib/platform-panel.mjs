@@ -1,5 +1,8 @@
 export const PLATFORM_SECTIONS = [
   {id:'recovery',label:'Admin recovery',path:'/api/admin/recovery',adminOnly:true},
+  {id:'curation',label:'Product curation',path:'/api/admin/curation',adminOnly:true},
+  {id:'invites',label:'Brand invites',path:'/api/brands',adminOnly:true},
+  {id:'onboarding',label:'Connect your brand',path:'/api/onboarding/session'},
   { id: 'shoppers', label: 'Shoppers', path: '/api/crm/shoppers', adminOnly: true, note: 'Masked list. Open a profile via the API; health data needs consent and every read is audited.' },
   { id: 'segments', label: 'Segments', path: '/api/crm/segments', adminOnly: true },
   { id: 'campaigns', label: 'Campaigns', path: '/api/crm/campaigns', adminOnly: true, actions: [{ label: 'Run scheduled flows', path: '/api/crm/jobs/run' }] },

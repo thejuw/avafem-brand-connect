@@ -1,3 +1,19 @@
+CREATE TABLE IF NOT EXISTS curation_audit (
+  id TEXT PRIMARY KEY,operation_id TEXT,brand_id TEXT NOT NULL REFERENCES brands(id),product_id TEXT,
+  actor TEXT NOT NULL,action TEXT NOT NULL,reason TEXT NOT NULL,fingerprint TEXT,payload JSONB NOT NULL DEFAULT '{}',created_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS curation_audit_brand ON curation_audit(brand_id,created_at,id);
+CREATE TABLE IF NOT EXISTS curation_operations (
+  operation_id TEXT PRIMARY KEY,request_hash TEXT NOT NULL,response JSONB NOT NULL,created_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS onboarding_operations (
+  brand_id TEXT NOT NULL REFERENCES brands(id),operation_id TEXT NOT NULL,kind TEXT NOT NULL,state TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,updated_at TIMESTAMPTZ NOT NULL,PRIMARY KEY(brand_id,operation_id)
+);
+CREATE TABLE IF NOT EXISTS brand_invite_deliveries (
+  id TEXT PRIMARY KEY,brand_id TEXT NOT NULL REFERENCES brands(id),invite_id TEXT NOT NULL,operation_id TEXT NOT NULL UNIQUE,
+  request_hash TEXT NOT NULL,state TEXT NOT NULL,provider_id TEXT,error_code TEXT,created_at TIMESTAMPTZ NOT NULL,updated_at TIMESTAMPTZ NOT NULL
+);
 CREATE TABLE IF NOT EXISTS shoppers (
   id TEXT PRIMARY KEY, email_hash TEXT UNIQUE, email_enc TEXT, profile_enc TEXT,
   consent JSONB NOT NULL DEFAULT '{"email":false,"sms":false,"marketing":false,"health":false}',

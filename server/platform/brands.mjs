@@ -130,21 +130,68 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
       fail('Connector order creation is not verified. Review the provider using this Bag ID; do not resend the order.', 502, 'CONNECTOR_OUTCOME_UNCERTAIN');
     }
   }
-  async function upsertRows(brandId, list, source) {
-    const errors = []; let accepted = 0;
+  async function assertCatalogLease(tx,brandId,lease) {
+    await tx.query('SELECT id FROM brands WHERE id=$1 FOR UPDATE',[brandId]);
+    const brand=await first(tx,'SELECT onboarding_state,status FROM brands WHERE id=$1',[brandId]),current=brand?.onboardingState?.catalogLease;
+    if(!lease || current?.token!==lease.token || current.provider!==lease.provider || current.catalogKey!==lease.catalogKey || !current.expiresAt || new Date(current.expiresAt)<=wall())
+      fail('The catalog import lease expired or was replaced; refresh the source snapshot.',409,'CATALOG_IMPORT_STALE');
+    if(brand.onboardingState?.platform && (['paused','disconnected'].includes(brand.status) || !brand.onboardingState.connected || brand.onboardingState.platform!==lease.provider))
+      fail('The selected store changed while its catalog was loading.',409,'STORE_CONNECTION_CHANGED');
+  }
+  async function withCatalogSnapshot(brandId,provider,catalogKey,fetchRows,options={}) {
+    if(!['shopify','woocommerce','bigcommerce','csv','feed'].includes(provider) || typeof catalogKey!=='string' || !catalogKey || catalogKey.length>500 || typeof fetchRows!=='function') fail('Use a bounded server-owned catalog source.');
+    const lease={token:id('catalog'),provider,catalogKey,expiresAt:new Date(wall().getTime()+5*60_000).toISOString()};
+    await db.transaction(async tx=>{
+      await tx.query('SELECT id FROM brands WHERE id=$1 FOR UPDATE',[brandId]);
+      const brand=await first(tx,'SELECT onboarding_state FROM brands WHERE id=$1',[brandId]);if(!brand)fail('Brand not found.',404,'NOT_FOUND');
+      const previous=brand.onboardingState?.catalogLease;
+      if(previous?.token && new Date(previous.expiresAt)>wall())fail('A catalog import is already reading or applying this brand’s snapshot.',409,'CATALOG_IMPORT_BUSY');
+      await tx.query('UPDATE brands SET onboarding_state=onboarding_state||$2::jsonb WHERE id=$1',[brandId,JSON.stringify({catalogLease:lease})]);
+    });
+    try {
+      const list=await fetchRows();
+      return await upsertRows(brandId,list,provider,catalogKey,{complete:options.complete===true || (options.complete===undefined && list?.complete===true),lease});
+    } finally {
+      await db.transaction(async tx=>{
+        await tx.query('SELECT id FROM brands WHERE id=$1 FOR UPDATE',[brandId]);
+        const brand=await first(tx,'SELECT onboarding_state FROM brands WHERE id=$1',[brandId]);
+        if(brand?.onboardingState?.catalogLease?.token===lease.token) await tx.query("UPDATE brands SET onboarding_state=onboarding_state-'catalogLease' WHERE id=$1",[brandId]);
+      });
+    }
+  }
+  async function upsertRows(brandId, list, source, catalogKey, { complete = false,lease } = {}) {
+    if (!Array.isArray(list) || list.length > 5000 || !['shopify','woocommerce','bigcommerce','csv','feed'].includes(source) || !text(catalogKey,500)) fail('A bounded server-owned catalog snapshot is required.',422,'INVALID_IMPORT');
+    const identities = list.map(row => String(row.externalId || row.source?.productId || (source==='csv' ? row.sku : '') || ''));
+    const nonemptyIds=identities.filter(Boolean),nonemptySkus=list.map(row=>row.sku).filter(Boolean);
+    if (identities.some(value=>(!value && source!=='csv') || value.length>200) || new Set(nonemptyIds).size!==nonemptyIds.length || new Set(nonemptySkus).size!==nonemptySkus.length)
+      fail('Catalog source IDs and SKUs must be present and unique.',422,'CATALOG_IDENTITY_INVALID');
+    const errors = [],acceptedProductIds=[],acceptedProducts=[]; let accepted = 0;
     for (const [index, row] of list.entries()) {
       try {
         if (!row.sku) fail('SKU is required.');
-        await domain.upsertProduct(brandId, row.sku, { title: row.title, description: row.description, category: row.category, priceCents: row.priceCents,
-          inventoryQty: row.inventoryQty, images: row.images, ...(row.taxCode ? { taxCode: row.taxCode } : {}) });
-        accepted++;
+        const input = Object.fromEntries(['title','description','category','priceCents','inventoryQty','images','variants','evidence','taxCode','shippingProfile','productType','tags','collections']
+          .filter(key=>row[key]!==undefined && (key!=='taxCode' || row[key])).map(key=>[key,row[key]]));
+        const imported=await domain.upsertProduct(brandId, row.sku, input, { source: { provider:source,catalogKey,productId:identities[index],
+          active:row.sourceActive!==false && (!row.sourceStatus || row.sourceStatus==='ACTIVE') },beforeUpsert:tx=>assertCatalogLease(tx,brandId,lease) });
+        accepted++;acceptedProductIds.push(imported.id);acceptedProducts.push({id:imported.id,fingerprint:imported.reviewFingerprint});
       } catch (error) { errors.push({ row: index + 1, sku: text(row.sku, 120), message: text(error.message, 300) }); }
     }
-    const result = { source, total: list.length, accepted, errors, at: now().toISOString() };
+    let delisted = 0;
+    if (complete===true && !errors.length) delisted=await db.transaction(async tx=>{
+      await assertCatalogLease(tx,brandId,lease);
+      const absent=await rows(tx,`SELECT id,sku FROM products WHERE brand_id=$1 AND source_provider=$2 AND source_catalog_key=$3
+        AND NOT(source_product_id=ANY($4::text[])) AND source_deleted_at IS NULL FOR UPDATE`,[brandId,source,catalogKey,identities]);
+      for(const p of absent) {
+        await tx.query("UPDATE products SET source_deleted_at=$2,status='draft',review_note='Removed from the complete source catalog.',updated_at=$2 WHERE id=$1",[p.id,now()]);
+        await tx.query(`INSERT INTO outbox_events(id,type,aggregate_id,brand_id,payload,created_at,available_at) VALUES($1,'product.delisted',$2,$3,$4,$5,$5)`,[id('evt'),p.id,brandId,JSON.stringify({productId:p.id,sku:p.sku,source,reason:'complete_source_snapshot'}),now()]);
+      }
+      return absent.length;
+    });
+    const result = { source, total: list.length, accepted, acceptedProductIds, acceptedProducts, errors, complete:complete===true && !errors.length, delisted, at: now().toISOString() };
     if (compliance) result.compliance = await compliance.scanBrand(brandId);
     return result;
   }
-  const side = {
+    const side = {
     fetch, resolve,
     // ---------- portal ----------
     async signup(input = {}) {
@@ -171,7 +218,9 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
       return side.status(brandId);
     },
     async stripeLink(brandId) {
-      await domain.getBrand(brandId);
+      const brand=await domain.getBrand(brandId);
+      if(brand.onboardingMode==='two_step' || brand.onboardingState?.platform || brand.onboardingState?.connected)
+        fail('Use the configured onboarding payout flow for this brand.',409,'USE_ONBOARDING_PAYOUT_FLOW');
       const app = await application(brandId);
       const account = app?.steps?.stripePendingAccount || `acct_sandbox_${randomBytes(8).toString('hex')}`;
       if (app) await setStep(brandId, 'stripePendingAccount', account);
@@ -179,6 +228,9 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
       return { account, url: `https://connect.stripe.com/setup/e/${account}/simulated`, type: 'account_onboarding', simulated: true, expiresAt: new Date(now().getTime() + 300_000).toISOString() };
     },
     async stripeReturn(brandId) {
+      const brand=await domain.getBrand(brandId);
+      if(brand.onboardingMode==='two_step' || brand.onboardingState?.platform || brand.onboardingState?.connected)
+        fail('Use the configured onboarding payout flow for this brand.',409,'USE_ONBOARDING_PAYOUT_FLOW');
       const app = await application(brandId); const account = app?.steps?.stripePendingAccount;
       if (!account) fail('Start Stripe onboarding first.', 409, 'STRIPE_LINK_REQUIRED');
       // Mocked account.updated webhook: charges and payouts enabled.
@@ -186,8 +238,10 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
       await setStep(brandId, 'stripe', now().toISOString());
       return side.status(brandId);
     },
-    async connect(brandId, platform, credentials = {}) {
+    async connect(brandId, platform, credentials = {}, {onboardingFlow=false} = {}) {
       const brand = await domain.getBrand(brandId);
+      if(!onboardingFlow && (brand.onboardingMode==='two_step' || brand.onboardingState?.platform || brand.onboardingState?.connected))
+        fail('Use the two-step onboarding connection flow for this brand.',409,'USE_ONBOARDING_CONNECT_FLOW');
       if (platform === 'shopify') return { platform, next: { method: 'POST', path: `/api/brands/${brandId}/shopify/authorize` }, message: 'Shopify uses the OAuth install flow.' };
       if (platform === 'csv') {
         await db.query(`INSERT INTO brand_connectors(brand_id,platform,store_ref,created_at) VALUES($1,'csv','csv-upload',$2) ON CONFLICT(brand_id,platform) DO UPDATE SET status='connected'`, [brandId, now()]);
@@ -204,6 +258,17 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
       return { platform, connected: true, storeRef: platform === 'csv' ? 'csv-upload' : (await first(db, 'SELECT store_ref FROM brand_connectors WHERE brand_id=$1 AND platform=$2', [brandId, platform])).storeRef };
     },
     async connectors(brandId) { return rows(db, 'SELECT brand_id,platform,store_ref,status,last_sync_at,last_result,created_at FROM brand_connectors WHERE brand_id=$1 ORDER BY platform', [brandId]); },
+    async connectedProfile(brandId, platform) {
+      const c=await first(db,"SELECT * FROM brand_connectors WHERE brand_id=$1 AND platform=$2 AND status='connected'",[brandId,platform]);
+      if(!c || !adapters[platform]?.profile) fail('This connected store cannot provide authenticated profile metadata.',409,'PROFILE_CAPABILITY_UNAVAILABLE');
+      return adapters[platform].profile(creds.decrypt(c.credentialsEnc));
+    },
+    // Server-only boundary. Native callers must finish validating/paginating the
+    // authenticated source before passing its rows; no HTTP endpoint accepts rows.
+    async importConnectedSnapshot(brandId, provider, catalogKey, list, options = {}) {
+      return withCatalogSnapshot(brandId,provider,catalogKey,async()=>list,options);
+    },
+    withCatalogSnapshot,
     async disconnect(brandId, platform) {
       const brand = await domain.getBrand(brandId);
       const connector = await first(db, 'SELECT platform FROM brand_connectors WHERE brand_id=$1 AND platform=$2', [brandId, platform]);
@@ -212,17 +277,19 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
       // listings on disconnect; another connector is not an automatic fallback.
       if (brand.connectionTier === platform || (platform === 'csv' && brand.connectionTier === 'dashboard'))
         await domain.updateBrand(brandId, { connectionHealthy: false, status: 'disconnected' });
+      if(brand.onboardingMode==='two_step' || brand.onboardingState?.platform) await db.query("UPDATE brands SET onboarding_state=onboarding_state||$2::jsonb WHERE id=$1",[brandId,JSON.stringify({connected:false,catalogImportComplete:false,profileVerified:false})]);
       const r = await db.query("UPDATE brand_connectors SET status='disconnected',credentials_enc=NULL WHERE brand_id=$1 AND platform=$2 RETURNING platform", [brandId, platform]);
       if (!r.rows.length) fail('Connector not found.', 404, 'NOT_FOUND');
       return { platform, disconnected: true };
     },
     async sync(brandId, platform) {
+      const brand=await domain.getBrand(brandId);
+      if(brand.onboardingState?.platform && (brand.onboardingState.platform!==platform || brand.connectionTier!==platform)) fail('Only the selected onboarding store can refresh this catalog.',409,'STORE_PLATFORM_MISMATCH');
       const c = await first(db, "SELECT * FROM brand_connectors WHERE brand_id=$1 AND platform=$2 AND status='connected'", [brandId, platform]);
       if (!c || !adapters[platform]) fail('No connected store for that platform.', 404, 'NOT_FOUND');
-      let list;
-      try { list = await adapters[platform].listProducts(creds.decrypt(c.credentialsEnc)); }
+      let result;
+      try { result=await withCatalogSnapshot(brandId,platform,targetFor(platform,creds.decrypt(c.credentialsEnc)),()=>adapters[platform].listProducts(creds.decrypt(c.credentialsEnc))); }
       catch (error) { await db.query("UPDATE brand_connectors SET last_result=$3 WHERE brand_id=$1 AND platform=$2", [brandId, platform, JSON.stringify({ error: error.code || 'CONNECTOR_ERROR' })]); throw error; }
-      const result = await upsertRows(brandId, list, platform);
       await db.query('UPDATE brand_connectors SET last_sync_at=$3,last_result=$4 WHERE brand_id=$1 AND platform=$2', [brandId, platform, now(), JSON.stringify({ total: result.total, accepted: result.accepted, errors: result.errors.length })]);
       await setStep(brandId, 'catalogSubmitted', now().toISOString());
       return result;
@@ -231,7 +298,9 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
       if (typeof csv !== 'string' || !csv.trim() || csv.length > 3_000_000) fail('Provide CSV text up to 3 MB.', 422, 'INVALID_IMPORT');
       await domain.getBrand(brandId);
       let list; try { list = csvRows(csvParse, csv); } catch (error) { if (error.statusCode) throw error; fail('CSV could not be parsed.', 422, 'INVALID_CSV'); }
-      const result = await upsertRows(brandId, list, 'csv');
+      const brand=await domain.getBrand(brandId);
+      if(brand.onboardingState?.platform && brand.onboardingState.platform!=='csv')fail('Use the selected store connector to refresh its catalog.',409,'STORE_PLATFORM_MISMATCH');
+      const result = await withCatalogSnapshot(brandId,'csv',`csv:${brandId}`,async()=>list,{complete:false});
       if (await application(brandId)) await setStep(brandId, 'catalogSubmitted', now().toISOString());
       return result;
     },
@@ -425,14 +494,16 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
         onboardingRequirements: brand.onboardingRequirements, selfServe: Boolean(app) };
     },
     async reviewQueue() {
-      const list = await rows(db, "SELECT id,brand_id,sku,title,status,validation_issues,evidence,description,category,updated_at FROM products WHERE status IN ('in_review','draft') ORDER BY updated_at");
+      const list = await rows(db, "SELECT * FROM products WHERE status IN ('in_review','draft') ORDER BY updated_at");
       return Promise.all(list.map(async p => ({ id: p.id, brandId: p.brandId, sku: p.sku, title: p.title, status: p.status, validationIssues: p.validationIssues,
         compliance: compliance ? await compliance.check(p) : null, updatedAt: p.updatedAt })));
     },
-    async activate(brandId) {
+    async activate(brandId, {twoStep=false,actor='system:onboarding'} = {}) {
+      if(twoStep) { await domain.activateConnectedBrand(brandId,{actor}); return side.status(brandId); }
       const status = await side.status(brandId);
       if (!status.steps.find(step => step.key === 'store_connection')?.done) fail('Onboarding incomplete: Store connection.', 409, 'ONBOARDING_INCOMPLETE');
       if (status.onboardingRequirements.length) fail(`Onboarding incomplete: ${status.onboardingRequirements.join('; ')}.`, 409, 'ONBOARDING_INCOMPLETE');
+      if(status.steps.some(step=>['stripe_express','profile','catalog_approved'].includes(step.key) && !step.done)) fail('Legacy activation requires the full payout, profile and approved-product checklist.',409,'ONBOARDING_INCOMPLETE');
       await domain.updateBrand(brandId, { status: 'live' });
       if (await application(brandId)) await setStep(brandId, 'live', now().toISOString());
       return side.status(brandId);
@@ -468,9 +539,9 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
     // ---------- paid placements ----------
     async requestPlacement(brandId, input = {}) {
       const kind = Object.hasOwn(PLACEMENT_PRICING, input.kind) ? input.kind : fail('kind must be featured_spot, sponsored_swipe or sampling_box.');
-      const product = await first(db, "SELECT id,status FROM products WHERE id=$1 AND brand_id=$2", [input.productId, brandId]);
+      const product = await first(db, "SELECT id,status,source_deleted_at FROM products WHERE id=$1 AND brand_id=$2", [input.productId, brandId]);
       if (!product) fail('Product not found.', 404, 'NOT_FOUND');
-      if (product.status !== 'approved') fail('Only approved products can be promoted.', 409, 'PRODUCT_NOT_APPROVED');
+      if (product.status !== 'approved' || product.sourceDeletedAt) fail('Only approved products can be promoted.', 409, 'PRODUCT_NOT_APPROVED');
       const starts = new Date(input.startsAt || now()); const ends = new Date(input.endsAt || starts.getTime() + 7 * DAY);
       if (!Number.isFinite(starts.getTime()) || !Number.isFinite(ends.getTime()) || ends <= starts || ends - starts > 90 * DAY) fail('Use a valid window of up to 90 days.');
       let units = 0; let price;
@@ -507,7 +578,7 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
     async feed(kind, { limit = 10 } = {}) {
       if (!Object.hasOwn(PLACEMENT_PRICING, kind)) fail('Unknown placement kind.');
       const list = await rows(db, `SELECT pl.id,pl.brand_id,pl.kind,pl.product_id,pl.units,pl.impressions,p.title,p.images,p.price_cents FROM placements pl JOIN products p ON p.id=pl.product_id
-        WHERE pl.kind=$1 AND pl.status='approved' AND pl.starts_at<=$2 AND pl.ends_at>$2 AND p.status='approved' AND (pl.kind<>'sponsored_swipe' OR pl.impressions<pl.units) ORDER BY pl.impressions,pl.created_at LIMIT $3`, [kind, now(), Math.min(50, limit)]);
+        WHERE pl.kind=$1 AND pl.status='approved' AND pl.starts_at<=$2 AND pl.ends_at>$2 AND p.status='approved' AND p.source_deleted_at IS NULL AND (pl.kind<>'sponsored_swipe' OR pl.impressions<pl.units) ORDER BY pl.impressions,pl.created_at LIMIT $3`, [kind, now(), Math.min(50, limit)]);
       for (const c of list) await db.query('UPDATE placements SET impressions=impressions+1 WHERE id=$1', [c.id]);
       return list.map(c => ({ placementId: c.id, brandId: c.brandId, productId: c.productId, title: c.title, image: c.images?.[0] || null, priceCents: c.priceCents, sponsored: true, kind: c.kind }));
     },

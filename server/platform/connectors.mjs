@@ -94,6 +94,8 @@ function createCall({ fetch, getFetch, resolve = lookup, getResolve, request = h
   };
 }
 
+export {createCall as createConnectorCall};
+
 const orderId = value => {
   if ((typeof value !== 'number' && typeof value !== 'string') || !/^[1-9]\d{0,29}$/.test(String(value)) || (typeof value === 'number' && !Number.isSafeInteger(value)))
     fail('The store did not return a valid order identity.', 502, 'CONNECTOR_RESPONSE_INVALID');
@@ -125,16 +127,26 @@ export function woocommerceAdapter(options = {}) {
   return {
     platform: 'woocommerce',
     async verify(c) { await call(`${base(c)}/system_status`, { headers: auth(c) }); return { storeRef: httpsUrl(c.storeUrl, 'storeUrl') }; },
+    async profile(c) {
+      const p=await call(`${base(c)}/system_status`,{headers:auth(c)}),s=p.store || {};
+      return { ...(s.name || p.store_name ? {name:text(s.name || p.store_name,160)} : {}),
+        ...(s.email || p.store_email ? {contactEmail:text(s.email || p.store_email,254)} : {}),
+        ...(s.logo_url || p.store_logo ? {logoUrl:text(s.logo_url || p.store_logo,2000)} : {}),
+        ...(s.return_policy || p.return_policy ? {returnPolicy:text(s.return_policy || p.return_policy,12000)} : {}) };
+    },
     async listProducts(c) {
       const out = [];
       for (let page = 1; page <= 50; page++) {
         const list = await call(`${base(c)}/products?per_page=100&page=${page}&status=publish`, { headers: auth(c) });
+        if(!Array.isArray(list) || list.length>100) return proofInvalid();
         for (const p of list) out.push({ sku: text(p.sku, 120) || `WC-${p.id}`, title: text(p.name, 500), description: strip(p.description || p.short_description),
           priceCents: cents(p.price || p.regular_price), inventoryQty: Number.isInteger(p.stock_quantity) ? Math.max(0, p.stock_quantity) : 0,
-          images: (p.images || []).map(i => i.src).filter(s => /^https:/.test(s)).slice(0, 20), category: text(p.categories?.[0]?.slug || '', 200), externalId: String(p.id) });
-        if (list.length < 100) break;
+          images: (p.images || []).map(i => i.src).filter(s => /^https:/.test(s)).slice(0, 20), category: text(p.categories?.[0]?.slug || '', 200), externalId: orderId(p.id),
+          ...(p.type ? {productType:text(p.type,150)} : {}),...(Array.isArray(p.tags)?{tags:p.tags.map(t=>text(t.name,150)).filter(Boolean)}:{}),
+          ...(Array.isArray(p.categories)?{collections:p.categories.map(t=>text(t.slug || t.name,150)).filter(Boolean)}:{}) });
+        if (list.length < 100) {Object.defineProperty(out,'complete',{value:true});return out;}
       }
-      return out;
+      fail('The complete catalog exceeds the bounded page limit.',422,'CATALOG_PAGINATION_LIMIT');
     },
     async createOrder(c, bag, { dispatchId } = {}) {
       const body = { status: 'processing', set_paid: true, customer_note: `Avafem ${bag.orderRef}`,
@@ -175,15 +187,25 @@ export function bigcommerceAdapter(options = {}) {
   return {
     platform: 'bigcommerce',
     async verify(c) { const s = await call(`${base(c)}/v2/store`, { headers: headers(c) }); return { storeRef: text(s?.domain || c.storeHash, 300) }; },
+    async profile(c) {
+      const s=await call(`${base(c)}/v2/store`,{headers:headers(c)});
+      return { ...(s.name ? {name:text(s.name,160)} : {}),...(s.admin_email ? {contactEmail:text(s.admin_email,254)} : {}),
+        ...(s.logo?.url || s.logo_url ? {logoUrl:text(s.logo?.url || s.logo_url,2000)} : {}),...(s.return_policy ? {returnPolicy:text(s.return_policy,12000)} : {}) };
+    },
     async listProducts(c) {
       const out = [];
       for (let page = 1; page <= 50; page++) {
         const r = await call(`${base(c)}/v3/catalog/products?include=images&limit=250&page=${page}&is_visible=true`, { headers: headers(c) });
-        for (const p of r.data || []) out.push({ sku: text(p.sku, 120) || `BC-${p.id}`, title: text(p.name, 500), description: strip(p.description),
-          priceCents: cents(p.price), inventoryQty: Math.max(0, p.inventory_level || 0), images: (p.images || []).map(i => i.url_standard).filter(s => /^https:/.test(s)).slice(0, 20), category: '', externalId: String(p.id) });
-        if (!r.meta?.pagination || page >= r.meta.pagination.total_pages) break;
+        if(!Array.isArray(r.data) || r.data.length>250) return proofInvalid();
+        for (const p of r.data) out.push({ sku: text(p.sku, 120) || `BC-${p.id}`, title: text(p.name, 500), description: strip(p.description),
+          priceCents: cents(p.price), inventoryQty: Math.max(0, p.inventory_level || 0), images: (p.images || []).map(i => i.url_standard).filter(s => /^https:/.test(s)).slice(0, 20), category: '', externalId: orderId(p.id),
+          ...(p.type?{productType:text(p.type,150)}:{}),...(Array.isArray(p.categories)?{collections:p.categories.map(String)}:{}),...(Array.isArray(p.tags)?{tags:p.tags.map(String)}:{}) });
+        const pagination=r.meta?.pagination;
+        if(!pagination) return out; // Missing proof permits upserts, never deletion.
+        if(!Number.isInteger(pagination.total_pages) || pagination.total_pages<0 || (pagination.total_pages===0 && r.data.length) || (pagination.current_page!==undefined && pagination.current_page!==page)) return proofInvalid();
+        if(page>=pagination.total_pages) {Object.defineProperty(out,'complete',{value:true});return out;}
       }
-      return out;
+      fail('The complete catalog exceeds the bounded page limit.',422,'CATALOG_PAGINATION_LIMIT');
     },
     async createOrder(c, bag, { dispatchId } = {}) {
       const body = { status_id: 11, customer_id: 0, billing_address: { first_name: bag.shipTo.name, street_1: bag.shipTo.line1, city: bag.shipTo.city, state: bag.shipTo.region, zip: bag.shipTo.postal, country_iso2: bag.shipTo.country, email: 'orders@avafem.invalid' },
@@ -232,7 +254,10 @@ export function csvRows(csvParse, csv) {
       priceCents: price != null ? Number(price) : cents(pick(r, 'price', 'Price', 'Variant Price')),
       inventoryQty: Number(pick(r, 'inventoryQty', 'inventory_qty', 'Variant Inventory Qty', 'Stock') ?? 0) || 0,
       images: String(pick(r, 'images', 'Image Src') || '').split('|').filter(Boolean), category: text(pick(r, 'category', 'Type', 'Product Category') || '', 200),
-      taxCode: text(pick(r, 'taxCode', 'tax_code') || '', 100) });
+      taxCode: text(pick(r, 'taxCode', 'tax_code') || '', 100),externalId:text(pick(r,'sourceProductId','externalId','ID') || sku,200),
+      ...(pick(r,'productType','product_type','Type')?{productType:text(pick(r,'productType','product_type','Type'),150)}:{}),
+      ...(pick(r,'tags','Tags')?{tags:String(pick(r,'tags','Tags')).split(/[|,]/).map(v=>v.trim()).filter(Boolean)}:{}),
+      ...(pick(r,'collections','Collection')?{collections:String(pick(r,'collections','Collection')).split('|').map(v=>v.trim()).filter(Boolean)}:{}) });
   }
   return out.map(({ handle, ...row }) => row);
 }

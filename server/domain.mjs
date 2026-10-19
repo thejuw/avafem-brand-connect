@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { checkProduct, productReviewFingerprint } from './platform/compliance.mjs';
 
 const DAY = 86_400_000;
 const id = prefix => `${prefix}_${randomUUID().replaceAll('-', '')}`;
@@ -70,6 +71,14 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
     return row;
   };
   async function requirements(tx, brand) {
+    if (brand.onboardingMode === 'two_step') {
+      const missing = [];
+      if (!brand.agreementSigned) missing.push('Signed brand agreement');
+      if (!brand.connectionHealthy || brand.status === 'disconnected' || !brand.onboardingState?.connected) missing.push('Healthy verified store connection');
+      if (!brand.onboardingState?.profileVerified) missing.push('Verified connected profile');
+      if (!brand.onboardingState?.catalogImportComplete) missing.push('Complete catalog import');
+      return missing;
+    }
     const approved = (await first(tx, "SELECT COUNT(*)::integer AS count FROM products WHERE brand_id=$1 AND status='approved'", [brand.id])).count;
     const missing = [];
     if (!brand.agreementSigned) missing.push('Signed brand agreement');
@@ -108,6 +117,8 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
   const credit = (account, creditCents) => ({ account, creditCents, debitCents: 0 });
 
   const releaseDays=(bag,brand)=>Math.max(7,bag.returnWindowDays??30,brand.returnWindowDays??30);
+  const payoutReady = brand => Boolean(brand.stripeAccountId && brand.chargesEnabled && brand.payoutsEnabled
+    && (brand.onboardingMode !== 'two_step' || brand.payoutSetup === 'complete'));
   async function extendScheduledWindow(tx,bag,brand) {
     if (!bag.deliveredAt) return bag;
     const transfer=await first(tx,'SELECT * FROM transfers WHERE bag_id=$1',[bag.id]);
@@ -134,7 +145,7 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
       const qty=integer(line.qty ?? line.quantity ?? 1,'qty',1,1000);
       const brand=await brandRow(tx,line.brandId);
       if (brand.status==='disconnected' || brand.status==='paused') fail('This brand is unavailable for new sandbox orders.',409,'BRAND_UNAVAILABLE');
-      const found=await first(tx,"SELECT * FROM products WHERE brand_id=$1 AND sku=$2 AND status='approved'",[brand.id,line.sku]);
+      const found=await first(tx,"SELECT * FROM products WHERE brand_id=$1 AND sku=$2 AND status='approved' AND source_deleted_at IS NULL",[brand.id,line.sku]);
       if (!found) fail(`Approved product ${line.sku} not found for this brand.`,409,'PRODUCT_UNAVAILABLE');
       if (!allocations.has(found.id)) allocations.set(found.id,structuredClone(found));
       const product=allocations.get(found.id);
@@ -214,6 +225,27 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
       return Promise.all(result.map(brand => decorateBrand(db,brand)));
     },
     async getBrand(brandId) { return decorateBrand(db,await brandRow(db,brandId)); },
+    async activateConnectedBrand(brandId,{actor='system:onboarding',payoutSetup='deferred'} = {}) {
+      if (!/^[A-Za-z0-9_:-]{1,120}$/.test(actor) || !['deferred','pending'].includes(payoutSetup)) fail('Use a server-owned onboarding actor and payout choice.');
+      return db.transaction(async tx => {
+        await tx.query('SELECT id FROM brands WHERE id=$1 FOR UPDATE',[brandId]);
+        const brand=await brandRow(tx,brandId),state=brand.onboardingState||{};
+        if (!state.connected || !state.catalogImportComplete || !state.profileVerified || !brand.agreementSigned || !brand.connectionHealthy || ['paused','disconnected'].includes(brand.status))
+          fail('A verified connection, profile, catalog import and agreement are required.',409,'ONBOARDING_INCOMPLETE');
+        let connection; const source=state.platform || state.source;
+        if (source==='shopify' && brand.connectionTier==='shopify') connection=await first(tx,"SELECT brand_id FROM shopify_connections WHERE brand_id=$1 AND status='connected'",[brandId]);
+        else if (['woocommerce','bigcommerce','csv','feed'].includes(source) && brand.connectionTier===(['csv','feed'].includes(source)?'dashboard':source)) connection=await first(tx,"SELECT brand_id FROM brand_connectors WHERE brand_id=$1 AND platform=$2 AND status='connected'",[brandId,source==='feed'?'csv':source]);
+        if (!connection) fail('The selected store connection is not verified.',409,'ONBOARDING_INCOMPLETE');
+        const products=await rows(tx,'SELECT * FROM products WHERE brand_id=$1 AND source_deleted_at IS NULL',[brandId]);
+        if (products.some(product=>checkProduct(product).status!=='pass')) fail('Flagged catalog listings need admin review; brand auto-activation is held.',409,'ONBOARDING_COMPLIANCE_REVIEW');
+        const payout=brand.stripeAccountId && brand.chargesEnabled && brand.payoutsEnabled?'complete':payoutSetup;
+        const result=await first(tx,"UPDATE brands SET onboarding_mode='two_step',payout_setup=$2,status='live',updated_at=$3 WHERE id=$1 RETURNING *",[brandId,payout,iso()]);
+        await tx.query(`INSERT INTO curation_audit(id,brand_id,actor,action,reason,payload,created_at) VALUES($1,$2,$3,'brand_connected_activation',$4,$5,$6)`,
+          [id('curation'),brandId,actor,'Verified clean connected brand; product approvals remain independent.',json({productCount:products.length,approvedProducts:products.filter(p=>p.status==='approved').length,payoutSetup:payout}),iso()]);
+        await event(tx,'brand.activated',brandId,brandId,{status:'live',onboardingMode:'two_step',payoutSetup:payout,productsAutoapproved:false});
+        return decorateBrand(tx,result);
+      });
+    },
     async createBrand(input = {}) {
       return db.transaction(async tx => {
         const name = text(input.name,160); if (!name) fail('Brand name is required.');
@@ -262,24 +294,42 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
       return rows(db,`SELECT * FROM products${query.sql} ORDER BY updated_at DESC,id`,query.params);
     },
     async getProduct(productId, brandId) { return owned(db,'products',productId,brandId); },
-    async upsertProduct(brandId,sku,input = {}) {
+    async upsertProduct(brandId,sku,input = {},{source,beforeUpsert} = {}) {
       return db.transaction(async tx => {
+        if(beforeUpsert) await beforeUpsert(tx);
         await brandRow(tx,brandId);
         sku = text(sku,120); if (!sku) fail('SKU is required.');
-        const existing = await first(tx,'SELECT * FROM products WHERE brand_id=$1 AND sku=$2',[brandId,sku]);
-        const product = { title:'',description:'',category:'',priceCents:0,inventoryQty:0,images:[],variants:[],
+        let existing = await first(tx,'SELECT * FROM products WHERE brand_id=$1 AND sku=$2',[brandId,sku]);
+        if (source) {
+          if (!['shopify','woocommerce','bigcommerce','csv','feed'].includes(source.provider) || !text(source.catalogKey,500) || !text(source.productId,200)) fail('A bounded server-owned catalog identity is required.');
+          const mapped=await rows(tx,'SELECT * FROM products WHERE brand_id=$1 AND source_provider=$2 AND source_catalog_key=$3 AND source_product_id=$4 FOR UPDATE',[brandId,source.provider,source.catalogKey,source.productId]);
+          if(mapped.length>1 || (mapped[0] && existing && mapped[0].id!==existing.id)) fail('This source identity conflicts with another catalog product.',409,'CATALOG_SKU_CONFLICT');
+          if(mapped[0] && mapped[0].sku!==sku) {
+            existing={...mapped[0],status:'in_review',reviewedFingerprint:mapped[0].reviewedFingerprint || (mapped[0].status==='approved'?productReviewFingerprint(mapped[0]):null)};
+            await tx.query("UPDATE products SET sku=$2,status='in_review',review_note='Source SKU changed; human review required.' WHERE id=$1",[existing.id,sku]);
+          }
+          if (existing && (!existing.sourceProvider || existing.sourceProvider!==source.provider || existing.sourceCatalogKey!==source.catalogKey || existing.sourceProductId!==source.productId))
+            fail('This source would overwrite a different or user-managed product.',409,'CATALOG_SKU_CONFLICT');
+        }
+        const product = { title:'',description:'',category:'',priceCents:0,inventoryQty:0,images:[],variants:[],productType:'',tags:[],collections:[],
           evidence:{ingredients_inci:[],certifications:[],claims:[],contraindications:''},taxCode:'',shippingProfile:'standard',...existing };
-        for (const field of ['title','description','category','priceCents','inventoryQty','images','variants','evidence','taxCode','shippingProfile'])
+        product.sku=sku;
+        for (const field of ['title','description','category','priceCents','inventoryQty','images','variants','evidence','taxCode','shippingProfile','productType','tags','collections'])
           if (input[field]!==undefined) product[field]=input[field];
         // Accept the normalized contract's price/inventory aliases as well.
         if (input.price?.amount!==undefined) product.priceCents=input.price.amount;
         if (input.inventory?.qty!==undefined) product.inventoryQty=input.inventory.qty;
         integer(product.priceCents,'priceCents'); integer(product.inventoryQty,'inventoryQty',0,1_000_000);
         product.title=text(product.title,250); product.description=text(product.description,12000); product.category=text(product.category,150);
+        product.productType=text(product.productType,150);
+        for (const field of ['tags','collections']) {
+          if (!Array.isArray(product[field]) || product[field].length>100 || product[field].some(value=>typeof value!=='string' || !text(value,150))) fail(`${field} must contain up to 100 nonempty names.`);
+          product[field]=[...new Set(product[field].map(value=>text(value,150)))].sort();
+        }
         if (!Array.isArray(product.images)) fail('images must be an array.');
         if (!product.evidence || typeof product.evidence!=='object' || Array.isArray(product.evidence)) fail('evidence must be an object.');
         const issues=validateProduct(product);
-        const reviewFields=['title','description','category','images','evidence','taxCode','shippingProfile'];
+        const reviewFields=['title','description','category','images','evidence','taxCode','shippingProfile','productType','tags','collections'];
         const contentChanged=existing && reviewFields.some(field=>!equal(existing[field],product[field]));
         // Variant prices and quantities are commercial edits. Variant identities,
         // options and other descriptive changes still require a fresh review.
@@ -288,35 +338,61 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
         let status=existing?.status || 'in_review';
         if (contentChanged || variantChanged) status='in_review';
         if (issues.length) status='draft';
+        const sourceDeletedAt=source ? (source.active===false?iso():null) : existing?.sourceDeletedAt||null;
+        if (sourceDeletedAt) status='draft';
+        const fingerprint=productReviewFingerprint(product);
+        const reviewedFingerprint=existing?.reviewedFingerprint || (existing?.status==='approved'?productReviewFingerprint(existing):null);
+        const reviewedAt=existing?.reviewedAt || (existing?.status==='approved'?existing.updatedAt:null);
         const result=await first(tx,`INSERT INTO products
-          (id,brand_id,sku,title,description,category,price_cents,inventory_qty,images,variants,evidence,tax_code,shipping_profile,status,validation_issues,review_note,created_at,updated_at)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17)
+          (id,brand_id,sku,title,description,category,price_cents,inventory_qty,images,variants,evidence,tax_code,shipping_profile,status,validation_issues,review_note,created_at,updated_at,
+           product_type,collections,tags,source_provider,source_product_id,source_catalog_key,source_deleted_at,review_fingerprint,reviewed_fingerprint,reviewed_at,compliance_result,compliance_checked_at)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$17)
           ON CONFLICT(brand_id,sku) DO UPDATE SET title=EXCLUDED.title,description=EXCLUDED.description,category=EXCLUDED.category,
           price_cents=EXCLUDED.price_cents,inventory_qty=EXCLUDED.inventory_qty,images=EXCLUDED.images,variants=EXCLUDED.variants,
           evidence=EXCLUDED.evidence,tax_code=EXCLUDED.tax_code,shipping_profile=EXCLUDED.shipping_profile,status=EXCLUDED.status,
-          validation_issues=EXCLUDED.validation_issues,review_note=EXCLUDED.review_note,updated_at=EXCLUDED.updated_at RETURNING *`,
+          validation_issues=EXCLUDED.validation_issues,review_note=EXCLUDED.review_note,updated_at=EXCLUDED.updated_at,
+          product_type=EXCLUDED.product_type,collections=EXCLUDED.collections,tags=EXCLUDED.tags,source_provider=EXCLUDED.source_provider,
+          source_product_id=EXCLUDED.source_product_id,source_catalog_key=EXCLUDED.source_catalog_key,source_deleted_at=EXCLUDED.source_deleted_at,
+          review_fingerprint=EXCLUDED.review_fingerprint,reviewed_fingerprint=EXCLUDED.reviewed_fingerprint,reviewed_at=EXCLUDED.reviewed_at,
+          compliance_result=EXCLUDED.compliance_result,compliance_checked_at=EXCLUDED.compliance_checked_at RETURNING *`,
           [existing?.id||id('prod'),brandId,sku,product.title,product.description,product.category,product.priceCents,product.inventoryQty,
           json(product.images),json(product.variants),json(product.evidence),text(product.taxCode,150),text(product.shippingProfile,100),status,json(issues),
-          contentChanged||variantChanged?'Content changed; human review required.':existing?.reviewNote||'',iso()]);
+          contentChanged||variantChanged?'Content changed; human review required.':existing?.reviewNote||'',iso(),product.productType,json(product.collections),json(product.tags),
+          source?.provider||existing?.sourceProvider||null,source?.productId||existing?.sourceProductId||null,source?.catalogKey||existing?.sourceCatalogKey||null,
+          sourceDeletedAt,fingerprint,reviewedFingerprint,reviewedAt,json(checkProduct(product))]);
         await event(tx,'product.upserted',result.id,brandId,{productId:result.id,sku,status,validationIssues:issues});
         if (existing && existing.inventoryQty!==result.inventoryQty) await event(tx,'inventory.changed',result.id,brandId,{sku,inventoryQty:result.inventoryQty});
         return result;
       });
     },
-    async reviewProduct(productId,input = {},brandId) {
-      return db.transaction(async tx => {
+    async reviewProduct(productId,input = {},brandId,{tx: providedTransaction} = {}) {
+      const review = async tx => {
         await tx.query('SELECT id FROM products WHERE id=$1 FOR UPDATE',[productId]);
         const product=await owned(tx,'products',productId,brandId);
         const status=input.status || (input.approved===true?'approved':input.approved===false?'rejected':null);
         if (!['approved','rejected'].includes(status)) fail('Review status must be approved or rejected.');
         const issues=validateProduct(product);
         if (status==='approved' && issues.length) fail('Resolve catalog validation issues before approval.',409,'CATALOG_INVALID');
+        const fingerprint=productReviewFingerprint(product),compliance=checkProduct(product);
+        if (input.fingerprint && input.fingerprint!==fingerprint) fail('The product changed; refresh the review.',409,'CURATION_STALE');
+        if (status==='approved' && product.sourceDeletedAt) fail('A delisted source product cannot be approved.',409,'PRODUCT_DELISTED');
+        if (status==='approved' && compliance.flags.length) {
+          const override=await first(tx,'SELECT * FROM compliance_overrides WHERE product_id=$1',[productId]);
+          if (!override || override.fingerprint!==fingerprint || text(override.reason).length<10) fail('Flagged products require an exact-content override with a reason.',409,'COMPLIANCE_BLOCKED');
+        }
         if (status==='approved' && beforeProductApproval) await beforeProductApproval(product,tx);
-        const result=await first(tx,'UPDATE products SET status=$2,review_note=$3,validation_issues=$4,updated_at=$5 WHERE id=$1 RETURNING *',
-          [productId,status,text(input.note,2000),json(issues),iso()]);
+        if(status==='approved' && productReviewFingerprint(await owned(tx,'products',productId,brandId))!==fingerprint)
+          fail('The listing changed during approval; refresh its exact-content review.',409,'CURATION_STALE');
+        const result=await first(tx,`UPDATE products SET status=$2,review_note=$3,validation_issues=$4,updated_at=$5,
+          review_fingerprint=$6,reviewed_fingerprint=$6,reviewed_at=$5,compliance_result=$7,compliance_checked_at=$5 WHERE id=$1 RETURNING *`,
+          [productId,status,text(input.note,2000),json(issues),iso(),fingerprint,json(compliance)]);
+        await tx.query(`INSERT INTO curation_audit(id,operation_id,brand_id,product_id,actor,action,reason,fingerprint,payload,created_at)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,[id('curation'),input.operationId||null,product.brandId,productId,text(input.actor||'internal:domain',120),
+          status,text(input.note||'Canonical product review.',2000),fingerprint,json({previousStatus:product.status,status}),iso()]);
         await event(tx,`product.${status}`,productId,product.brandId,{productId,sku:product.sku,status});
         return result;
-      });
+      };
+      return providedTransaction?review(providedTransaction):db.transaction(review);
     },
     async listBags(input = {}) {
       const query=filter(input,[['status','status']]);
@@ -373,8 +449,11 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14) RETURNING *`,
             [id('bag'),orderId,group.brand.id,json(group.items),json(storedShipTo),group.subtotal,group.shipping,group.tax,group.commission,
             group.subtotal-group.commission+group.shipping,group.subtotal+group.shipping+group.tax,new Date(now().getTime()+3*DAY).toISOString(),group.brand.returnWindowDays,iso()]);
-          await tx.query("INSERT INTO transfers(id,bag_id,brand_id,amount_cents,status,created_at) VALUES($1,$2,$3,$4,'scheduled',$5)",
-            [id('tr'),bag.id,bag.brandId,bag.transferCents,iso()]);
+          const payoutHeld=group.brand.onboardingMode==='two_step' && !payoutReady(group.brand);
+          await tx.query("INSERT INTO transfers(id,bag_id,brand_id,amount_cents,status,created_at) VALUES($1,$2,$3,$4,$5,$6)",
+            [id('tr'),bag.id,bag.brandId,bag.transferCents,payoutHeld?'held':'scheduled',iso()]);
+          if (payoutHeld) await tx.query("INSERT INTO jobs(id,kind,bag_id,status,due_at,last_error,created_at) VALUES($1,'sandbox_payout',$2,'held',$3,'Payout onboarding required; delivery still required',$4)",
+            [id('job'),bag.id,new Date(now().getTime()+releaseDays(bag,group.brand)*DAY).toISOString(),iso()]);
           const creditAmount=Math.round(bag.subtotalCents*500/10000);
           await tx.query("INSERT INTO credits(id,bag_id,brand_id,amount_cents,status,created_at) VALUES($1,$2,$3,$4,'pending',$5)",
             [id('credit'),bag.id,bag.brandId,creditAmount,iso()]);
@@ -446,11 +525,12 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
           bag.payoutDueAt?new Date(bag.payoutDueAt).getTime():0)).toISOString();
         const result=await first(tx,"UPDATE bags SET status='delivered',delivered_at=$2,payout_due_at=$3,updated_at=$4 WHERE id=$1 RETURNING *",[bagId,deliveredAt.toISOString(),dueAt,iso()]);
         const pending=await first(tx,"SELECT COUNT(*)::integer AS count FROM refunds WHERE bag_id=$1 AND status='proposed'",[bagId]);
-        await tx.query('UPDATE transfers SET due_at=$2,status=$3 WHERE bag_id=$1',[bagId,dueAt,pending.count?'held':'scheduled']);
+        const held=Boolean(pending.count) || !payoutReady(brand);
+        await tx.query('UPDATE transfers SET due_at=$2,status=$3 WHERE bag_id=$1',[bagId,dueAt,held?'held':'scheduled']);
         await tx.query(`INSERT INTO jobs(id,kind,bag_id,status,due_at,created_at) VALUES($1,'sandbox_payout',$2,$3,$4,$5)
-          ON CONFLICT(kind,bag_id) DO NOTHING`,[id('job'),bagId,pending.count?'held':'scheduled',dueAt,iso()]);
+          ON CONFLICT(kind,bag_id) DO UPDATE SET due_at=GREATEST(jobs.due_at,EXCLUDED.due_at),status=EXCLUDED.status`,[id('job'),bagId,held?'held':'scheduled',dueAt,iso()]);
         await event(tx,'bag.delivered',bagId,bag.brandId,{bagId,deliveredAt:deliveredAt.toISOString()});
-        await event(tx,'payout.scheduled',bagId,bag.brandId,{bagId,dueAt,amountCents:bag.transferCents,held:Boolean(pending.count),returnWindowDays:releaseDays(bag,brand)});
+        await event(tx,'payout.scheduled',bagId,bag.brandId,{bagId,dueAt,amountCents:bag.transferCents,held,returnWindowDays:releaseDays(bag,brand)});
         return bagView(tx,result);
       });
     },
@@ -522,7 +602,14 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
             await tx.query("UPDATE jobs SET status='held',last_error='Provider-backed settlement required' WHERE id=$1",[job.id]);
             continue;
           }
-          bag=await extendScheduledWindow(tx,bag,await brandRow(tx,bag.brandId));
+          const brand=await brandRow(tx,bag.brandId);
+          bag=await extendScheduledWindow(tx,bag,brand);
+          if (!payoutReady(brand)) {
+            await tx.query("UPDATE jobs SET status='held',last_error='Payout onboarding required' WHERE id=$1",[job.id]);
+            await tx.query("UPDATE transfers SET status='held' WHERE bag_id=$1 AND status='scheduled'",[bag.id]);
+            await event(tx,'payout.held',bag.id,bag.brandId,{bagId:bag.id,reason:'payout_onboarding_required'});
+            continue;
+          }
           if (bag.payoutDueAt && new Date(bag.payoutDueAt)>now()) continue;
           const transfer=await first(tx,'SELECT * FROM transfers WHERE bag_id=$1',[bag.id]);
           const proposal=await first(tx,"SELECT COUNT(*)::integer AS count FROM refunds WHERE bag_id=$1 AND status='proposed'",[bag.id]);

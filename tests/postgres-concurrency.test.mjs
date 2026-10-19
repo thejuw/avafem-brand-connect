@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import {randomUUID} from 'node:crypto';
 import {Pool} from 'pg';
 import {createDatabase} from '../server/db.mjs';
+import {createDomain} from '../server/domain.mjs';
 import {createBrandSide} from '../server/platform/brands.mjs';
+import {createCuration} from '../server/platform/curation.mjs';
+import {createCompliance,productReviewFingerprint} from '../server/platform/compliance.mjs';
 import {createSubscriptions} from '../server/platform/commerce.mjs';
 import {createBeautyBank,createConsole} from '../server/platform/money.mjs';
 import {platformFixture} from './helpers/platform-fixture.mjs';
@@ -12,6 +15,8 @@ const postgresUrl=process.env.AVAFEM_TEST_POSTGRES_URL;
 if (process.env.AVAFEM_REQUIRE_POSTGRES==='1' && !postgresUrl) throw new Error('AVAFEM_TEST_POSTGRES_URL is required for the PostgreSQL job.');
 const options={skip:!postgresUrl,timeout:60_000};
 const json=body=>({status:200,ok:true,json:async()=>body});
+const curationListing=extra=>({title:'Postgres fixture body oil',description:'Unscented body oil.',category:'body-care/oil',priceCents:1000,inventoryQty:10,
+  images:['https://images.example.com/pg-fixture.jpg'],evidence:{ingredients_inci:['Olive oil'],claims:[],certifications:[],contraindications:'External use only.'},taxCode:'txcd_99999999',...extra});
 async function fixture(t) {
   const url=new URL(postgresUrl);
   assert.ok(['postgres:','postgresql:'].includes(url.protocol));
@@ -189,4 +194,48 @@ test('real Postgres: verified void authorizes one replacement across independent
   const shared=(await f.db.query('SELECT state,external_order_id FROM external_orders WHERE bag_id=$1',[bag.id])).rows[0];
   assert.equal(shared.state,'connector_created');assert.equal(shared.external_order_id,'8002');
   assert.equal((await f.db.query("SELECT COUNT(*)::int AS n FROM audit_log WHERE resource_id=$1 AND action='connector.retry_reserved'",[bag.id])).rows[0].n,1);
+});
+
+test('real Postgres: concurrent exact-fingerprint curation operations commit one decision and immutable audit',options,async t=>{
+  const f=await fixture(t),domain2=createDomain(f.db2,{clock:f.clock});
+  const other=createCuration(f.db2,{domain:domain2,compliance:createCompliance(f.db2,{clock:f.clock}),clock:f.clock});
+  const product=await f.domain.upsertProduct('brand_bloom','PG-CURATION-ONCE',curationListing());
+  const actor={owner:true,brandId:null,credentialId:'postgres_curator'};
+  const input={operationId:'postgres_curation_once',reason:'Exact fixture revision reviewed by an authorized test operator.',action:'approved',
+    products:[{id:product.id,fingerprint:productReviewFingerprint(product)}]};
+  const results=await Promise.all([f.platform.curation.bulk(input,actor),other.bulk(input,actor)]);
+  assert.equal(results.filter(r=>r.replayed===true).length,1);
+  assert.ok(results.every(r=>r.changed===1 && r.products[0].fingerprint===input.products[0].fingerprint));
+  assert.equal((await f.domain.getProduct(product.id)).status,'approved');
+  assert.equal((await f.db.query('SELECT COUNT(*)::int AS n FROM curation_operations WHERE operation_id=$1',[input.operationId])).rows[0].n,1);
+  assert.equal((await f.db.query("SELECT COUNT(*)::int AS n FROM curation_audit WHERE operation_id=$1 AND product_id=$2 AND action='approved'",[input.operationId,product.id])).rows[0].n,1);
+  assert.equal((await f.db.query("SELECT COUNT(*)::int AS n FROM outbox_events WHERE aggregate_id=$1 AND type='product.approved'",[product.id])).rows[0].n,1);
+});
+
+test('real Postgres: catalog leases fence independent readers and expired writers cannot delist a newer snapshot',options,async t=>{
+  const f=await fixture(t),domain2=createDomain(f.db2,{clock:f.clock});
+  const other=createBrandSide(f.db2,{domain:domain2,auth:f.auth,secret:f.config.encryptionKey,clock:f.clock});
+  const brand=await f.domain.createBrand({name:'Postgres isolated catalog fixture'}),key='shopify:postgres-fixture.myshopify.com';
+  const row=(sku,num)=>curationListing({sku,externalId:`gid://shopify/Product/${num}`});
+  await f.platform.brands.importConnectedSnapshot(brand.id,'shopify',key,[row('PG-BASE',1),row('PG-REMOVED',2)],{complete:true});
+  let entered,release,otherReads=0;
+  const started=new Promise(resolve=>{entered=resolve;}),gate=new Promise(resolve=>{release=resolve;});
+  const stale=f.platform.brands.withCatalogSnapshot(brand.id,'shopify',key,async()=>{entered();await gate;return [row('PG-STALE',3)];},{complete:true});
+  let staleResult;
+  try {
+    await started;
+    await assert.rejects(other.withCatalogSnapshot(brand.id,'shopify',key,async()=>{otherReads++;return [];},{complete:true}),e=>e.code==='CATALOG_IMPORT_BUSY');
+    assert.equal(otherReads,0,'the second pool must be rejected before its provider read');
+    await f.db2.query("UPDATE brands SET onboarding_state=jsonb_set(onboarding_state,'{catalogLease,expiresAt}',to_jsonb($2::text)) WHERE id=$1",[brand.id,'2000-01-01T00:00:00Z']);
+    const newest=await other.withCatalogSnapshot(brand.id,'shopify',key,async()=>{otherReads++;return [row('PG-BASE',1),row('PG-NEWEST',4)];},{complete:true});
+    assert.equal(newest.accepted,2);assert.equal(newest.delisted,1);assert.equal(otherReads,1);
+  } finally {release();staleResult=await stale;}
+  assert.equal(staleResult.accepted,0);assert.equal(staleResult.complete,false);assert.equal(staleResult.delisted,0);
+  const products=await f.domain.listProducts({brandId:brand.id});
+  assert.deepEqual(products.filter(p=>!p.sourceDeletedAt).map(p=>p.sku).sort(),['PG-BASE','PG-NEWEST']);
+  assert.equal(products.some(p=>p.sku==='PG-STALE'),false);
+  assert.equal((await f.domain.getBrand(brand.id)).onboardingState.catalogLease,undefined);
+  const queue=await f.platform.curation.queue({brandId:brand.id});
+  assert.equal(queue.products.some(p=>p.sku==='PG-REMOVED'),false,'delisted rows are not offered for approval');
+  assert.equal((await f.db.query("SELECT COUNT(*)::int AS n FROM outbox_events WHERE brand_id=$1 AND type='product.delisted'",[brand.id])).rows[0].n,1);
 });

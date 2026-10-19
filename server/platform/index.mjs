@@ -6,6 +6,9 @@ import { createBrandSide } from './brands.mjs';
 import { createCompliance } from './compliance.mjs';
 import { createSubscriptions, createShipping, createPrivacy } from './commerce.mjs';
 import { createBeautyBank, createRisk, createConsole, createReports } from './money.mjs';
+import {createCuration} from './curation.mjs';
+import {createOnboarding} from './onboarding.mjs';
+import {createInviteDelivery,createResendInviteAdapter} from './invite-delivery.mjs';
 
 /** Avafem platform modules layered on the canonical sandbox core. Email/SMS and
  * subscription charges are simulated. Explicitly connected Woo/BigCommerce
@@ -24,6 +27,12 @@ export async function createPlatform(db, options) {
   platform.brands = createBrandSide(db, { clock, domain, auth, secret, shopifyConnections: options.shopifyConnections, ...(options.fetch ? { fetch: options.fetch } : {}),
     compliance: { check: (...a) => platform.compliance?.check(...a) ?? null, scanBrand: (...a) => platform.compliance?.scanBrand(...a) ?? null } });
   platform.compliance = createCompliance(db, { clock });
+  platform.curation=createCuration(db,{domain,compliance:platform.compliance,clock});
+  platform.onboarding=createOnboarding(db,{domain,auth,brands:platform.brands,curation:platform.curation,compliance:platform.compliance,
+    shopifyConnections:options.shopifyConnections,clock,...(options.onboarding || {})});
+  const email=options.inviteDelivery || {};
+  platform.inviteDelivery=createInviteDelivery(db,{auth,domain,clock,secret,publicBaseUrl:email.publicBaseUrl || options.publicBaseUrl,
+    adapter:email.adapter || (email.enableExternal===true ? createResendInviteAdapter({apiKey:email.apiKey,from:email.from}) : null),allowExternal:email.enableExternal===true});
   platform.subscriptions = createSubscriptions(db, { clock, domain, crm: platform.crm, health, bank: platform.bank, secret, charge: options.subscriptionCharge });
   platform.shipping = createShipping(db, { clock });
   platform.privacy = createPrivacy(db, { clock, crm: platform.crm, health, bank: platform.bank, secret });
@@ -34,7 +43,7 @@ export async function createPlatform(db, options) {
     if (platform.afterRefund) await platform.afterRefund(bagId);
     return approved;
   };
-  platform.jobs = async () => ({ healthMigration: await health.migrateOutbox(),subscriptions: await platform.subscriptions.runDue(), bank: await platform.bank.run(), campaigns: await platform.crm.runActiveCampaigns(),
+  platform.jobs = async () => ({ healthMigration: await health.migrateOutbox(),onboardingPayoutPrompts:await platform.onboarding.payoutPrompts(),subscriptions: await platform.subscriptions.runDue(), bank: await platform.bank.run(), campaigns: await platform.crm.runActiveCampaigns(),
     alerts: (await platform.console.scan()).length });
   return platform;
 }

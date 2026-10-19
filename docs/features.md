@@ -1,8 +1,11 @@
 # Avafem backend + CRM features (branch `ava/backend-crm`)
 
-These modules are **sandbox features, not a production-completion claim**. Email/SMS
-go to a simulated outbox (`message_outbox`, status `simulated`), subscription charges
-and self-serve Express onboarding are mocked. WooCommerce/BigCommerce adapters can make
+These modules are **sandbox features, not a production-completion claim**. CRM email/SMS
+go to a simulated outbox (`message_outbox`, status `simulated`) and subscription charges
+are mocked. New two-step payout onboarding is unavailable without a configured server
+test adapter; the legacy portal's simulated Express shortcut cannot complete it.
+Invitation email has a separate default-off, server-only Resend opt-in; no actual
+invitation email was sent in the local checks. WooCommerce/BigCommerce adapters can make
 real HTTPS requests when explicitly connected; automated tests inject fake transports
 and never use provider credentials. The existing provider-backed Shopify/Stripe unified
 checkout remains separate. Platform modules live in `server/platform/`,
@@ -12,6 +15,10 @@ MCP tools are appended to the existing `/mcp` server. The operator UI is the
 **Backend & CRM** nav item (`web/PlatformPanel.jsx`).
 Its admin-only **Recovery desk** now provides guarded recovery queues and audit
 history; see [the operator runbook](admin-recovery.md) for actions and limitations.
+Its **Brand invites**, **Connect your brand** and **Product curation** screens now
+implement the local two-step/curation foundation; see [the onboarding runbook](two-step-onboarding.md).
+Public native approval, real invitation acceptance/delivery and embedded payout
+onboarding remain separate, unverified acceptance work.
 
 Conventions kept from the core: tenant isolation by brand id (brand sessions/bearers can only
 read their own records), admin routes need the operations workspace + CSRF, PII is AES‑256‑GCM
@@ -77,20 +84,31 @@ Tests: `tests/platform-money.test.mjs`, `tests/platform-money-failures.test.mjs`
 
 | Capability | Where |
 |---|---|
-| Public self-serve signup (rate limited 5/min): creates an `invited` brand, encrypted contact, and a 48 h invite; accepting the invite (existing `/api/invites/:token/accept`) signs the agreement and opens a brand session | `POST /api/portal/signup` |
-| Onboarding checklist: signup → agreement → profile (ship-from, shipping table, support email) → store connection → Stripe Express → catalog submitted → catalog approved → live, plus the core `onboardingRequirements` | `GET /api/portal/:brandId/status`, `PATCH …/profile`, MCP `get_onboarding_status` |
-| Stripe Express onboarding (**mocked** AccountLink + simulated `account.updated`; uses `acct_sandbox_…` ids) | `POST /api/portal/:brandId/stripe/link`, `…/stripe/return` |
-| Store connection: WooCommerce (consumer key/secret), BigCommerce (store hash + token), CSV, or Shopify (hands off to the existing OAuth install). Credentials are verified, then stored AES‑GCM encrypted; disconnect wipes them | `POST /api/portal/:brandId/connect`, `GET …/connectors`, `DELETE …/connectors/:platform` |
+| Signup endpoint (local implementation, not a deployed public signup claim): rate limited 5/min, creates an `invited` brand, encrypted contact and signed 48 h invite; explicit acceptance establishes only a brand session | `POST /api/portal/signup`, `POST /api/invites/:token/accept` |
+| Two-step onboarding: signed preview → explicit accept/resume → advisory URL detection/verified store + complete catalog → optional payout setup or deferral. A clean connected brand may activate independently of product approvals. Brand/session-scoped mutations require CSRF; public preview does not bootstrap owner access. | `/onboard/:token`, `GET /api/onboarding/invites/:token`, `GET /api/onboarding/session`, `/api/onboarding/:brandId…`, `web/BrandOnboarding.jsx` |
+| Owner invitations: create, replace/re-send (revokes old link), revoke and safe status UI; stable operations, encrypted replay responses, no automatic resend after pending/uncertain delivery. Private local path copy is not an admin navigation link. | `/api/admin/onboarding/:brandId/invites…`, `web/AdminInvitesPanel.jsx` |
+| Invitation email: separate fixed-endpoint Resend adapter, server secret/public HTTPS base and explicit opt-in required; default unconfigured. Provider accepted is not delivered; tests use injected transports, not actual emails. | `server/platform/invite-delivery.mjs`, `AVAFEM_ENABLE_INVITE_EMAIL` (default off) |
+| Advisory store discovery: exact hostname hints and optional bounded/public-DNS-pinned JSON probes; default no probes. Unknown/custom domains can choose masked manual Woo/BC credentials or CSV, without claiming verified ownership. | `server/platform/store-discovery.mjs`, `POST …/detect`, `AVAFEM_ENABLE_STORE_DISCOVERY` (default off) |
+| New payout step: defer without a bank account while all payables remain held; actual hosted setup is blocked without an injected configured test adapter. No real embedded Express acceptance was verified. Legacy simulated portal link/return routes reject the new two-step flow. | `POST /api/onboarding/:brandId/payouts/skip`, `…/payouts/start` |
+| Store connection: WooCommerce (masked consumer key/secret), BigCommerce (masked token + store hash), CSV, or configuration-gated Shopify OAuth. Woo/BC one-click approval is not implemented. Verified credentials are AES‑GCM encrypted; disconnect wipes them. Native certification is still required. | `POST /api/onboarding/:brandId/connect`, `/shopify/authorize`, existing `/api/portal/:brandId/connectors…` |
+| Verified display-profile suggestions remain editable and cannot set commercial/approval authority. Native Shopify reads name/contact only under the unchanged fifteen-scope ceiling; logo/refund-policy autofill is unavailable (`read_legal_policies` is not approved). Nothing missing is fabricated. | `GET /api/onboarding/:brandId`, `PATCH …/profile`, `getStoreProfile`, `sanitizeStoreProfile` |
 | Connector adapters behind one interface (`verify`, `listProducts`, `createOrder`); default HTTPS transport pins public DNS, rejects redirects and bounds request time/response size; tests inject fake transports and DNS | `server/platform/connectors.mjs` |
 | Catalog sync from Woo/BigCommerce and CSV fallback (Avafem columns or Shopify product export) into the core catalog (products land in draft/in_review with validation issues) | `POST …/connectors/:platform/sync`, `POST /api/portal/:brandId/catalog/csv`, `POST /v1/catalog/csv`, MCP `upload_catalog_csv` |
-| Catalog approval queue (validation issues + Phase 4 compliance flags); approve with the existing `POST /api/products/:id/review` | `GET /api/portal/review-queue` |
-| Operator activation (refuses while core requirements remain) | `POST /api/portal/:brandId/activate` |
+| Independent product curation queue: brand/ID/collection/type/tag/new/changed filters; exact-fingerprint atomic bulk approve/reject, stable operation and reason. Warning/block approvals require a separate exact-content override; changed listings invalidate prior approval/override. | `GET /api/admin/curation`, `POST …/bulk`, `web/CurationPanel.jsx`; individual `POST /api/products/:id/review` shares the gate |
+| Trusted-brand initial auto-approval: off by default, audited owner opt-in, one initial import only, clean/valid/non-deleted products only, never flags. Later enabling does not retroactively approve the queue; new re-sync products always need curation. | `PUT /api/admin/curation/brands/:brandId/auto-approve`, `server/platform/curation.mjs` |
+| Catalog source reconciliation: immutable source mappings, complete bounded product/variant/image reads for native Shopify callback refresh, delist missing mapped rows only after an error-free complete snapshot. Partial/error snapshots do not infer deletion; unrelated user-managed products are preserved. Price/stock updates can retain review; descriptive/evidence changes re-enter review. | `POST /api/onboarding/:brandId/refresh`, `…/sync`, `importConnectedSnapshot`, core product review fingerprints |
+| Brand activation and product approval are separate. Clean connected two-step brands can activate with deferred payouts/unlisted drafts; flagged catalog blocks activation. Legacy operator activation still refuses while its core requirements remain. | `activateConnectedBrand`, `POST /api/portal/:brandId/activate` |
 | Push an unowned Bag to the brand's selected Woo/BigCommerce store: durable cross-workflow reservation before one create, replay of verified receipts, no resend after uncertain results; provider-bound/already-mapped Bags are rejected | `POST /api/connectors/orders/:bagId/push` |
 | Connector recovery: fresh authoritative readback can confirm an existing matching order or prove an already-cancelled/unfulfilled order. Only verified void authorizes one separate, revalidated retry; leases, frozen snapshots and per-attempt markers fence stale reviewers. | `GET /api/admin/recovery/connectors`, `POST …/connectors/:bagId/resolve`, `POST …/connectors/:bagId/retry` |
 | Brand analytics: sales (gross, net, AOV, commission), returns (rate), conversion (swipes, likes, liked→purchased rate, placement impressions/clicks/CTR), top products | `GET /api/brands/:id/analytics`, `GET /v1/analytics`, MCP `get_brand_analytics` |
 | Paid placements: `featured_spot` ($25/day), `sponsored_swipe` ($10 per 1,000 impressions), `sampling_box` ($1.50/unit); approved product only; operator approval creates an `invoiced` billing record (`invoice` or `payout_offset`); cancel before start voids it; shopper feed caps sponsored swipes at purchased impressions | `/api/placements…`, `/api/billing…`, `/v1/placements`, `/v1/billing`, MCP `list_placements`, `request_placement` |
 
-Tests: `tests/platform-brands.test.mjs` (WooCommerce/BigCommerce HTTP fully mocked).
+Local regressions: `tests/platform-brands.test.mjs`, `platform-onboarding.test.mjs`,
+`platform-curation.test.mjs`, `platform-invite-lifecycle.test.mjs`,
+`platform-invite-delivery.test.mjs`, `platform-store-discovery.test.mjs`,
+`shopify-connections.test.mjs`, plus onboarding/curation UI utilities.
+WooCommerce/BigCommerce HTTP and onboarding/email providers are injected mocks;
+passing these is not native/public/email acceptance.
 Native connector certification is still outstanding. Woo creation lacks product/variation
 ID mapping and full shipping/tax authoring; Woo/BC lifecycle readback needs real-store
 validation. Woo void recovery requires an authoritative fulfillment endpoint and fails
@@ -161,10 +179,11 @@ for the dedicated test command and restrictions.
 
 ## Needs live credentials / production work (not done here)
 
+* New two-step onboarding: public HTTPS/app configuration and real native installation/invite acceptance verification; real embedded Express (currently unavailable without an adapter). Shopify logo/policy metadata is not available under the approved scopes; do not expand scopes or invent it.
 * Stripe: real Express AccountLinks + `account.updated`, real subscription/PaymentIntent charges
   (off-session, SCA), real dispute webhooks (`charge.dispute.*`) feeding `openDispute`, discount
   application of free shipping on the PaymentIntent, 1099-K reconciliation with Stripe's own filings.
-* Email/SMS provider (outbox is simulated), with unsubscribe links and STOP handling.
+* Invitation email: explicitly configure the server-only opt-in/public origin and validate real provider acceptance/delivery separately. Default setup performs no email sends or store probes. CRM email/SMS outbox remains simulated; production messaging needs unsubscribe/STOP handling.
 * WooCommerce/BigCommerce: real store credentials, webhooks for order/fulfillment sync back.
 * A shopper-facing auth layer (shopper endpoints are operator-only here).
 * Legal/tax review of the compliance rule lists, sales-tax nexus/filing, credit (Beauty Bank) escheat rules, and HIPAA/state health-privacy (e.g. WA MHMDA) obligations.

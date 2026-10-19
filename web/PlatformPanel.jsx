@@ -2,16 +2,19 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { LoaderCircle, RefreshCw, Play } from 'lucide-react';
 import { PLATFORM_SECTIONS, platformRows, platformColumns, formatCell } from './lib/platform-panel.mjs';
 import AdminRecoveryPanel from './AdminRecoveryPanel.jsx';
+import CurationPanel from './CurationPanel.jsx';
+import BrandOnboarding from './BrandOnboarding.jsx';
+import AdminInvitesPanel from './AdminInvitesPanel.jsx';
 
 /** Minimal operator panels for the CRM, money/ops, brand and compliance modules. */
-export default function PlatformPanel({ request, owner }) {
-  const sections = PLATFORM_SECTIONS.filter(s => owner || !s.adminOnly);
+export default function PlatformPanel({ request, owner,session }) {
+  const sections = PLATFORM_SECTIONS.filter(s => (owner || !s.adminOnly) && (s.id!=='onboarding' || session?.brandId));
   const [active, setActive] = useState(sections[0]?.id);
   const [state, setState] = useState({ loading: false, error: '', data: null });
   const generation=useRef(0);
   const section = sections.find(s => s.id === active);
   const load = useCallback(async () => {
-    if (!section || section.id==='recovery') return;
+    if (!section || ['recovery','curation','onboarding','invites'].includes(section.id)) return;
     const token=++generation.current;
     setState({scope:section.id,owner,loading:true,error:'',data:null});
     try { const result=await request(section.path); if(token===generation.current) setState({scope:section.id,owner,loading:false,error:'',data:result}); }
@@ -27,9 +30,9 @@ export default function PlatformPanel({ request, owner }) {
   const list = platformRows(current ? state.data : null); const columns = platformColumns(list);
   return <section className="card" aria-label="Platform modules">
     <div className="card-header"><h2>Backend &amp; CRM</h2>
-      {section?.id!=='recovery' && <button className="button small" onClick={load} disabled={state.loading}>{state.loading ? <LoaderCircle size={14} className="spin" /> : <RefreshCw size={14} />}Refresh</button>}</div>
+      {!['recovery','curation','onboarding','invites'].includes(section?.id) && <button className="button small" onClick={load} disabled={state.loading}>{state.loading ? <LoaderCircle size={14} className="spin" /> : <RefreshCw size={14} />}Refresh</button>}</div>
     <div className="tabs" role="tablist">{sections.map(s => <button key={s.id} role="tab" aria-selected={s.id === active} className={`button small ${s.id === active ? 'primary' : ''}`} onClick={() => setActive(s.id)}>{s.label}</button>)}</div>
-    {section?.id==='recovery' && owner?<AdminRecoveryPanel request={request}/>:<>
+    {section?.id==='recovery' && owner?<AdminRecoveryPanel request={request}/>:section?.id==='curation' && owner?<CurationPanel request={request} owner={owner} session={session}/>:section?.id==='invites' && owner?<AdminInvitesPanel request={request}/>:section?.id==='onboarding' && session?.brandId?<BrandOnboarding request={request} session={session} brandId={session.brandId}/>:<>
     {section?.actions?.length ? <div className="row-actions">{section.actions.map(a => <button key={a.label} className="button small" onClick={() => runAction(a)}><Play size={14} />{a.label}</button>)}</div> : null}
     {current && state.error && <p role="alert" className="form-error">{state.error}</p>}
     {section?.note && <p className="checkout-fixture-note">{section.note}</p>}

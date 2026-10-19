@@ -23,7 +23,30 @@ CREATE TABLE IF NOT EXISTS products (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE (brand_id,sku)
 );
+ALTER TABLE brands ADD COLUMN IF NOT EXISTS onboarding_mode TEXT NOT NULL DEFAULT 'legacy' CHECK (onboarding_mode IN ('legacy','two_step'));
+ALTER TABLE brands ADD COLUMN IF NOT EXISTS payout_setup TEXT NOT NULL DEFAULT 'pending' CHECK (payout_setup IN ('deferred','pending','complete'));
+ALTER TABLE brands ADD COLUMN IF NOT EXISTS onboarding_state JSONB NOT NULL DEFAULT '{}';
+ALTER TABLE brands ADD COLUMN IF NOT EXISTS auto_approve_products BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE brands ADD COLUMN IF NOT EXISTS logo_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE brands ADD COLUMN IF NOT EXISTS return_policy TEXT NOT NULL DEFAULT '';
+ALTER TABLE products ADD COLUMN IF NOT EXISTS product_type TEXT NOT NULL DEFAULT '';
+ALTER TABLE products ADD COLUMN IF NOT EXISTS collections JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE products ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE products ADD COLUMN IF NOT EXISTS source_provider TEXT;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS source_product_id TEXT;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS source_catalog_key TEXT;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS source_deleted_at TIMESTAMPTZ;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS review_fingerprint TEXT;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS reviewed_fingerprint TEXT;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS compliance_result JSONB NOT NULL DEFAULT '{}';
+ALTER TABLE products ADD COLUMN IF NOT EXISTS compliance_checked_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS products_brand_status ON products(brand_id,status);
+CREATE TABLE IF NOT EXISTS compliance_overrides (product_id TEXT PRIMARY KEY,reason TEXT NOT NULL,actor TEXT NOT NULL,fingerprint TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL);
+CREATE TABLE IF NOT EXISTS curation_audit (
+  id TEXT PRIMARY KEY,operation_id TEXT,brand_id TEXT NOT NULL REFERENCES brands(id),product_id TEXT,
+  actor TEXT NOT NULL,action TEXT NOT NULL,reason TEXT NOT NULL,fingerprint TEXT,payload JSONB NOT NULL DEFAULT '{}',created_at TIMESTAMPTZ NOT NULL
+);
 CREATE TABLE IF NOT EXISTS orders (
   id TEXT PRIMARY KEY, order_ref TEXT NOT NULL UNIQUE, currency TEXT NOT NULL DEFAULT 'USD' CHECK (currency='USD'),
   status TEXT NOT NULL DEFAULT 'paid', subtotal_cents INTEGER NOT NULL CHECK (subtotal_cents>=0),

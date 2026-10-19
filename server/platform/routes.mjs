@@ -10,6 +10,37 @@ export function registerPlatformRoutes(app, h) {
   const actor = ctx => ctx?.credentialId || (ctx?.owner ? 'owner' : ctx?.role) || 'system';
   const consent = z.object({ email: z.boolean().optional(), sms: z.boolean().optional(), marketing: z.boolean().optional(), health: z.boolean().optional() });
 
+  // Two-step onboarding is scoped to the authenticated invited brand. Public
+  // preview never bootstraps an operations session or exposes connector secrets.
+  const onboardingBrand=async r=>{const ctx=await browserRoute(r,'catalog:write');const brandId=brandScope(ctx,r.params.brandId);if(!brandId)throw Object.assign(new Error('Select a brand.'),{statusCode:422,code:'BRAND_REQUIRED'});return {ctx,brandId};};
+  app.get('/api/onboarding/invites/:token',async r=>{const invite=await platform.auth.lookupInvite(r.params.token),brand=await platform.domain.getBrand(invite.brandId);return data({brand:{id:brand.id,name:brand.name},expiresAt:invite.expiresAt,sandbox:true});});
+  app.get('/api/onboarding/session',async r=>{const ctx=await browserRoute(r);if(!ctx.brandId)throw Object.assign(new Error('An existing brand session is required.'),{statusCode:403,code:'BRAND_SESSION_REQUIRED'});return data({brandId:ctx.brandId,csrfToken:ctx.csrfToken,role:'brand',sandbox:true});});
+  app.get('/api/onboarding/:brandId',async r=>{const {brandId}=await onboardingBrand(r);return data(await platform.onboarding.status(brandId));});
+  app.post('/api/onboarding/:brandId/detect',async r=>{const {brandId,ctx}=await onboardingBrand(r);return data(await platform.onboarding.detect(brandId,z.object({storeUrl:z.string().min(1).max(2048)}).strict().parse(r.body),ctx));});
+  app.post('/api/onboarding/:brandId/connect',async r=>{const {brandId,ctx}=await onboardingBrand(r);const i=z.object({platform:z.enum(['shopify','woocommerce','bigcommerce','csv']),credentials:z.record(z.string(),z.string().max(2000)).optional()}).strict().parse(r.body);return data(await platform.onboarding.connect(brandId,i,ctx));});
+  app.post('/api/onboarding/:brandId/catalog',async r=>{const {brandId,ctx}=await onboardingBrand(r);return data(await platform.onboarding.importCsv(brandId,z.object({csv:z.string().min(1).max(3_000_000)}).strict().parse(r.body),ctx));});
+  app.post('/api/onboarding/:brandId/sync',async r=>{const {brandId,ctx}=await onboardingBrand(r);z.object({}).strict().parse(r.body || {});return data(await platform.onboarding.syncCatalog(brandId,ctx));});
+  app.post('/api/onboarding/:brandId/refresh',async r=>{const {brandId,ctx}=await onboardingBrand(r);z.object({}).strict().parse(r.body || {});return data(await platform.onboarding.refreshStore(brandId,ctx));});
+  app.patch('/api/onboarding/:brandId/profile',async r=>{const {brandId,ctx}=await onboardingBrand(r);const i=z.object({name:z.string().max(160).optional(),supportEmail:z.string().max(254).optional(),logoUrl:z.string().max(2048).optional(),returnPolicy:z.string().max(12_000).optional()}).strict().parse(r.body);return data(await platform.onboarding.updateProfile(brandId,i,ctx));});
+  for(const [path,method] of [['skip','deferPayouts'],['start','startPayouts']])app.post(`/api/onboarding/:brandId/payouts/${path}`,async r=>{const {brandId,ctx}=await onboardingBrand(r);z.object({}).strict().parse(r.body || {});return data(await platform.onboarding[method](brandId,ctx));});
+  app.post('/api/onboarding/:brandId/shopify/authorize',async(r,reply)=>{const {brandId}=await onboardingBrand(r);z.object({}).strict().parse(r.body || {});const pending=await platform.onboarding.authorizeShopify(brandId);reply.setCookie('avf_shopify_oauth',pending.browserToken,{path:'/oauth/shopify/callback',httpOnly:true,sameSite:'lax',secure:true,maxAge:600});return data({authorizationUrl:pending.url,expiresAt:pending.expiresAt,scopes:pending.scopes});});
+  const curationFilters=z.object({brandId:z.string().max(100).optional(),status:z.enum(['draft','in_review','approved','rejected']).optional(),collection:z.string().max(200).optional(),productType:z.string().max(200).optional(),tag:z.string().max(200).optional(),sinceReview:z.enum(['new','changed','new_or_changed']).optional()}).strict();
+  app.get('/api/admin/curation',async r=>{await admin(r);const {ids,...filters}=curationFilters.extend({ids:z.string().max(10_000).optional()}).parse(r.query);const selected=ids?.split(',').filter(Boolean);if(selected?.length>500)throw Object.assign(new Error('Select at most 500 product IDs.'),{statusCode:422,code:'CURATION_LIMIT'});const result=await platform.curation.queue(filters);return data({...result,products:result.products.filter(p=>!selected || selected.includes(p.id)).map(p=>({...p,isChanged:p.changedSinceReview}))});});
+  app.post('/api/admin/curation/bulk',async r=>{const ctx=await admin(r);const i=z.object({operationId:z.string().regex(/^[A-Za-z0-9_-]{8,100}$/),reason:z.string().trim().min(10).max(1000),action:z.enum(['approved','rejected']),products:z.array(z.object({id:z.string().min(1).max(100),fingerprint:z.string().regex(/^[a-f0-9]{64}$/),overrideReason:z.string().trim().min(10).max(1000).optional()}).strict()).min(1).max(500).optional(),filter:curationFilters.optional()}).strict().parse(r.body);return data(await platform.curation.bulk(i,ctx));});
+  app.put('/api/admin/curation/brands/:brandId/auto-approve',async r=>{const ctx=await admin(r);return data(await platform.curation.setAutoApprove(r.params.brandId,z.object({enabled:z.boolean(),reason:z.string().trim().min(10).max(1000)}).strict().parse(r.body),ctx));});
+  app.get('/api/admin/onboarding/:brandId/invites',async r=>{await admin(r);return data({invites:await platform.auth.listInvites(r.params.brandId),deliveries:await platform.inviteDelivery.list(r.params.brandId),capabilities:platform.inviteDelivery.capabilities()});});
+  const inviteInput=z.object({operationId:z.string().regex(/^[A-Za-z0-9_-]{8,100}$/),email:z.string().email().max(254).optional()}).strict();
+  for(const action of ['create','resend'])app.post(`/api/admin/onboarding/:brandId/invites${action==='resend'?'/:inviteId/resend':''}`,async(r,reply)=>{
+    const ctx=await admin(r),i=inviteInput.parse(r.body);await platform.domain.getBrand(r.params.brandId);
+    const out=await platform.auth.idempotent(`admin:${actor(ctx)}`,`POST ${r.url.split('?')[0]}`,i.operationId,i,async()=>{
+      const invite=action==='resend' ? await platform.auth.replaceInvite(r.params.brandId,r.params.inviteId) : await platform.auth.createInvite(r.params.brandId);
+      const delivery=await platform.inviteDelivery.send({brandId:r.params.brandId,invite,operationId:i.operationId,to:i.email});
+      await platform.auth.audit(ctx,`brand.invite_${action==='resend'?'resent':'created'}`,invite.id);
+      return {...invite,path:`/onboard/${invite.token}`,delivery};
+    });reply.code(out.statusCode);if(out.replayed)reply.header('Idempotent-Replayed','true');return out.error ? {error:out.error} : data(out.data);
+  });
+  app.post('/api/admin/onboarding/:brandId/invites/:inviteId/revoke',async r=>{const ctx=await admin(r);z.object({}).strict().parse(r.body || {});const result=await platform.auth.revokeInvite(r.params.brandId,r.params.inviteId);await platform.auth.audit(ctx,'brand.invite_revoked',r.params.inviteId);return data(result);});
+
   // ---- Phase 1: CRM / shopper ----
   app.get('/api/crm/shoppers', async r => { await admin(r); return data(await crm.listShoppers()); });
   app.post('/api/crm/shoppers', async r => { const ctx = await admin(r);

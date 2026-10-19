@@ -39,7 +39,15 @@ export function checkProduct(p) {
   const status = flags.some(f => f.severity === 'block') ? 'blocked' : flags.length ? 'flagged' : 'pass';
   return { status, supplement, flags };
 }
-const fingerprint = p => sha(JSON.stringify([p.title, p.description, p.category, p.evidence]));
+const stable = value => Array.isArray(value) ? value.map(stable) : value && typeof value === 'object'
+  ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, child]) => [key, stable(child)])) : value;
+/** Review identity excludes commercial price/stock changes, but includes every
+ * descriptive listing field so an override cannot approve a later revision. */
+export const productReviewFingerprint = p => sha(JSON.stringify(stable({ sku:p.sku || '',title: p.title, description: p.description, category: p.category,
+  images: p.images || [], evidence: p.evidence || {}, taxCode: p.taxCode || '', shippingProfile: p.shippingProfile || 'standard',
+  productType: p.productType || '', tags: p.tags || [], collections: p.collections || [],
+  variants: (p.variants || []).map(({ price, inventory, ...description }) => description) })));
+const fingerprint = productReviewFingerprint;
 
 export function createCompliance(db, { clock }) {
   const load = async (productId, query = db) => first(query, 'SELECT * FROM products WHERE id=$1', [productId]);
@@ -53,7 +61,7 @@ export function createCompliance(db, { clock }) {
       const o = p.id ? await first(query, 'SELECT * FROM compliance_overrides WHERE product_id=$1', [p.id]) : null;
       const full = p.evidence && p.title !== undefined && p.description !== undefined && p.category !== undefined;
       const overridden = Boolean(o && full && o.fingerprint === fingerprint(p));
-      return { productId: p.id || null, ...result, overridden, override: overridden ? { reason: o.reason, actor: o.actor, at: o.createdAt } : null, canGoLive: result.status !== 'blocked' || overridden };
+      return { productId: p.id || null, fingerprint: fingerprint(p), ...result, overridden, override: overridden ? { reason: o.reason, actor: o.actor, at: o.createdAt } : null, canGoLive: result.status === 'pass' || overridden };
     },
     async scanBrand(brandId) {
       const list = await rows(db, 'SELECT * FROM products WHERE brand_id=$1 ORDER BY sku', [brandId]);
@@ -61,11 +69,12 @@ export function createCompliance(db, { clock }) {
       return { brandId, blocked: out.filter(r => r.status === 'blocked' && !r.overridden).map(r => r.productId), flagged: out.filter(r => r.status === 'flagged').map(r => r.productId), checked: out.length };
     },
     /** Operator override, bound to the exact listing content: any later edit invalidates it. */
-    async override(productId, reason, actor) {
+    async override(productId, reason, actor, expectedFingerprint) {
       const why = text(reason, 1000); if (why.length < 10) throw Object.assign(new Error('Give an override reason of at least 10 characters.'), { statusCode: 422, code: 'VALIDATION_ERROR' });
       return db.transaction(async tx => {
         await tx.query('SELECT id FROM products WHERE id=$1 FOR UPDATE', [productId]);
         const p = await load(productId, tx); if (!p) throw Object.assign(new Error('Product not found.'), { statusCode: 404, code: 'NOT_FOUND' });
+        if (expectedFingerprint && expectedFingerprint !== fingerprint(p)) throw Object.assign(new Error('The product changed; refresh its review first.'), { statusCode: 409, code: 'CURATION_STALE' });
         await tx.query(`INSERT INTO compliance_overrides(product_id,reason,actor,fingerprint,created_at) VALUES($1,$2,$3,$4,$5)
           ON CONFLICT(product_id) DO UPDATE SET reason=EXCLUDED.reason,actor=EXCLUDED.actor,fingerprint=EXCLUDED.fingerprint,created_at=EXCLUDED.created_at`, [productId, why, actor, fingerprint(p), clock()]);
         return api.check(p, tx);

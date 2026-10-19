@@ -34,7 +34,7 @@ test('connector adapters normalize WooCommerce and BigCommerce products and reje
   const creds = { storeUrl: 'https://shop.example.com/any/path', consumerKey: 'ck_test', consumerSecret: 'cs_test' };
   assert.equal((await woo.verify(creds)).storeRef, 'https://shop.example.com');
   const products = await woo.listProducts(creds);
-  assert.deepEqual(products[0], { sku: 'WC-SERUM', title: 'Woo serum', description: 'Hydrating serum', priceCents: 2450, inventoryQty: 7, images: ['https://img.example.com/s.jpg'], category: 'skin', externalId: '11' });
+  assert.deepEqual(products[0], { sku: 'WC-SERUM', title: 'Woo serum', description: 'Hydrating serum', priceCents: 2450, inventoryQty: 7, images: ['https://img.example.com/s.jpg'], category: 'skin', externalId: '11',collections:['skin'] });
   assert.equal(products[1].sku, 'WC-12'); assert.deepEqual(products[1].images, []); assert.equal(products[1].inventoryQty, 0);
   await assert.rejects(woo.verify({ ...creds, consumerSecret: 'cs_wrong' }), e => e.code === 'CONNECTOR_UNAUTHORIZED');
   await assert.rejects(woo.verify({ ...creds, storeUrl: 'http://shop.example.com' }), /https/);

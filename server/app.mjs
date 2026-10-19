@@ -103,7 +103,7 @@ export async function createApp(options = {}) {
   providerEvents = await createProviderEvents(db, auth, { unifiedCheckout, stores: testStores, providerMoney, providerFulfillment, providerCatalog });
   const providerJobs = createProviderJobs(db, { unifiedCheckout, providerEvents, providerMoney, providerFulfillment,
     catalog: providerCatalog, reconciliation: providerReconciliation, taxReconciliation: providerTaxReconciliation, automation: providerAutomation });
-  platform = await createPlatform(db, { domain, auth, shopifyConnections, secret: config.encryptionKey, ...(options.domainOptions?.clock ? { clock: options.domainOptions.clock } : {}), ...(options.platform || {}) });
+  platform = await createPlatform(db, { domain, auth, shopifyConnections,publicBaseUrl:config.publicBaseUrl, secret: config.encryptionKey, ...(options.domainOptions?.clock ? { clock: options.domainOptions.clock } : {}), ...(options.platform || {}) });
   if (options.seed !== false) await seedDatabase(db, domain);
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 3 * 1024 * 1024, trustProxy: false });
   await app.register(cookie);
@@ -588,7 +588,14 @@ export async function createApp(options = {}) {
   app.post('/api/brands/:id/credentials', async request => { requireAdmin(await browserRoute(request)); await domain.getBrand(request.params.id); return data(await auth.createCredential(request.params.id, request.body)); });
   app.get('/api/brands/:id/credentials', async request => { const ctx = await browserRoute(request); brandScope(ctx, request.params.id); return data(await auth.listCredentials(request.params.id)); });
   app.delete('/api/brands/:id/credentials/:credentialId', async request => { requireAdmin(await browserRoute(request)); return data(await auth.revokeCredential(request.params.id, request.params.credentialId)); });
-  app.post('/api/brands/:id/invite', async request => { requireAdmin(await browserRoute(request)); await domain.getBrand(request.params.id); const invite = await auth.createInvite(request.params.id); return data({ ...invite, path: `/onboard/${invite.token}` }); });
+  app.post('/api/brands/:id/invite', async(request,reply)=>{
+    const ctx=await browserRoute(request);requireAdmin(ctx);await domain.getBrand(request.params.id);
+    const supplied=request.headers['idempotency-key'],key=typeof supplied==='string' && /^[A-Za-z0-9_-]{8,100}$/.test(supplied) ? supplied : randomUUID();
+    const result=await auth.idempotent('admin:owner',`POST /api/brands/${request.params.id}/invite`,key,{},async()=>{
+      const invite=await auth.createInvite(request.params.id),delivery=await platform.inviteDelivery.send({brandId:request.params.id,invite,operationId:key});
+      await auth.audit(ctx,'brand.invite_created',invite.id);return {...invite,path:`/onboard/${invite.token}`,delivery};
+    });reply.code(result.statusCode);if(result.replayed)reply.header('Idempotent-Replayed','true');return result.error ? {error:result.error} : data(result.data);
+  });
   app.get('/api/brands/:id/shopify', async request => { const ctx = await browserRoute(request); brandScope(ctx, request.params.id); return data(await shopifyConnections.status(request.params.id)); });
   app.post('/api/brands/:id/shopify/authorize', async (request, reply) => {
     requireAdmin(await browserRoute(request));
@@ -602,6 +609,11 @@ export async function createApp(options = {}) {
     const installed = await shopifyConnections.complete(params, request.cookies.avf_shopify_oauth);
     reply.clearCookie('avf_shopify_oauth', { path: '/oauth/shopify/callback', secure: true, sameSite: 'lax' });
     await domain.updateBrand(installed.brandId, { connectionTier: 'shopify', connectionHealthy: true });
+    const onboarding=(await db.query('SELECT onboarding_state FROM brands WHERE id=$1',[installed.brandId])).rows[0]?.onboarding_state;
+    if(onboarding?.platform==='shopify') {
+      try {await platform.onboarding.refreshStore(installed.brandId);}
+      catch {return data({connection:installed,catalogNeedsReview:true,message:'Store authorization is saved. Resume the brand onboarding screen to review the catalog import; do not reinstall to retry it.'});}
+    }
     // Token exchange establishes the connector, never an owner/browser login.
     return data({ connection: installed, message: 'Store authorization saved. Catalog, webhook and payment acceptance tests are still required.' });
   });

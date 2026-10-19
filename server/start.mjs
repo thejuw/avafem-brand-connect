@@ -4,6 +4,7 @@ import { randomBytes } from 'node:crypto';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createApp } from './app.mjs';
+import {redactedRequestPath} from './log-redaction.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 if (existsSync(resolve(root,'.env'))) process.loadEnvFile(resolve(root,'.env'));
@@ -33,8 +34,9 @@ const app=await createApp({
     sessionSecret:process.env.AVAFEM_SESSION_SECRET||secrets.sessionSecret,
     encryptionKey:process.env.AVAFEM_CREDENTIAL_ENCRYPTION_KEY||secrets.encryptionKey,
     adminToken:process.env.AVAFEM_ADMIN_TOKEN,publicBaseUrl:process.env.PUBLIC_BASE_URL,
-  },logger:{level:'warn',
-    serializers:{req:request=>({method:request.method,path:String(request.url || '').split('?')[0]})},
+  },platform:{onboarding:{localOnly:!process.env.PUBLIC_BASE_URL,allowStoreProbes:process.env.AVAFEM_ENABLE_STORE_DISCOVERY==='true'},
+    inviteDelivery:{enableExternal:process.env.AVAFEM_ENABLE_INVITE_EMAIL==='true',apiKey:process.env.RESEND_API_KEY,from:process.env.AVAFEM_INVITE_EMAIL_FROM}},logger:{level:'warn',
+    serializers:{req:request=>({method:request.method,path:redactedRequestPath(request.url)})},
     redact:['req.headers.authorization','req.headers.cookie','req.body','res.headers','err'],
   },
 });
