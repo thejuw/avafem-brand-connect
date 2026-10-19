@@ -53,16 +53,18 @@ export function createBrandPortal(db, { auth, domain, brands, reports, secret, c
     return m;
   }
   async function assertOwnerRemains(tx, brandId, excludingId) {
-    const owners = await first(tx, "SELECT COUNT(*)::int AS c FROM brand_members WHERE brand_id=$1 AND role='owner' AND status<>'removed' AND id<>$2", [brandId, excludingId]);
+    const owners = await first(tx, "SELECT COUNT(*)::int AS c FROM brand_members WHERE brand_id=$1 AND role='owner' AND status='active' AND id<>$2", [brandId, excludingId]);
     if (!owners.c) fail('A brand must keep at least one owner. Add another owner first.', 409, 'LAST_OWNER');
   }
   const hashPassword = async password => { const salt = randomBytes(16); const key = await scrypt(password, salt, 64, SCRYPT); return `scrypt$${SCRYPT.N}$${SCRYPT.r}$${SCRYPT.p}$${salt.toString('base64url')}$${key.toString('base64url')}`; };
   const verifyPassword = async (password, stored) => {
-    const [kind, N, r, p, salt, expected] = String(stored || 'scrypt$16384$8$1$AAAAAAAAAAAAAAAAAAAAAA$').split('$');
-    if (kind !== 'scrypt') return false;
-    const want = Buffer.from(expected || '', 'base64url');
-    const got = await scrypt(String(password), Buffer.from(salt, 'base64url'), 64, { N: Number(N), r: Number(r), p: Number(p), maxmem: SCRYPT.maxmem });
-    return want.length === got.length && timingSafeEqual(want, got);
+    // Exactly one fixed-cost KDF even for unknown/locked/ambiguous accounts or
+    // corrupt hashes. Never interpret arbitrary persisted cost parameters.
+    const valid = typeof stored === 'string' && /^scrypt\$16384\$8\$1\$[A-Za-z0-9_-]{22}\$[A-Za-z0-9_-]{86}$/.test(stored);
+    const parts = valid ? stored.split('$') : null;
+    const want = parts ? Buffer.from(parts[5], 'base64url') : Buffer.alloc(64);
+    const got = await scrypt(String(password), parts ? Buffer.from(parts[4], 'base64url') : Buffer.alloc(16), 64, SCRYPT);
+    return valid && want.length === got.length && timingSafeEqual(want, got);
   };
   const checkPassword = value => { if (typeof value !== 'string' || value.length < 12 || value.length > 200) fail('Use a password of 12 to 200 characters.'); return value; };
 
@@ -74,11 +76,12 @@ export function createBrandPortal(db, { auth, domain, brands, reports, secret, c
       const email = normalizeEmail(input.email); const role = MEMBER_ROLES.includes(input.role) ? input.role : fail('role must be owner, staff or finance.');
       await domain.getBrand(brandId);
       return db.transaction(async tx => {
+        await auth.requireMemberOwner(tx, brandId, ctx);
         const key = emailKey(email);
         const existing = await first(tx, 'SELECT * FROM brand_members WHERE brand_id=$1 AND email_key=$2 FOR UPDATE', [brandId, key]);
         if (existing && existing.status !== 'removed') fail('This person is already on your team.', 409, 'MEMBER_EXISTS');
         const member = existing
-          ? await first(tx, "UPDATE brand_members SET role=$2,status='invited',password_hash=NULL,failed_logins=0,locked_until=NULL,removed_at=NULL,invited_by=$3,updated_at=$4 WHERE id=$1 RETURNING *", [existing.id, role, actorOf(ctx), now()])
+          ? await first(tx, "UPDATE brand_members SET role=$2,status='invited',password_hash=NULL,failed_logins=0,locked_until=NULL,removed_at=NULL,auth_version=auth_version+1,invited_by=$3,updated_at=$4 WHERE id=$1 RETURNING *", [existing.id, role, actorOf(ctx), now()])
           : await first(tx, "INSERT INTO brand_members(id,brand_id,email_key,email_enc,role,status,invited_by,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'invited',$6,$7,$7) RETURNING *",
             [id('member'), brandId, key, auth.encrypt(email), role, actorOf(ctx), now()]);
         const sent = await issueLink(tx, member, 'invite');
@@ -89,6 +92,7 @@ export function createBrandPortal(db, { auth, domain, brands, reports, secret, c
     async changeRole(brandId, memberId, role, ctx) {
       if (!MEMBER_ROLES.includes(role)) fail('role must be owner, staff or finance.');
       return db.transaction(async tx => {
+        await auth.requireMemberOwner(tx, brandId, ctx);
         const m = await memberRow(tx, brandId, memberId, true);
         if (m.role === 'owner' && role !== 'owner') await assertOwnerRemains(tx, brandId, m.id);
         const out = await first(tx, 'UPDATE brand_members SET role=$2,updated_at=$3 WHERE id=$1 RETURNING *', [m.id, role, now()]);
@@ -98,9 +102,10 @@ export function createBrandPortal(db, { auth, domain, brands, reports, secret, c
     },
     async removeMember(brandId, memberId, ctx) {
       return db.transaction(async tx => {
+        await auth.requireMemberOwner(tx, brandId, ctx);
         const m = await memberRow(tx, brandId, memberId, true);
         if (m.role === 'owner') await assertOwnerRemains(tx, brandId, m.id);
-        await tx.query("UPDATE brand_members SET status='removed',removed_at=$2,password_hash=NULL,updated_at=$2 WHERE id=$1", [m.id, now()]);
+        await tx.query("UPDATE brand_members SET status='removed',removed_at=$2,password_hash=NULL,auth_version=auth_version+1,updated_at=$2 WHERE id=$1", [m.id, now()]);
         await tx.query('DELETE FROM auth_sessions WHERE member_id=$1', [m.id]);
         await tx.query('UPDATE brand_login_tokens SET consumed_at=$2 WHERE member_id=$1 AND consumed_at IS NULL', [m.id, now()]);
         await audit(tx, ctx, brandId, 'brand_member.removed', m.id);
@@ -111,8 +116,12 @@ export function createBrandPortal(db, { auth, domain, brands, reports, secret, c
     async requestLogin(rawEmail) {
       let email; try { email = normalizeEmail(rawEmail); } catch { return { requested: true }; }
       await db.transaction(async tx => {
-        const members = await rows(tx, "SELECT * FROM brand_members WHERE email_key=$1 AND status IN ('invited','active') ORDER BY brand_id FOR UPDATE", [emailKey(email)]);
-        for (const m of members.slice(0, 10)) if (await issueLink(tx, m, m.status === 'invited' ? 'invite' : 'login')) await audit(tx, { memberId: m.id }, m.brandId, 'brand_auth.link_requested', m.id);
+        const members = await rows(tx, "SELECT id,brand_id FROM brand_members WHERE email_key=$1 AND status IN ('invited','active') ORDER BY brand_id LIMIT 10", [emailKey(email)]);
+        for (const candidate of members) {
+          await auth.lockBrandMembership(tx, candidate.brandId);
+          const m = await first(tx, "SELECT * FROM brand_members WHERE id=$1 AND brand_id=$2 AND status IN ('invited','active') FOR UPDATE", [candidate.id, candidate.brandId]);
+          if (m && await issueLink(tx, m, m.status === 'invited' ? 'invite' : 'login')) await audit(tx, { memberId: m.id }, m.brandId, 'brand_auth.link_requested', m.id);
+        }
       });
       return { requested: true };
     },
@@ -120,45 +129,62 @@ export function createBrandPortal(db, { auth, domain, brands, reports, secret, c
     async consumeLink(raw) {
       if (typeof raw !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(raw)) fail('This sign-in link is invalid, expired or already used.', 401, 'LOGIN_LINK_INVALID');
       return db.transaction(async tx => {
-        const t = await first(tx, 'SELECT * FROM brand_login_tokens WHERE token_hash=$1 FOR UPDATE', [hash(raw)]);
-        if (!t || t.consumedAt || new Date(t.expiresAt) <= now()) fail('This sign-in link is invalid, expired or already used.', 401, 'LOGIN_LINK_INVALID');
-        await tx.query('UPDATE brand_login_tokens SET consumed_at=$2 WHERE token_hash=$1', [hash(raw), now()]);
-        const m = await first(tx, "SELECT * FROM brand_members WHERE id=$1 AND brand_id=$2 AND status IN ('invited','active') FOR UPDATE", [t.memberId, t.brandId]);
+        const hint = await first(tx, 'SELECT member_id,brand_id FROM brand_login_tokens WHERE token_hash=$1', [hash(raw)]);
+        if (!hint) fail('This sign-in link is invalid, expired or already used.', 401, 'LOGIN_LINK_INVALID');
+        await auth.lockBrandMembership(tx, hint.brandId);
+        const m = await first(tx, "SELECT * FROM brand_members WHERE id=$1 AND brand_id=$2 AND status IN ('invited','active') FOR UPDATE", [hint.memberId, hint.brandId]);
         if (!m) fail('This sign-in link is invalid, expired or already used.', 401, 'LOGIN_LINK_INVALID');
+        const t = await first(tx, 'SELECT * FROM brand_login_tokens WHERE token_hash=$1 FOR UPDATE', [hash(raw)]);
+        if (!t || t.memberId !== m.id || t.brandId !== m.brandId || t.consumedAt || !Number.isFinite(new Date(t.expiresAt).getTime()) || new Date(t.expiresAt) <= now()) fail('This sign-in link is invalid, expired or already used.', 401, 'LOGIN_LINK_INVALID');
+        await tx.query('UPDATE brand_login_tokens SET consumed_at=$2 WHERE token_hash=$1', [hash(raw), now()]);
         const out = await first(tx, "UPDATE brand_members SET status='active',last_login_at=$2,failed_logins=0,locked_until=NULL,updated_at=$2 WHERE id=$1 RETURNING *", [m.id, now()]);
         await audit(tx, { memberId: m.id }, m.brandId, 'brand_auth.link_login', m.id);
-        return view(out);
+        return { ...view(out), sessionVersion: out.authVersion };
       });
     },
     async passwordLogin({ email: rawEmail, password, brandId }) {
       const invalid = () => fail('Email or password is incorrect.', 401, 'INVALID_LOGIN');
       let email; try { email = normalizeEmail(rawEmail); } catch { await verifyPassword('x', null); invalid(); }
       if (typeof password !== 'string' || password.length > 200) { await verifyPassword('x', null); invalid(); }
-      const candidates = await rows(db, "SELECT * FROM brand_members WHERE email_key=$1 AND status='active' AND password_hash IS NOT NULL" + (brandId ? ' AND brand_id=$2' : '') + ' ORDER BY brand_id', brandId ? [emailKey(email), brandId] : [emailKey(email)]);
-      if (!candidates.length) { await verifyPassword(password, null); invalid(); }
-      const matched = [];
-      for (const m of candidates.slice(0, 10)) {
-        if (m.lockedUntil && new Date(m.lockedUntil) > now()) { await verifyPassword(password, null); continue; }
-        if (await verifyPassword(password, m.passwordHash)) matched.push(m);
-        else await db.transaction(async tx => {
-          const r = await first(tx, 'UPDATE brand_members SET failed_logins=failed_logins+1 WHERE id=$1 RETURNING failed_logins', [m.id]);
-          if (r.failedLogins >= MAX_FAILED_LOGINS) { await tx.query('UPDATE brand_members SET locked_until=$2,failed_logins=0 WHERE id=$1', [m.id, new Date(now().getTime() + LOCK_MS)]); await audit(tx, { memberId: m.id }, m.brandId, 'brand_auth.locked', m.id); }
-        });
-      }
-      if (!matched.length) invalid();
-      if (matched.length > 1) fail('This email belongs to several brands. Choose the brand to sign in to.', 409, 'BRAND_REQUIRED');
-      const out = await first(db, 'UPDATE brand_members SET failed_logins=0,locked_until=NULL,last_login_at=$2 WHERE id=$1 RETURNING *', [matched[0].id, now()]);
-      await audit(db, { memberId: out.id }, out.brandId, 'brand_auth.password_login', out.id);
-      return view(out);
+      const candidates = await rows(db, "SELECT * FROM brand_members WHERE email_key=$1 AND status='active' AND password_hash IS NOT NULL" + (brandId ? ' AND brand_id=$2' : '') + ' ORDER BY brand_id LIMIT 2', brandId ? [emailKey(email), brandId] : [emailKey(email)]);
+      // Multiple memberships require an explicit brand ID or emailed link; do
+      // not leak their count through status or one expensive KDF per member.
+      const candidate = candidates.length === 1 ? candidates[0] : null;
+      const unlocked = candidate && !(candidate.lockedUntil && new Date(candidate.lockedUntil) > now());
+      const matches = await verifyPassword(password, unlocked ? candidate.passwordHash : null);
+      if (!candidate) invalid();
+      const out = await db.transaction(async tx => {
+        await auth.lockBrandMembership(tx, candidate.brandId);
+        const m = await first(tx, 'SELECT * FROM brand_members WHERE id=$1 AND brand_id=$2 FOR UPDATE', [candidate.id, candidate.brandId]);
+        if (!m || m.status !== 'active' || m.passwordHash !== candidate.passwordHash || m.authVersion !== candidate.authVersion || (m.lockedUntil && new Date(m.lockedUntil) > now())) return null;
+        if (!matches) {
+          const count = m.failedLogins + 1;
+          await tx.query('UPDATE brand_members SET failed_logins=$2,locked_until=$3 WHERE id=$1', [m.id, count >= MAX_FAILED_LOGINS ? 0 : count, count >= MAX_FAILED_LOGINS ? new Date(now().getTime() + LOCK_MS) : null]);
+          if (count >= MAX_FAILED_LOGINS) await audit(tx, { memberId: m.id }, m.brandId, 'brand_auth.locked', m.id);
+          return null; // commit the failure counter, then return the generic error
+        }
+        const result = await first(tx, 'UPDATE brand_members SET failed_logins=0,locked_until=NULL,last_login_at=$2 WHERE id=$1 RETURNING *', [m.id, now()]);
+        await audit(tx, { memberId: m.id }, m.brandId, 'brand_auth.password_login', m.id);
+        return result;
+      });
+      if (!out) invalid();
+      return { ...view(out), sessionVersion: out.authVersion };
     },
     async setPassword(ctx, { currentPassword, newPassword }) {
       if (!ctx.memberId) fail('Sign in with your own email to set a password.', 403, 'MEMBER_SESSION_REQUIRED');
       checkPassword(newPassword);
       const m = await memberRow(db, ctx.brandId, ctx.memberId);
-      if (m.passwordHash && !(typeof currentPassword === 'string' && await verifyPassword(currentPassword, m.passwordHash))) fail('Your current password is incorrect.', 403, 'INVALID_PASSWORD');
-      await db.query('UPDATE brand_members SET password_hash=$2,updated_at=$3 WHERE id=$1', [m.id, await hashPassword(newPassword), now()]);
-      await auth.deleteMemberSessions(m.id, ctx.tokenHash);
-      await audit(db, ctx, ctx.brandId, 'brand_auth.password_set', m.id);
+      if (m.passwordHash && !(typeof currentPassword === 'string' && currentPassword.length <= 200 && await verifyPassword(currentPassword, m.passwordHash))) fail('Your current password is incorrect.', 403, 'INVALID_PASSWORD');
+      const nextHash = await hashPassword(newPassword);
+      await db.transaction(async tx => {
+        await auth.lockBrandMembership(tx, ctx.brandId);
+        const fresh = await memberRow(tx, ctx.brandId, ctx.memberId, true);
+        if (fresh.status !== 'active' || fresh.passwordHash !== m.passwordHash || fresh.authVersion !== m.authVersion) fail('Sign in again before changing your password.', 409, 'PASSWORD_CHANGED');
+        await tx.query('UPDATE brand_members SET password_hash=$2,auth_version=auth_version+1,updated_at=$3 WHERE id=$1', [m.id, nextHash, now()]);
+        await tx.query('DELETE FROM auth_sessions WHERE member_id=$1 AND token_hash IS DISTINCT FROM $2', [m.id, ctx.tokenHash || null]);
+        await tx.query('UPDATE brand_login_tokens SET consumed_at=$2 WHERE member_id=$1 AND consumed_at IS NULL', [m.id, now()]);
+        await audit(tx, ctx, ctx.brandId, 'brand_auth.password_set', m.id);
+      });
       return { passwordSet: true, otherSessionsSignedOut: true };
     },
     async me(ctx) {

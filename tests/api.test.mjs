@@ -79,7 +79,7 @@ test('disabled local bootstrap requires the configured owner token',async t=>{
   assertStatus(session,200); assert.equal(payload(session).role,'admin');
 });
 
-test('an accepted invite creates a non-owner tenant session and cannot grant admin access',async t=>{
+test('an accepted invite creates an onboarding-only tenant capability, not operational or admin access',async t=>{
   const {request,ownerRequest,domain}=await fixture(t);
   const invitation=await ownerRequest({method:'POST',url:'/api/brands/brand_bloom/invite',payload:{}});
   assertStatus(invitation,200);
@@ -92,8 +92,8 @@ test('an accepted invite creates a non-owner tenant session and cannot grant adm
   const brands=await asBrand({method:'GET',url:'/api/brands'});
   assertStatus(brands,200); assert.deepEqual(payload(brands).map(brand=>brand.id),['brand_bloom']);
   const own=(await domain.listBags({brandId:'brand_bloom'}))[0], foreign=(await domain.listBags({brandId:'brand_lunelle'}))[0];
-  assertStatus(await asBrand({method:'GET',url:`/api/bags/${own.id}`}),200);
-  assertStatus(await asBrand({method:'GET',url:`/api/bags/${foreign.id}`}),404);
+  assertStatus(await asBrand({method:'GET',url:`/api/bags/${own.id}`}),403);
+  assertStatus(await asBrand({method:'GET',url:`/api/bags/${foreign.id}`}),403);
   assertStatus(await asBrand({method:'GET',url:'/api/bags?brandId=brand_lunelle'}),403);
   for (const options of [
     {method:'POST',url:'/api/jobs/run',payload:{}},
@@ -102,8 +102,9 @@ test('an accepted invite creates a non-owner tenant session and cannot grant adm
     {method:'POST',url:'/api/products/nonexistent/review',payload:{decision:'approved'}},
     {method:'POST',url:'/api/refunds/nonexistent/approve',payload:{}},
   ]) assertStatus(await asBrand(options),403);
+  assertStatus(await asBrand({method:'GET',url:'/api/onboarding/session'}),200);
   for (const url of ['/api/bags','/api/finance','/api/events']) {
-    const response=await asBrand({method:'GET',url}); assertStatus(response,200);
+    const response=await asBrand({method:'GET',url}); assertStatus(response,403);
     assert.ok(!response.body.includes('brand_lunelle')); assert.ok(!response.body.includes('brand_hearth'));
   }
 });

@@ -152,7 +152,7 @@ test('strict brand isolation across browser, API and MCP', async t => {
   const code = async o => (await bloom.req(o)).statusCode;
   for (const url of ['/api/brand-portal/members?brandId=brand_lunelle', '/api/brand-portal/dashboard?brandId=brand_lunelle', '/api/brand-portal/products?brandId=brand_lunelle',
     '/api/brand-portal/statements?month=2026-10&brandId=brand_lunelle', '/api/brand-portal/reports/annual?year=2026&brandId=brand_lunelle', '/api/admin/brand-auth/outbox'])
-    assert.equal(await code({ method: 'GET', url }), 403, url);
+    assert.equal(await code({ method: 'GET', url }), url === '/api/admin/brand-auth/outbox' ? 404 : 403, url);
   assert.equal(await code({ method: 'PATCH', url: `/api/brand-portal/members/${lunelleMember.id}`, payload: { role: 'staff' } }), 404, 'other brand member invisible');
   assert.equal(await code({ method: 'DELETE', url: `/api/brand-portal/members/${lunelleMember.id}` }), 404);
   assert.equal(await code({ method: 'POST', url: `/api/brand-portal/products/${lunelleProduct.id}/resubmit` }), 404);
@@ -180,15 +180,17 @@ test('strict brand isolation across browser, API and MCP', async t => {
   assert.equal((await bloom.req({ method: 'GET', url: '/api/brand-auth/me' })).statusCode, 401, 'session/member brand mismatch rejected');
 });
 
-test('invite-link sessions still work and act as brand owner', async t => {
+test('invite-link sessions retain onboarding catalog access without identified owner authority', async t => {
   const { f } = await portal(t);
   const invite = await f.ok(f.owner({ method: 'POST', url: '/api/admin/onboarding/brand_hearth/invites', payload: { operationId: opId() } }));
   const accepted = await f.request({ method: 'POST', url: `/api/invites/${invite.token}/accept`, payload: { acceptedSandboxTerms: true } });
   assert.equal(accepted.statusCode, 200, accepted.body);
   const cookie = cookieOf(accepted); const csrf = accepted.json().data.csrfToken;
   const me = await f.ok(f.request({ method: 'GET', url: '/api/brand-auth/me', headers: { cookie } }));
-  assert.equal(me.role, 'owner'); assert.equal(me.session, 'invite_link');
-  await f.ok(f.request({ method: 'POST', url: '/api/brand-portal/members', headers: { cookie, 'x-csrf-token': csrf }, payload: { operationId: opId(), email: 'boss@hearth.example', role: 'owner' } }));
+  assert.equal(me.role, 'invite'); assert.equal(me.session, 'invite_link');
+  assert.deepEqual(me.scopes, ['catalog:read','catalog:write']);
+  assert.equal((await f.request({ method: 'POST', url: '/api/brand-portal/members', headers: { cookie, 'x-csrf-token': csrf }, payload: { operationId: opId(), email: 'boss@hearth.example', role: 'owner' } })).statusCode,403);
+  assert.equal((await f.request({method:'GET',url:'/api/brand-portal/products',headers:{cookie}})).statusCode,200);
   assert.equal((await f.request({ method: 'PUT', url: '/api/brand-auth/password', headers: { cookie, 'x-csrf-token': csrf }, payload: { newPassword: 'long enough password' } })).json().error.code, 'MEMBER_SESSION_REQUIRED');
 });
 
@@ -244,7 +246,7 @@ test('statements and annual report are brand-scoped, finance/owner only, CSV-saf
   assert.equal(actions.length, 4); assert(actions.every(a => a.actor.startsWith('member:')));
   const { csvCell } = await import('../server/platform/brand-portal.mjs');
   assert.equal(csvCell('=HYPERLINK("x")'), `"'=HYPERLINK(""x"")"`); assert.equal(csvCell('-1+1'), `"'-1+1"`); assert.equal(csvCell(42), '42');
-  // Simulated outbox is operator-only
-  assert.equal((await f.owner({ method: 'GET', url: '/api/admin/brand-auth/outbox' })).statusCode, 200);
+  // Raw sign-in links are not exposed over HTTP without explicit local-only opt-in.
+  assert.equal((await f.owner({ method: 'GET', url: '/api/admin/brand-auth/outbox' })).statusCode, 404);
   f.advance(0); assert.ok(DAY);
 });

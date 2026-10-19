@@ -10,6 +10,9 @@ import {createCompliance,productReviewFingerprint} from '../server/platform/comp
 import {createSubscriptions} from '../server/platform/commerce.mjs';
 import {createBeautyBank,createConsole} from '../server/platform/money.mjs';
 import {platformFixture} from './helpers/platform-fixture.mjs';
+import {createBrandPortal} from '../server/platform/brand-portal.mjs';
+import {createAuth,hash} from '../server/auth.mjs';
+import {createBrandAuthDelivery} from '../server/platform/brand-auth-delivery.mjs';
 
 const postgresUrl=process.env.AVAFEM_TEST_POSTGRES_URL;
 if (process.env.AVAFEM_REQUIRE_POSTGRES==='1' && !postgresUrl) throw new Error('AVAFEM_TEST_POSTGRES_URL is required for the PostgreSQL job.');
@@ -238,4 +241,125 @@ test('real Postgres: catalog leases fence independent readers and expired writer
   const queue=await f.platform.curation.queue({brandId:brand.id});
   assert.equal(queue.products.some(p=>p.sku==='PG-REMOVED'),false,'delisted rows are not offered for approval');
   assert.equal((await f.db.query("SELECT COUNT(*)::int AS n FROM outbox_events WHERE brand_id=$1 AND type='product.delisted'",[brand.id])).rows[0].n,1);
+});
+
+const portalOperator={owner:true,role:'admin'};
+const otherPortal=f=>createBrandPortal(f.db2,{auth:f.auth,domain:f.domain,brands:f.platform.brands,reports:f.platform.reports,secret:f.config.encryptionKey,clock:f.clock});
+async function portalMember(f,email,role='owner') {
+  const m=await f.platform.portal.addMember('brand_bloom',{email,role},portalOperator);
+  const mail=(await f.platform.portal.outbox({memberId:m.id}))[0];
+  return f.platform.portal.consumeLink(/#invite=([A-Za-z0-9_-]{43})/.exec(mail.body)[1]);
+}
+async function waitForPortalLock(f) {
+  const deadline=Date.now()+5000;
+  while(Date.now()<deadline) {
+    if((await f.control.query("SELECT 1 FROM pg_stat_activity WHERE application_name=$1 AND wait_event_type='Lock'",[f.worker2Name])).rows.length)return;
+    await new Promise(resolve=>setTimeout(resolve,20));
+  }
+  assert.fail('the independent pool did not wait on the raw PostgreSQL row lock');
+}
+
+test('real Postgres: member-row supersession fences an in-flight link verifier and two pools consume once',options,async t=>{
+  const f=await fixture(t),other=otherPortal(f),m=await portalMember(f,'pg-link@example.invalid');
+  await f.platform.portal.requestLogin(m.email);
+  let mail=(await f.platform.portal.outbox({memberId:m.id}))[0];
+  const raw=/#token=([A-Za-z0-9_-]{43})/.exec(mail.body)[1];
+  const schema=(await f.db.query('SELECT current_schema() AS schema')).rows[0].schema;
+  const client=await f.control.connect();let outcome;
+  try {
+    await client.query('BEGIN');
+    await client.query(`SELECT id FROM "${schema}".brand_members WHERE id=$1 FOR UPDATE`,[m.id]);
+    outcome=other.consumeLink(raw).then(value=>({value}),error=>({error}));
+    await waitForPortalLock(f);
+    // Models newer-link/removal invalidation while bypassing the application's
+    // advisory lock: verifier must re-read the token after its member row lock.
+    await client.query(`UPDATE "${schema}".brand_login_tokens SET consumed_at=NOW() WHERE token_hash=$1`,[hash(raw)]);
+    await client.query('COMMIT');
+  } finally {await client.query('ROLLBACK');client.release();}
+  assert.equal((await outcome).error?.code,'LOGIN_LINK_INVALID');
+  await f.platform.portal.requestLogin(m.email);
+  mail=(await f.platform.portal.outbox({memberId:m.id}))[0];
+  const newest=/#token=([A-Za-z0-9_-]{43})/.exec(mail.body)[1];
+  const both=await Promise.allSettled([f.platform.portal.consumeLink(newest),other.consumeLink(newest)]);
+  assert.equal(both.filter(r=>r.status==='fulfilled').length,1);
+  assert.equal(both.find(r=>r.status==='rejected').reason.code,'LOGIN_LINK_INVALID');
+});
+
+test('real Postgres: per-brand owner lock reevaluates last-owner eligibility and serializes duplicate additions',options,async t=>{
+  const f=await fixture(t),other=otherPortal(f),a=await portalMember(f,'pg-owner-a@example.invalid'),b=await portalMember(f,'pg-owner-b@example.invalid');
+  const schema=(await f.db.query('SELECT current_schema() AS schema')).rows[0].schema;
+  const client=await f.control.connect();let outcome;
+  try {
+    await client.query('BEGIN');
+    await client.query(`SELECT id FROM "${schema}".brands WHERE id='brand_bloom' FOR UPDATE`);
+    outcome=other.removeMember('brand_bloom',a.id,portalOperator).then(value=>({value}),error=>({error}));
+    await waitForPortalLock(f);
+    await client.query(`UPDATE "${schema}".brand_members SET role='staff' WHERE id=$1`,[b.id]);
+    await client.query('COMMIT');
+  } finally {await client.query('ROLLBACK');client.release();}
+  assert.equal((await outcome).error?.code,'LAST_OWNER');
+  await f.platform.portal.changeRole('brand_bloom',b.id,'owner',portalOperator);
+  const changes=await Promise.allSettled([f.platform.portal.removeMember('brand_bloom',a.id,portalOperator),other.changeRole('brand_bloom',b.id,'staff',portalOperator)]);
+  assert.equal(changes.filter(r=>r.status==='fulfilled').length,1);
+  assert.equal(changes.find(r=>r.status==='rejected').reason.code,'LAST_OWNER');
+  assert.equal((await f.db.query("SELECT COUNT(*)::int AS n FROM brand_members WHERE brand_id='brand_bloom' AND role='owner' AND status='active'")).rows[0].n,1);
+  const body={email:'pg-unique@example.invalid',role:'staff'};
+  const adds=await Promise.allSettled([f.platform.portal.addMember('brand_bloom',body,portalOperator),other.addMember('brand_bloom',body,portalOperator)]);
+  assert.equal(adds.filter(r=>r.status==='fulfilled').length,1);
+  assert.equal(adds.find(r=>r.status==='rejected').reason.code,'MEMBER_EXISTS');
+});
+
+test('real Postgres: password success cannot clear a newly locked row and removed membership cannot receive a session',options,async t=>{
+  const f=await fixture(t),other=otherPortal(f),m=await portalMember(f,'pg-password@example.invalid');
+  const ctx={memberId:m.id,brandId:m.brandId,role:'brand',memberRole:'owner'};
+  await f.platform.portal.setPassword(ctx,{newPassword:'Synthetic PostgreSQL password 123!'});
+  const schema=(await f.db.query('SELECT current_schema() AS schema')).rows[0].schema;
+  const client=await f.control.connect();let outcome;
+  try {
+    await client.query('BEGIN');
+    await client.query(`SELECT id FROM "${schema}".brand_members WHERE id=$1 FOR UPDATE`,[m.id]);
+    outcome=other.passwordLogin({email:m.email,password:'Synthetic PostgreSQL password 123!'}).then(value=>({value}),error=>({error}));
+    await waitForPortalLock(f);
+    await client.query(`UPDATE "${schema}".brand_members SET locked_until=$2 WHERE id=$1`,[m.id,new Date(f.clock().getTime()+900_000)]);
+    await client.query('COMMIT');
+  } finally {await client.query('ROLLBACK');client.release();}
+  assert.equal((await outcome).error?.code,'INVALID_LOGIN');
+  assert.ok(new Date((await f.db.query('SELECT locked_until FROM brand_members WHERE id=$1',[m.id])).rows[0].locked_until)>f.clock());
+  const secondAuth=await createAuth(f.db2,{sessionSecret:f.config.sessionSecret,encryptionKey:f.config.encryptionKey,clock:f.clock});
+  await f.db.query("UPDATE brand_members SET status='removed',auth_version=auth_version+1 WHERE id=$1",[m.id]);
+  await assert.rejects(secondAuth.createSession({brandId:m.brandId,memberId:m.id,memberVersion:m.sessionVersion}),e=>e.code==='SESSION_INVALID');
+  assert.equal((await f.db.query('SELECT COUNT(*)::int AS n FROM auth_sessions WHERE member_id=$1',[m.id])).rows[0].n,0);
+});
+
+test('real Postgres: independently pooled owners issue one hash-only API key and replay never reveals its secret',options,async t=>{
+  const f=await fixture(t),m=await portalMember(f,'pg-key@example.invalid');
+  const secondAuth=await createAuth(f.db2,{sessionSecret:f.config.sessionSecret,encryptionKey:f.config.encryptionKey,clock:f.clock});
+  const ctx={memberId:m.id,brandId:m.brandId,role:'brand',memberRole:'owner'};
+  const input={operationId:'postgres_key_issue_once',scopes:['orders:read'],label:'PostgreSQL fixture'};
+  const both=await Promise.all([f.auth.createManagedApiKey(m.brandId,input,ctx),secondAuth.createManagedApiKey(m.brandId,input,ctx)]);
+  assert.equal(both.filter(r=>r.apiKey).length,1);assert.equal(both.filter(r=>r.replayed && !r.apiKey).length,1);
+  assert.equal(both[0].id,both[1].id);
+  const stored=JSON.stringify((await f.db.query('SELECT * FROM api_credentials')).rows)+JSON.stringify((await f.db.query('SELECT * FROM member_api_key_operations')).rows);
+  assert.ok(!stored.includes(both.find(r=>r.apiKey).apiKey));
+  assert.equal((await f.db.query('SELECT COUNT(*)::int AS n FROM member_api_key_operations WHERE operation_id=$1',[input.operationId])).rows[0].n,1);
+});
+
+test('real Postgres: independently pooled auth email workers claim one dispatch and never resend an unknown outcome',options,async t=>{
+  const f=await fixture(t);
+  await f.platform.portal.addMember('brand_bloom',{email:'pg-mail@example.invalid',role:'staff'},portalOperator);
+  // Test fixture only: replace the encrypted relative link with the fixed,
+  // configured HTTPS origin. No provider or application runtime is contacted.
+  const mail=(await f.db.query('SELECT id,body_enc FROM brand_auth_outbox')).rows[0];
+  await f.db.query('UPDATE brand_auth_outbox SET body_enc=$2 WHERE id=$1',[mail.id,f.auth.encrypt(f.auth.decrypt(mail.body_enc).replace('/brand/login#','https://portal.example.com/brand/login#'))]);
+  let calls=0;
+  const adapter={provider:'test',simulated:true,checkDomain:async()=>true,send:async()=>{calls++;throw new Error('Synthetic unknown response');}};
+  const config={auth:f.auth,clock:f.clock,publicBaseUrl:'https://portal.example.com',adapter};
+  const one=await createBrandAuthDelivery(f.db,config),two=await createBrandAuthDelivery(f.db2,config);
+  const results=await Promise.all([one.run(),two.run()]);
+  assert.equal(calls,1);assert.equal(results.reduce((n,r)=>n+r.dispatched,0),1);
+  assert.ok(results.every(r=>r.delivered===false));
+  assert.equal((await one.run()).dispatched,0);assert.equal((await two.run()).dispatched,0);
+  assert.equal((await f.db.query('SELECT state FROM brand_auth_deliveries WHERE mail_id=$1',[mail.id])).rows[0].state,'uncertain');
+  const stored=JSON.stringify((await f.db.query('SELECT * FROM brand_auth_deliveries')).rows);
+  assert.ok(!stored.includes('pg-mail@'));assert.ok(!stored.includes('#invite='));
 });

@@ -54,7 +54,7 @@ const productSchema = z.object({ title: z.string().trim().min(1).max(500), descr
 const refundSchema = z.object({ reason: z.string().trim().min(3).max(1000), amountCents: z.number().int().positive().optional(), amount: z.number().int().positive().optional() });
 
 export async function createApp(options = {}) {
-  const config = { mode: 'sandbox', host: '127.0.0.1', port: 4317, allowLocalBootstrap: true,
+  const config = { mode: 'sandbox', host: '127.0.0.1', port: 4317, allowLocalBootstrap: true, allowAuthOutbox:false,
     sessionSecret: randomBytes(48).toString('base64url'), encryptionKey: randomBytes(48).toString('base64url'), ...options.config };
   if (config.mode !== 'sandbox') throw new Error('This initial release is sandbox-only. Live payments and production launch are deliberately disabled.');
   if (!['127.0.0.1', 'localhost', '::1'].includes(config.host) && config.allowLocalBootstrap) throw new Error('Local owner bootstrap may only be enabled on a loopback listener.');
@@ -151,6 +151,13 @@ export async function createApp(options = {}) {
     if (browser && ctx.bearer) throw fail(403, 'BROWSER_SESSION_REQUIRED', 'Use the scoped /v1 API for brand integration credentials.');
     if (!ctx.bearer && !['GET','HEAD','OPTIONS'].includes(request.method)
       && !safeEqual(ctx.csrfToken, request.headers['x-csrf-token'])) throw fail(403, 'CSRF_REQUIRED', 'Refresh your session before making changes.');
+    // Finance is deliberately not a general brand/customer-data role. Keep a
+    // narrow browser allowlist as a second boundary around old unscoped routes.
+    if(browser && ctx.brandId && ctx.memberRole==='finance') {
+      const path=request.url.split('?')[0],allowed=request.method==='GET' && ['/api/brand-auth/me','/api/brand-portal/dashboard','/api/brand-portal/statements','/api/brand-portal/reports/annual','/api/finance','/api/reports/brand-payouts','/api/billing'].includes(path)
+        || request.method==='POST' && path==='/api/brand-auth/logout' || request.method==='PUT' && path==='/api/brand-auth/password';
+      if(!allowed)throw fail(403,'SCOPE_REQUIRED','Finance sessions may read financial statements and payouts, not operational/customer or store settings data.');
+    }
     if (scope && ctx.role !== 'admin') requireScope(ctx, scope);
     return ctx;
   }
@@ -162,6 +169,12 @@ export async function createApp(options = {}) {
     return requested || null;
   }
   async function browserRoute(request, scope) { return context(request, { browser: true, scope }); }
+  function identifiedOwner(ctx) {
+    if(ctx.owner)return;
+    if(!ctx.memberId)throw fail(403,'MEMBER_SESSION_REQUIRED','Sign in with your own owner email before managing team members or API keys.');
+    if(ctx.memberRole!=='owner')throw fail(403,'OWNER_REQUIRED','An identified brand owner is required.');
+  }
+  function settingsOwner(ctx) {if(ctx.memberId && ctx.memberRole!=='owner' && !ctx.owner)throw fail(403,'OWNER_REQUIRED','Brand owner or onboarding invitation required for store settings.');}
   async function localTestOwner(request) {
     const host = String(request.headers.host || '').replace(/:\d+$/, '');
     if (!config.allowLocalBootstrap || !['127.0.0.1','localhost','[::1]'].includes(host)
@@ -194,8 +207,8 @@ export async function createApp(options = {}) {
     await auth.switchBrand(ctx, brandId);
     return data({ csrfToken: ctx.csrfToken, brandId, role: brandId ? 'brand' : 'admin', sandbox: true, owner: ctx.owner });
   });
-  app.get('/api/dashboard', async request => data(await domain.dashboard({ brandId: (await browserRoute(request)).brandId })));
-  app.get('/api/brands', async request => { const ctx = await browserRoute(request); return data(ctx.brandId ? [await domain.getBrand(ctx.brandId)] : await domain.listBrands()); });
+  app.get('/api/dashboard', async request => {const ctx=await browserRoute(request,'orders:read');if(ctx.brandId){requireScope(ctx,'catalog:read');requireScope(ctx,'payouts:read');}return data(await domain.dashboard({brandId:ctx.brandId}));});
+  app.get('/api/brands', async request => { const ctx = await browserRoute(request,'catalog:read'); return data(ctx.brandId ? [await domain.getBrand(ctx.brandId)] : await domain.listBrands()); });
   app.post('/api/brands', async request => { const ctx = await browserRoute(request); requireAdmin(ctx); const created = await domain.createBrand(request.body); const result = await domain.updateBrand(created.id, request.body); await auth.audit(ctx, 'brand.created', result.id); return data(result); });
   app.patch('/api/brands/:id', async request => { const ctx = await browserRoute(request); requireAdmin(ctx); return data(await domain.updateBrand(request.params.id, request.body)); });
   app.get('/api/products', async request => { const ctx = await browserRoute(request, 'catalog:read'); return data(await domain.listProducts({ brandId: brandScope(ctx, request.query.brandId), status: request.query.status || undefined })); });
@@ -215,7 +228,7 @@ export async function createApp(options = {}) {
       paidCents: transfers.filter(t => t.status === 'paid').reduce((s,t) => s + t.amountCents - (t.reversedCents || 0), 0), sandbox: true } });
   });
   app.get('/api/events', async request => {
-    const ctx = await browserRoute(request);
+    const ctx = await browserRoute(request,'orders:read');if(ctx.brandId)requireScope(ctx,'payouts:read');
     const [events, jobs] = await Promise.all([domain.listEvents(), domain.listJobs()]);
     return data({ events: ctx.brandId ? events.filter(e => e.brandId === ctx.brandId) : events, jobs: ctx.brandId ? jobs.filter(j => j.brandId === ctx.brandId) : jobs,
       inbox: await operations.listInbox(ctx.brandId) });
@@ -585,9 +598,19 @@ export async function createApp(options = {}) {
       items: selected.map(p => ({ brandId: p.brandId, sku: p.sku, qty: 1 })) });
   }
   app.post('/api/sandbox/orders', async request => { requireAdmin(await browserRoute(request)); return data(await sandboxOrder(request.body)); });
-  app.post('/api/brands/:id/credentials', async request => { requireAdmin(await browserRoute(request)); await domain.getBrand(request.params.id); return data(await auth.createCredential(request.params.id, request.body)); });
-  app.get('/api/brands/:id/credentials', async request => { const ctx = await browserRoute(request, 'credentials:manage'); brandScope(ctx, request.params.id); return data(await auth.listCredentials(request.params.id)); });
-  app.delete('/api/brands/:id/credentials/:credentialId', async request => { requireAdmin(await browserRoute(request)); return data(await auth.revokeCredential(request.params.id, request.params.credentialId)); });
+  app.post('/api/brands/:id/credentials', async request => {
+    const ctx=await browserRoute(request);brandScope(ctx,request.params.id);identifiedOwner(ctx);await domain.getBrand(request.params.id);
+    if(ctx.role==='admin' && request.body?.operationId===undefined){const out=await auth.createCredential(request.params.id,request.body);await auth.audit({...ctx,brandId:request.params.id},'credential.created',out.id);return data(out);}
+    if(ctx.role!=='admin')requireScope(ctx,'credentials:manage');
+    const i=z.object({operationId:z.string().regex(/^[A-Za-z0-9_-]{8,100}$/),kind:z.literal('api_key').optional(),label:z.string().trim().min(1).max(100),scopes:z.array(z.enum(BRAND_SCOPES)).min(1).max(BRAND_SCOPES.length)}).strict().parse(request.body);
+    return data(await auth.createManagedApiKey(request.params.id,i,ctx));
+  });
+  app.get('/api/brands/:id/credentials', async request => { const ctx = await browserRoute(request);brandScope(ctx,request.params.id);identifiedOwner(ctx);if(ctx.role!=='admin')requireScope(ctx,'credentials:manage');const rows=await auth.listCredentials(request.params.id);return data(ctx.role==='admin'?rows:rows.filter(row=>row.kind==='api_key')); });
+  app.delete('/api/brands/:id/credentials/:credentialId', async request => {
+    const ctx=await browserRoute(request);brandScope(ctx,request.params.id);identifiedOwner(ctx);
+    if(ctx.role==='admin'){const out=await auth.revokeCredential(request.params.id,request.params.credentialId);await auth.audit({...ctx,brandId:request.params.id},'credential.revoked',request.params.credentialId);return data(out);}
+    requireScope(ctx,'credentials:manage');return data(await auth.revokeManagedApiKey(request.params.id,request.params.credentialId,ctx));
+  });
   app.post('/api/brands/:id/invite', async(request,reply)=>{
     const ctx=await browserRoute(request);requireAdmin(ctx);await domain.getBrand(request.params.id);
     const supplied=request.headers['idempotency-key'],key=typeof supplied==='string' && /^[A-Za-z0-9_-]{8,100}$/.test(supplied) ? supplied : randomUUID();
@@ -596,7 +619,7 @@ export async function createApp(options = {}) {
       await auth.audit(ctx,'brand.invite_created',invite.id);return {...invite,path:`/onboard/${invite.token}`,delivery};
     });reply.code(result.statusCode);if(result.replayed)reply.header('Idempotent-Replayed','true');return result.error ? {error:result.error} : data(result.data);
   });
-  app.get('/api/brands/:id/shopify', async request => { const ctx = await browserRoute(request); brandScope(ctx, request.params.id); return data(await shopifyConnections.status(request.params.id)); });
+  app.get('/api/brands/:id/shopify', async request => { const ctx = await browserRoute(request,'catalog:read');settingsOwner(ctx); brandScope(ctx, request.params.id); return data(await shopifyConnections.status(request.params.id)); });
   app.post('/api/brands/:id/shopify/authorize', async (request, reply) => {
     requireAdmin(await browserRoute(request));
     const pending = await shopifyConnections.begin(request.params.id, limitedString.parse(request.body?.shop));
@@ -632,6 +655,7 @@ export async function createApp(options = {}) {
     // reachable in the gap before the merchant chooses/detects a store.
     await domain.enterTwoStepOnboarding(invite.brandId, { actor: 'invite-accept' });
     await domain.updateBrand(invite.brandId, { agreementSigned: input.acceptedSandboxTerms });
+    const previous=await auth.resolveSession(request.cookies.avf_session);if(previous)await auth.deleteSession(previous.tokenHash);
     const session = await auth.createSession({ brandId: invite.brandId }); setSessionCookie(reply, session);
     return data({ csrfToken: session.csrfToken, brandId: session.brandId, role: 'brand', sandbox: true });
   });
@@ -726,6 +750,7 @@ export async function createApp(options = {}) {
   app.get('/.well-known/oauth-authorization-server', async () => ({ issuer: config.publicBaseUrl || `http://127.0.0.1:${config.port}`, token_endpoint: `${config.publicBaseUrl || `http://127.0.0.1:${config.port}`}/oauth/token`, grant_types_supported: ['client_credentials'], token_endpoint_auth_methods_supported: ['client_secret_basic','client_secret_post'], scopes_supported: BRAND_SCOPES }));
   app.get('/.well-known/oauth-protected-resource', async () => ({ resource: `${config.publicBaseUrl || `http://127.0.0.1:${config.port}`}/mcp`, authorization_servers: [config.publicBaseUrl || `http://127.0.0.1:${config.port}`], scopes_supported: BRAND_SCOPES, bearer_methods_supported: ['header'] }));
   registerPlatformRoutes(app, { platform, browserRoute, context, brandScope, requireAdmin, data, apiMutation, setSessionCookie,
+    allowAuthOutbox:config.allowAuthOutbox===true && config.mode==='sandbox' && !config.publicBaseUrl && ['127.0.0.1','localhost','::1'].includes(config.host),
     clearSessionCookie: reply => reply.clearCookie('avf_session', { path: '/', httpOnly: true, sameSite: 'strict', secure: Boolean(config.publicBaseUrl?.startsWith('https:')) }) });
   await registerMcp(app, { auth, context, actions, extraTools: platformMcpTools(platform) });
   const dist = resolve(ROOT, 'dist');

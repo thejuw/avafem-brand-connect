@@ -13,9 +13,10 @@ export function registerPlatformRoutes(app, h) {
 
   // Two-step onboarding is scoped to the authenticated invited brand. Public
   // preview never bootstraps an operations session or exposes connector secrets.
-  const onboardingBrand=async r=>{const ctx=await browserRoute(r,'catalog:write');const brandId=brandScope(ctx,r.params.brandId);if(!brandId)throw Object.assign(new Error('Select a brand.'),{statusCode:422,code:'BRAND_REQUIRED'});return {ctx,brandId};};
+  const onboardingOwner=ctx=>{if(ctx.memberId && ctx.memberRole!=='owner' && !ctx.owner)throw Object.assign(new Error('A brand owner or onboarding invitation is required for store settings.'),{statusCode:403,code:'OWNER_REQUIRED'});};
+  const onboardingBrand=async r=>{const ctx=await browserRoute(r,'catalog:write');onboardingOwner(ctx);const brandId=brandScope(ctx,r.params.brandId);if(!brandId)throw Object.assign(new Error('Select a brand.'),{statusCode:422,code:'BRAND_REQUIRED'});return {ctx,brandId};};
   app.get('/api/onboarding/invites/:token',async r=>{const invite=await platform.auth.lookupInvite(r.params.token),brand=await platform.domain.getBrand(invite.brandId);return data({brand:{id:brand.id,name:brand.name},expiresAt:invite.expiresAt,sandbox:true});});
-  app.get('/api/onboarding/session',async r=>{const ctx=await browserRoute(r);if(!ctx.brandId)throw Object.assign(new Error('An existing brand session is required.'),{statusCode:403,code:'BRAND_SESSION_REQUIRED'});return data({brandId:ctx.brandId,csrfToken:ctx.csrfToken,role:'brand',sandbox:true});});
+  app.get('/api/onboarding/session',async r=>{const ctx=await browserRoute(r,'catalog:write');onboardingOwner(ctx);if(!ctx.brandId)throw Object.assign(new Error('An existing brand session is required.'),{statusCode:403,code:'BRAND_SESSION_REQUIRED'});return data({brandId:ctx.brandId,csrfToken:ctx.csrfToken,role:'brand',sandbox:true});});
   app.get('/api/onboarding/:brandId',async r=>{const {brandId}=await onboardingBrand(r);return data(await platform.onboarding.status(brandId));});
   app.post('/api/onboarding/:brandId/detect',async r=>{const {brandId,ctx}=await onboardingBrand(r);return data(await platform.onboarding.detect(brandId,z.object({storeUrl:z.string().min(1).max(2048)}).strict().parse(r.body),ctx));});
   app.post('/api/onboarding/:brandId/connect',async r=>{const {brandId,ctx}=await onboardingBrand(r);const i=z.object({platform:z.enum(['shopify','woocommerce','bigcommerce','csv']),credentials:z.record(z.string(),z.string().max(2000)).optional()}).strict().parse(r.body);return data(await platform.onboarding.connect(brandId,i,ctx));});
@@ -137,7 +138,7 @@ export function registerPlatformRoutes(app, h) {
     });
     await platform.auth.audit(ctx, `ticket.${r.body?.action}`, r.params.id); return data(out); });
   app.get('/api/crm/brand/reviews', async r => { const ctx = await browserRoute(r, 'orders:read'); const brandId = brandScope(ctx, r.query.brandId); if (!brandId) throw Object.assign(new Error('brandId is required.'), { statusCode: 422, code: 'VALIDATION_ERROR' }); return data(await crm.brandReviews(brandId)); });
-  app.get('/api/crm/products/:id/reviews', async r => { await browserRoute(r, 'catalog:read'); return data(await crm.productReviews(r.params.id)); });
+  app.get('/api/crm/products/:id/reviews', async r => { const ctx=await browserRoute(r, 'catalog:read');await platform.domain.getProduct(r.params.id,ctx.brandId);return data(await crm.productReviews(r.params.id)); });
   app.post('/api/crm/jobs/run', async r => { await admin(r); return data(await platform.jobs()); });
 
   // Brand bearer API (scoped).
@@ -186,19 +187,20 @@ function registerBrandRoutes(app, h, admin) {
   const { platform, browserRoute, context, brandScope, data, apiMutation } = h;
   const side = platform.brands;
   const brandRoute = async (r, scope) => { const ctx = await browserRoute(r, scope); const brandId = brandScope(ctx, r.params.brandId || r.params.id || r.body?.brandId || r.query.brandId); if (!brandId) throw Object.assign(new Error('brandId is required.'), { statusCode: 422, code: 'VALIDATION_ERROR' }); return { ctx, brandId }; };
+  const settingsRoute=async(r,scope='catalog:write')=>{const result=await brandRoute(r,scope);if(result.ctx.memberId && result.ctx.memberRole!=='owner' && !result.ctx.owner)throw Object.assign(new Error('A brand owner or onboarding invitation is required for store settings.'),{statusCode:403,code:'OWNER_REQUIRED'});return result;};
   // ---- Phase 3: self-serve portal ----
   app.post('/api/portal/signup', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } }, async r => {
     const i = z.object({ brandName: z.string().min(1).max(160), email: z.string().max(320), website: z.string().max(500).optional(), category: z.string().max(100).optional(), contactName: z.string().max(120).optional() }).parse(r.body);
     const out = await side.signup(i); await platform.auth.audit({ role: 'public' }, 'portal.signup', out.brandId); return data(out); });
   app.get('/api/portal/review-queue', async r => { await admin(r); return data(await side.reviewQueue()); });
-  app.get('/api/portal/:brandId/status', async r => { const { brandId } = await brandRoute(r, 'catalog:read'); return data(await side.status(brandId)); });
-  app.patch('/api/portal/:brandId/profile', async r => { const { brandId } = await brandRoute(r, 'catalog:write'); return data(await side.updateProfile(brandId, r.body || {})); });
-  app.post('/api/portal/:brandId/stripe/link', async r => { const { brandId } = await brandRoute(r, 'payouts:read'); return data(await side.stripeLink(brandId)); });
-  app.post('/api/portal/:brandId/stripe/return', async r => { const { ctx, brandId } = await brandRoute(r, 'payouts:read'); const out = await side.stripeReturn(brandId); await platform.auth.audit(ctx, 'portal.stripe_onboarded', brandId); return data(out); });
-  app.post('/api/portal/:brandId/connect', async r => { const { ctx, brandId } = await brandRoute(r, 'catalog:write'); const i = z.object({ platform: z.enum(['shopify', 'woocommerce', 'bigcommerce', 'csv']), credentials: z.record(z.string(), z.string().max(500)).optional() }).parse(r.body); const out = await side.connect(brandId, i.platform, i.credentials); await platform.auth.audit(ctx, `connector.${i.platform}.connected`, brandId); return data(out); });
-  app.get('/api/portal/:brandId/connectors', async r => { const { brandId } = await brandRoute(r, 'catalog:read'); return data(await side.connectors(brandId)); });
-  app.post('/api/portal/:brandId/connectors/:platform/sync', async r => { const { brandId } = await brandRoute(r, 'catalog:write'); return data(await side.sync(brandId, r.params.platform)); });
-  app.delete('/api/portal/:brandId/connectors/:platform', async r => { const { brandId } = await brandRoute(r, 'catalog:write'); return data(await side.disconnect(brandId, r.params.platform)); });
+  app.get('/api/portal/:brandId/status', async r => { const { brandId } = await settingsRoute(r, 'catalog:read'); return data(await side.status(brandId)); });
+  app.patch('/api/portal/:brandId/profile', async r => { const { brandId } = await settingsRoute(r); return data(await side.updateProfile(brandId, r.body || {})); });
+  app.post('/api/portal/:brandId/stripe/link', async r => { const { brandId } = await settingsRoute(r, 'payouts:read'); return data(await side.stripeLink(brandId)); });
+  app.post('/api/portal/:brandId/stripe/return', async r => { const { ctx, brandId } = await settingsRoute(r, 'payouts:read'); const out = await side.stripeReturn(brandId); await platform.auth.audit(ctx, 'portal.stripe_onboarded', brandId); return data(out); });
+  app.post('/api/portal/:brandId/connect', async r => { const { ctx, brandId } = await settingsRoute(r); const i = z.object({ platform: z.enum(['shopify', 'woocommerce', 'bigcommerce', 'csv']), credentials: z.record(z.string(), z.string().max(500)).optional() }).parse(r.body); const out = await side.connect(brandId, i.platform, i.credentials); await platform.auth.audit(ctx, `connector.${i.platform}.connected`, brandId); return data(out); });
+  app.get('/api/portal/:brandId/connectors', async r => { const { brandId } = await settingsRoute(r, 'catalog:read'); return data(await side.connectors(brandId)); });
+  app.post('/api/portal/:brandId/connectors/:platform/sync', async r => { const { brandId } = await settingsRoute(r); return data(await side.sync(brandId, r.params.platform)); });
+  app.delete('/api/portal/:brandId/connectors/:platform', async r => { const { brandId } = await settingsRoute(r); return data(await side.disconnect(brandId, r.params.platform)); });
   app.post('/api/portal/:brandId/catalog/csv', async r => { const { brandId } = await brandRoute(r, 'catalog:write'); return data(await side.importCsv(brandId, r.body?.csv)); });
   app.post('/api/portal/:brandId/activate', async r => { const ctx = await admin(r); const out = await side.activate(r.params.brandId); await platform.auth.audit(ctx, 'brand.activated', r.params.brandId); return data(out); });
   app.post('/api/connectors/orders/:bagId/push', async r => { await admin(r); return data(await side.pushOrder(r.params.bagId)); });

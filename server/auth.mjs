@@ -52,6 +52,10 @@ export async function createAuth(db, { sessionSecret, encryptionKey, issuer = 'a
   )`;
   for (const statement of schema.split(';').filter(part => part.trim())) await db.query(statement);
   await db.query('ALTER TABLE auth_sessions ADD COLUMN IF NOT EXISTS member_id TEXT');
+  await db.query('ALTER TABLE brand_members ADD COLUMN IF NOT EXISTS auth_version INT NOT NULL DEFAULT 0');
+  await db.query(`CREATE TABLE IF NOT EXISTS member_api_key_operations (
+    brand_id TEXT NOT NULL,operation_id TEXT NOT NULL,request_hash TEXT NOT NULL,credential_id TEXT NOT NULL,
+    actor TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL,PRIMARY KEY(brand_id,operation_id))`);
   await db.query('CREATE INDEX IF NOT EXISTS auth_sessions_member ON auth_sessions(member_id)');
   await db.query('CREATE INDEX IF NOT EXISTS brand_login_tokens_member ON brand_login_tokens(member_id,created_at)');
   // Preserve older opaque invitation rows. Domain-separated opaque IDs permit
@@ -84,15 +88,36 @@ export async function createAuth(db, { sessionSecret, encryptionKey, issuer = 'a
     const decipher = createDecipheriv('aes-256-gcm', encryption, iv); decipher.setAuthTag(tag);
     return JSON.parse(Buffer.concat([decipher.update(data), decipher.final()]).toString());
   }
-  async function createSession({ owner = false, brandId = null, memberId = null } = {}) {
+  // All membership writers lock the brand before members, then login tokens.
+  // The brand row also serializes inserts and last-owner decisions across pools.
+  async function lockBrandMembership(tx, brandId) {
+    if (!(await tx.query('SELECT id FROM brands WHERE id=$1 FOR UPDATE', [brandId])).rows.length)
+      throw fail(404, 'NOT_FOUND', 'Brand not found.');
+  }
+  async function requireMemberOwner(tx, brandId, context) {
+    await lockBrandMembership(tx, brandId);
+    if (context?.owner === true && !context?.bearer) return;
+    const member = context?.memberId && context?.brandId === brandId && !context?.bearer
+      ? (await tx.query('SELECT role,status FROM brand_members WHERE id=$1 AND brand_id=$2 FOR UPDATE', [context.memberId, brandId])).rows[0] : null;
+    if (!member || member.role !== 'owner' || member.status !== 'active')
+      throw fail(403, 'IDENTIFIED_OWNER_REQUIRED', 'An active owner member must sign in for this action.');
+  }
+  async function createSession({ owner = false, brandId = null, memberId = null, memberVersion } = {}) {
     if (memberId && (owner || !brandId)) throw fail(500, 'SESSION_INVALID', 'Member sessions are brand-only.');
     const token = random(); const csrfToken = random(); const expiresAt = new Date(now() + 12 * 3600_000);
-    await db.query('INSERT INTO auth_sessions(token_hash,owner,brand_id,csrf_token,expires_at,member_id) VALUES($1,$2,$3,$4,$5,$6)', [hash(token), owner, brandId, csrfToken, expiresAt, memberId]);
+    const insert = tx => tx.query('INSERT INTO auth_sessions(token_hash,owner,brand_id,csrf_token,expires_at,member_id) VALUES($1,$2,$3,$4,$5,$6)', [hash(token), owner, brandId, csrfToken, expiresAt, memberId]);
+    if (memberId) await db.transaction(async tx => {
+      await lockBrandMembership(tx, brandId);
+      const member = (await tx.query('SELECT status,auth_version FROM brand_members WHERE id=$1 AND brand_id=$2 FOR UPDATE', [memberId, brandId])).rows[0];
+      if (!member || member.status !== 'active' || (memberVersion !== undefined && member.auth_version !== memberVersion))
+        throw fail(401, 'SESSION_INVALID', 'Sign in again to start a member session.');
+      await insert(tx);
+    }); else await insert(db);
     return { token, csrfToken, owner, brandId, memberId, role: brandId ? 'brand' : owner ? 'admin' : 'brand', expiresAt };
   }
   // Member role and status are read live on every request, so demotion or
-  // removal takes effect immediately. Invite-link and owner-workspace brand
-  // sessions (no member row) keep the original full brand owner authority.
+  // removal takes effect immediately. A legacy invitation is an onboarding
+  // capability, not an identified team owner or a financial/API credential.
   async function resolveSession(token) {
     if (!token || typeof token !== 'string' || token.length > 200) return null;
     const { rows } = await db.query(`SELECT s.*,m.role AS member_role,m.status AS member_status,m.brand_id AS member_brand FROM auth_sessions s
@@ -102,9 +127,9 @@ export async function createAuth(db, { sessionSecret, encryptionKey, issuer = 'a
     if (row.member_id && (row.member_status !== 'active' || row.member_brand !== row.brand_id || !ROLE_SCOPES[row.member_role])) {
       await db.query('DELETE FROM auth_sessions WHERE token_hash=$1', [row.token_hash]); return null;
     }
-    const memberRole = row.brand_id ? (row.member_id ? row.member_role : 'owner') : null;
+    const memberRole = row.brand_id ? (row.member_id ? row.member_role : row.owner ? 'owner' : 'invite') : null;
     return { tokenHash: row.token_hash, csrfToken: row.csrf_token, owner: row.owner, brandId: row.brand_id, memberId: row.member_id || null, memberRole,
-      role: row.brand_id ? 'brand' : row.owner ? 'admin' : 'brand', scopes: row.brand_id ? [...ROLE_SCOPES[memberRole]] : BRAND_SCOPES, expiresAt: row.expires_at };
+      role: row.brand_id ? 'brand' : row.owner ? 'admin' : 'brand', scopes: row.brand_id ? (memberRole === 'invite' ? ['catalog:read', 'catalog:write'] : [...ROLE_SCOPES[memberRole]]) : BRAND_SCOPES, expiresAt: row.expires_at };
   }
   async function deleteSession(tokenHash) { await db.query('DELETE FROM auth_sessions WHERE token_hash=$1', [tokenHash]); }
   async function deleteMemberSessions(memberId, exceptTokenHash = null) {
@@ -136,6 +161,40 @@ export async function createAuth(db, { sessionSecret, encryptionKey, issuer = 'a
     const result = await db.query('UPDATE api_credentials SET active=false WHERE id=$1 AND brand_id=$2 RETURNING id', [id, brandId]);
     if (!result.rows.length) throw fail(404, 'NOT_FOUND', 'Credential not found.');
     return { id, revoked: true };
+  }
+  async function createManagedApiKey(brandId, { operationId, scopes, label = 'Brand integration' } = {}, context) {
+    if (typeof operationId !== 'string' || !/^[A-Za-z0-9_-]{8,100}$/.test(operationId)) throw fail(422, 'INVALID_OPERATION_ID', 'Use a valid operation ID.');
+    scopes = validateScopes(scopes).sort();
+    if (typeof label !== 'string' || !label.trim() || label.length > 100 || /[\u0000-\u001f\u007f]/.test(label)) throw fail(422, 'INVALID_LABEL', 'Use a label of 1–100 characters.');
+    label = label.trim();
+    const requestHash = hash(JSON.stringify({ scopes, label }));
+    return db.transaction(async tx => {
+      await requireMemberOwner(tx, brandId, context);
+      const previous = (await tx.query('SELECT * FROM member_api_key_operations WHERE brand_id=$1 AND operation_id=$2', [brandId, operationId])).rows[0];
+      if (previous && previous.request_hash !== requestHash) throw fail(422, 'IDEMPOTENCY_CONFLICT', 'This operation ID was used with a different request.');
+      if (previous) {
+        const row = (await tx.query('SELECT id,kind,scopes,label,active FROM api_credentials WHERE brand_id=$1 AND id=$2', [brandId, previous.credential_id])).rows[0];
+        return { ...row, brandId, replayed: true, secretAvailable: false };
+      }
+      const id = `client_${random(15)}`, apiKey = `avf_test_${random()}`;
+      const actor = context?.memberId ? `member:${context.memberId}` : 'owner-workspace';
+      await tx.query("INSERT INTO api_credentials(id,brand_id,kind,secret_hash,scopes,label) VALUES($1,$2,'api_key',$3,$4,$5)", [id, brandId, hash(apiKey), JSON.stringify(scopes), label]);
+      await tx.query('INSERT INTO member_api_key_operations(brand_id,operation_id,request_hash,credential_id,actor,created_at) VALUES($1,$2,$3,$4,$5,$6)', [brandId, operationId, requestHash, id, actor, new Date(now())]);
+      await tx.query("INSERT INTO audit_log(actor,brand_id,action,resource_id) VALUES($1,$2,'brand_credential.created',$3)", [actor, brandId, id]);
+      return { id, brandId, kind: 'api_key', scopes, label, active: true, apiKey, secretAvailable: true, replayed: false };
+    });
+  }
+  async function revokeManagedApiKey(brandId, id, context) {
+    return db.transaction(async tx => {
+      await requireMemberOwner(tx, brandId, context);
+      const row = (await tx.query("SELECT active FROM api_credentials WHERE brand_id=$1 AND id=$2 AND kind='api_key' FOR UPDATE", [brandId, id])).rows[0];
+      if (!row) throw fail(404, 'NOT_FOUND', 'API key not found.');
+      if (row.active) {
+        await tx.query('UPDATE api_credentials SET active=false WHERE id=$1 AND brand_id=$2', [id, brandId]);
+        await tx.query("INSERT INTO audit_log(actor,brand_id,action,resource_id) VALUES($1,$2,'brand_credential.revoked',$3)", [context?.memberId ? `member:${context.memberId}` : 'owner-workspace', brandId, id]);
+      }
+      return { id, revoked: true, replayed: !row.active };
+    });
   }
   async function issueToken(clientId, secret, requestedScope) {
     const { rows } = await db.query("SELECT * FROM api_credentials WHERE id=$1 AND kind='oauth_client' AND active=true", [clientId]);
@@ -296,7 +355,8 @@ export async function createAuth(db, { sessionSecret, encryptionKey, issuer = 'a
     });
     if (!changed) break;
   }
-  return { deleteSession, deleteMemberSessions, createSession, resolveSession, switchBrand, createCredential, listCredentials, revokeCredential,
+  return { deleteSession, deleteMemberSessions, createSession, resolveSession, switchBrand, lockBrandMembership, requireMemberOwner,
+    createManagedApiKey, revokeManagedApiKey, createCredential, listCredentials, revokeCredential,
     issueToken, resolveBearer, createInvite, lookupInvite, consumeInvite, listInvites, revokeInvite, replaceInvite, rateLimit, idempotent, audit, encrypt, decrypt };
 }
 

@@ -10,6 +10,7 @@ import {createCuration} from './curation.mjs';
 import {createOnboarding} from './onboarding.mjs';
 import {createBrandPortal} from './brand-portal.mjs';
 import {createInviteDelivery,createResendInviteAdapter} from './invite-delivery.mjs';
+import {createBrandAuthDelivery,createResendAuthAdapter} from './brand-auth-delivery.mjs';
 
 /** Avafem platform modules layered on the canonical sandbox core. Email/SMS and
  * subscription charges are simulated. Explicitly connected Woo/BigCommerce
@@ -35,6 +36,9 @@ export async function createPlatform(db, options) {
   platform.inviteDelivery=createInviteDelivery(db,{auth,domain,clock,secret,publicBaseUrl:email.publicBaseUrl || options.publicBaseUrl,
     adapter:email.adapter || (email.enableExternal===true ? createResendInviteAdapter({apiKey:email.apiKey,from:email.from}) : null),allowExternal:email.enableExternal===true});
   platform.portal=createBrandPortal(db,{auth,domain,brands:platform.brands,reports:platform.reports,secret,clock,publicBaseUrl:options.publicBaseUrl});
+  const authEmail=options.portalEmail || {};
+  platform.portalDelivery=await createBrandAuthDelivery(db,{auth,clock,publicBaseUrl:options.publicBaseUrl,
+    adapter:authEmail.adapter || (authEmail.enableExternal===true ? createResendAuthAdapter(authEmail) : null),enableExternal:authEmail.enableExternal===true});
   platform.subscriptions = createSubscriptions(db, { clock, domain, crm: platform.crm, health, bank: platform.bank, secret, charge: options.subscriptionCharge });
   platform.shipping = createShipping(db, { clock });
   platform.privacy = createPrivacy(db, { clock, crm: platform.crm, health, bank: platform.bank, secret });
@@ -45,7 +49,7 @@ export async function createPlatform(db, options) {
     if (platform.afterRefund) await platform.afterRefund(bagId);
     return approved;
   };
-  platform.jobs = async () => ({ healthMigration: await health.migrateOutbox(),onboardingPayoutPrompts:await platform.onboarding.payoutPrompts(),subscriptions: await platform.subscriptions.runDue(), bank: await platform.bank.run(), campaigns: await platform.crm.runActiveCampaigns(),
+  platform.jobs = async () => ({ brandAuthEmail: await platform.portalDelivery.run(),healthMigration: await health.migrateOutbox(),onboardingPayoutPrompts:await platform.onboarding.payoutPrompts(),subscriptions: await platform.subscriptions.runDue(), bank: await platform.bank.run(), campaigns: await platform.crm.runActiveCampaigns(),
     alerts: (await platform.console.scan()).length });
   return platform;
 }

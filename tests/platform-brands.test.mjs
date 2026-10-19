@@ -63,7 +63,13 @@ test('explicit legacy server-owned fixture: portal profile -> mocked Stripe -> W
   // the old simulated portal. Public invitation acceptance always enters the
   // two-step flow; there is no request field or production opt-out for this.
   await f.db.query("UPDATE brands SET onboarding_mode='legacy',onboarding_state='{}',payout_setup='pending' WHERE id=$1", [signup.brandId]);
-  const cookie = String(accept.headers['set-cookie']).split(';')[0]; const csrf = accept.json().data.csrfToken;
+  // The compatibility fixture uses an identified owner; an onboarding invite
+  // intentionally has no finance/team/API-key authority in either lifecycle.
+  const invitedOwner=await f.platform.portal.addMember(signup.brandId,{email:'legacy-owner@fernflow.example',role:'owner'},{owner:true,role:'admin'});
+  const mail=(await f.platform.portal.outbox({memberId:invitedOwner.id}))[0];
+  const member=await f.platform.portal.consumeLink(/#(?:token|invite)=([A-Za-z0-9_-]{43})/.exec(mail.body)[1]);
+  const identified=await f.auth.createSession({brandId:signup.brandId,memberId:member.id,memberVersion:member.sessionVersion});
+  const cookie=`avf_session=${identified.token}`,csrf=identified.csrfToken;
   const brand = o => f.request({ ...o, headers: { cookie, 'x-csrf-token': csrf, ...o.headers } });
   const brandId = signup.brandId;
   let status = await f.ok(brand({ method: 'GET', url: `/api/portal/${brandId}/status` }));
