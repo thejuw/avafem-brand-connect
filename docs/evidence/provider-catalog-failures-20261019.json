@@ -1,0 +1,273 @@
+{
+  "schemaVersion": 1,
+  "observedDate": "2026-10-19",
+  "status": "passed_all_three_stores_catalog_only",
+  "source": "actual_shopify_provider_via_local_owner_api",
+  "scope": "catalog_only_dedicated_disposable_failure_fixtures",
+  "sourceVerification": "Native mutation and readback, complete authoritative catalog sync, canonical product read, pre-Session rejection and final native baseline reads.",
+  "limitations": [
+    "Not checkout-phase acceptance.",
+    "No charge, capture, order, refund, transfer, payout, publication or delete operation was performed.",
+    "No hosted Checkout Session was created by these catalog tests.",
+    "Canonical products remain draft; no automatic human-review approval is claimed.",
+    "Archive added the existing conservative source-retirement review annotation; evidence/category/tax/shipping metadata hashes remained unchanged."
+  ],
+  "stores": [
+    {
+      "shop": "i4vd1u-s8.myshopify.com",
+      "number": "002",
+      "nativeProductId": "gid://shopify/Product/15428714102971",
+      "nativeVariantId": "gid://shopify/ProductVariant/67755079729339",
+      "canonicalProductId": "prod_eacd433e36ef42c7b6061fe8cb327caf",
+      "brandId": "brand_bd66325a43644676850fd3213aa37c69",
+      "startedAt": "2026-10-19T16:50:14.614Z",
+      "completedAt": "2026-10-19T16:50:38.054Z",
+      "source": "actual_provider_via_local_owner_api",
+      "catalogOnly": true,
+      "checkoutPhaseUsed": false,
+      "baselineReplaySameId": true,
+      "cases": [
+        {
+          "scenario": "out_of_stock",
+          "nativeInventoryQty": 0,
+          "canonicalInventoryQty": 0,
+          "canonicalIdUnchanged": true,
+          "humanMetadataHashUnchanged": true,
+          "checkoutRejectedCode": "TEST_VARIANT_UNAVAILABLE",
+          "normalCheckoutRunSetUnchanged": true,
+          "normalCheckoutSessionCreated": false,
+          "restoredNativeBaseline": true,
+          "restoredCanonicalBaseline": true,
+          "restoredCanonicalStatus": "draft"
+        },
+        {
+          "scenario": "price_changed",
+          "changedPriceCents": 101,
+          "canonicalIdUnchanged": true,
+          "humanMetadataHashUnchanged": true,
+          "restoredNativeBaseline": true,
+          "restoredCanonicalBaseline": true,
+          "restoredCanonicalStatus": "draft"
+        },
+        {
+          "scenario": "archived",
+          "nativeStatus": "ARCHIVED",
+          "canonicalStatus": "draft",
+          "canonicalInventoryQty": 0,
+          "canonicalIdUnchanged": true,
+          "humanMetadataHashUnchanged": true,
+          "reviewNoteChangedToConservativeRetirementAnnotation": true,
+          "restoredNativeBaseline": true,
+          "restoredCanonicalBaseline": true,
+          "restoredCanonicalStatus": "draft"
+        }
+      ],
+      "financialWritesAttempted": false,
+      "normalCheckoutSessionCreated": false,
+      "allRestored": true,
+      "finalNative": {
+        "priceCents": 100,
+        "inventoryQty": 10,
+        "status": "ACTIVE",
+        "cleanupRequired": false,
+        "state": "prepared"
+      }
+    },
+    {
+      "shop": "qpsd02-jz.myshopify.com",
+      "number": "004",
+      "nativeProductId": "gid://shopify/Product/15428714135739",
+      "nativeVariantId": "gid://shopify/ProductVariant/67755079762107",
+      "canonicalProductId": "prod_8a623fbcd5414c6b9914e4d49d025cf7",
+      "brandId": "brand_2e529f54ef294014a344d6e1d6144f3d",
+      "startedAt": "2026-10-19T16:51:41.539Z",
+      "completedAt": "2026-10-19T16:52:02.773Z",
+      "source": "actual_provider_via_local_owner_api",
+      "catalogOnly": true,
+      "checkoutPhaseUsed": false,
+      "baselineReplaySameId": true,
+      "cases": [
+        {
+          "scenario": "out_of_stock",
+          "nativeInventoryQty": 0,
+          "canonicalInventoryQty": 0,
+          "canonicalIdUnchanged": true,
+          "humanMetadataHashUnchanged": true,
+          "checkoutRejectedCode": "TEST_VARIANT_UNAVAILABLE",
+          "normalCheckoutRunSetUnchanged": true,
+          "normalCheckoutSessionCreated": false,
+          "restoredNativeBaseline": true,
+          "restoredCanonicalBaseline": true,
+          "restoredCanonicalStatus": "draft"
+        },
+        {
+          "scenario": "price_changed",
+          "changedPriceCents": 201,
+          "canonicalIdUnchanged": true,
+          "humanMetadataHashUnchanged": true,
+          "restoredNativeBaseline": true,
+          "restoredCanonicalBaseline": true,
+          "restoredCanonicalStatus": "draft"
+        },
+        {
+          "scenario": "archived",
+          "nativeStatus": "ARCHIVED",
+          "canonicalStatus": "draft",
+          "canonicalInventoryQty": 0,
+          "canonicalIdUnchanged": true,
+          "humanMetadataHashUnchanged": true,
+          "reviewNoteChangedToConservativeRetirementAnnotation": true,
+          "restoredNativeBaseline": true,
+          "restoredCanonicalBaseline": true,
+          "restoredCanonicalStatus": "draft"
+        }
+      ],
+      "financialWritesAttempted": false,
+      "normalCheckoutSessionCreated": false,
+      "allRestored": true,
+      "finalNative": {
+        "priceCents": 200,
+        "inventoryQty": 10,
+        "status": "ACTIVE",
+        "cleanupRequired": false,
+        "state": "prepared"
+      }
+    },
+    {
+      "shop": "ir7112-v1.myshopify.com",
+      "number": "006",
+      "nativeProductId": "gid://shopify/Product/15278926659802",
+      "nativeVariantId": "gid://shopify/ProductVariant/67578426130650",
+      "source": "actual_provider_via_local_owner_api",
+      "startedAt": "2026-10-19T16:52:16.238Z",
+      "catalogOnly": true,
+      "checkoutPhaseUsed": false,
+      "cases": [
+        {
+          "scenario": "out_of_stock",
+          "phase": "catalog",
+          "source": "actual_provider",
+          "nativeVerified": true,
+          "canonicalIdUnchanged": true,
+          "humanMetadataHashUnchanged": true,
+          "nativeInventoryQty": 0,
+          "canonicalInventoryQty": 0,
+          "checkoutRejectedCode": "TEST_VARIANT_UNAVAILABLE",
+          "normalCheckoutRunSetUnchanged": true,
+          "normalCheckoutSessionCreated": false,
+          "restoredNativeBaseline": true,
+          "restoredCanonicalBaseline": true,
+          "restoredCanonicalStatus": "draft",
+          "automaticReviewApprovalClaimed": false
+        },
+        {
+          "scenario": "price_changed",
+          "phase": "catalog",
+          "source": "actual_provider",
+          "nativeVerified": true,
+          "canonicalIdUnchanged": true,
+          "humanMetadataHashUnchanged": true,
+          "changedPriceCents": 301,
+          "restoredNativeBaseline": true,
+          "restoredCanonicalBaseline": true,
+          "restoredCanonicalStatus": "draft",
+          "automaticReviewApprovalClaimed": false
+        },
+        {
+          "scenario": "archived",
+          "phase": "catalog",
+          "source": "actual_provider",
+          "nativeVerified": true,
+          "canonicalIdUnchanged": true,
+          "humanMetadataHashUnchanged": true,
+          "nativeStatus": "ARCHIVED",
+          "canonicalStatus": "draft",
+          "canonicalInventoryQty": 0,
+          "reviewNoteChangedToConservativeRetirementAnnotation": true,
+          "restoredNativeBaseline": true,
+          "restoredCanonicalBaseline": true,
+          "restoredCanonicalStatus": "draft",
+          "automaticReviewApprovalClaimed": false
+        }
+      ],
+      "financialWritesAttempted": false,
+      "normalCheckoutSessionCreated": false,
+      "allRestored": true,
+      "canonicalProductId": "prod_78ad1efbc038423f88d46d174e34da44",
+      "brandId": "brand_6ad2c1aa725f40f1b8c2001b65347360",
+      "baselineReplaySameId": true,
+      "finalNative": {
+        "productId": "gid://shopify/Product/15278926659802",
+        "variantId": "gid://shopify/ProductVariant/67578426130650",
+        "priceCents": 300,
+        "inventoryQty": 10,
+        "status": "ACTIVE",
+        "cleanupRequired": false,
+        "state": "prepared"
+      },
+      "completedAt": "2026-10-19T16:52:34.015Z"
+    }
+  ],
+  "passedCases": 9,
+  "completedAt": "2026-10-19T16:53:02.007Z",
+  "allThreeBaselinesRestored": true,
+  "normalPreSessionStockRejections": 3,
+  "fixtureMutationRequests": 18,
+  "humanMetadataFingerprintFields": [
+    "evidence",
+    "category",
+    "taxCode",
+    "shippingProfile"
+  ],
+  "finalReadback": {
+    "observedAt": "2026-10-19T16:53:02.007Z",
+    "allThreeRestored": true,
+    "stores": [
+      {
+        "shop": "i4vd1u-s8.myshopify.com",
+        "productId": "gid://shopify/Product/15428714102971",
+        "variantId": "gid://shopify/ProductVariant/67755079729339",
+        "priceCents": 100,
+        "inventoryQty": 10,
+        "status": "ACTIVE",
+        "state": "prepared",
+        "cleanupRequired": false,
+        "completedScenarios": [
+          "catalog:out_of_stock",
+          "catalog:price_changed",
+          "catalog:archived"
+        ]
+      },
+      {
+        "shop": "qpsd02-jz.myshopify.com",
+        "productId": "gid://shopify/Product/15428714135739",
+        "variantId": "gid://shopify/ProductVariant/67755079762107",
+        "priceCents": 200,
+        "inventoryQty": 10,
+        "status": "ACTIVE",
+        "state": "prepared",
+        "cleanupRequired": false,
+        "completedScenarios": [
+          "catalog:out_of_stock",
+          "catalog:price_changed",
+          "catalog:archived"
+        ]
+      },
+      {
+        "shop": "ir7112-v1.myshopify.com",
+        "productId": "gid://shopify/Product/15278926659802",
+        "variantId": "gid://shopify/ProductVariant/67578426130650",
+        "priceCents": 300,
+        "inventoryQty": 10,
+        "status": "ACTIVE",
+        "state": "prepared",
+        "cleanupRequired": false,
+        "completedScenarios": [
+          "catalog:out_of_stock",
+          "catalog:price_changed",
+          "catalog:archived"
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,42 @@
+name: Isolated tests and build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source without persisting credentials
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # verified v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # verified v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Check server syntax
+        run: npm run check
+
+      # Mocks and isolated local databases only. Never start the provider runtime,
+      # load provider credentials, run fixture --apply, or deploy from this job.
+      - name: Run isolated tests with bounded database concurrency
+        run: node --test --test-concurrency=2 tests/*.test.mjs web/lib/*.test.mjs
+
+      - name: Build dashboard
+        run: npm run build

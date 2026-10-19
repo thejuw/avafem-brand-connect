@@ -1,0 +1,21 @@
+{
+  "source": "actual_Shopify_admin_UI_observation",
+  "stores": [
+    {
+      "shop": "i4vd1u-s8.myshopify.com",
+      "productId": "gid://shopify/Product/15428714102971",
+      "text": "This product is not published anywhere"
+    },
+    {
+      "shop": "qpsd02-jz.myshopify.com",
+      "productId": "gid://shopify/Product/15428714135739",
+      "text": "This product is not published anywhere"
+    },
+    {
+      "shop": "ir7112-v1.myshopify.com",
+      "productId": "gid://shopify/Product/15278926659802",
+      "text": "This product is not published anywhere"
+    }
+  ],
+  "recordedAt": "2026-10-19T16:49:35.145Z"
+}

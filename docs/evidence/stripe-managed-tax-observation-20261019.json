@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "source": "operator_verified_dashboard",
+  "accountId": "acct_1U74iQGgawRtH2qe",
+  "test": true,
+  "observedAt": "2026-10-19T08:27:23.000Z",
+  "sourceUrl": "https://dashboard.stripe.com/acct_1U74iQGgawRtH2qe/test/tax/transactions",
+  "captureMethod": "Authenticated sandbox dashboard accessibility labels and exact Tax detail links; amounts transcribed in integer USD cents. No API line-item verification is claimed.",
+  "apiLimitation": {
+    "kind": "stripe_managed_tax_not_retrievable",
+    "requestId": "req_gMJ6t3iRmPV37p"
+  },
+  "runs": [
+    {
+      "runId": "uco_33e3eed7612b443d82655b1a4e07bb55",
+      "original": {
+        "id": "tax_1USAj4GgawRtH2qeH9YkSEiB",
+        "reference": "pi_3USAv7GgawRtH2qe1hczKpWg",
+        "grossCents": 2760,
+        "taxCents": 210
+      },
+      "reversals": [
+        {
+          "id": "tax_1USBQAGgawRtH2qeKycbJDVG",
+          "reference": "re_3USAv7GgawRtH2qe1owmCQTe",
+          "grossCents": -108,
+          "taxCents": -8
+        },
+        {
+          "id": "tax_1USBAwGgawRtH2qeXgeFonTn",
+          "reference": "re_3USAv7GgawRtH2qe1A8pH2lb",
+          "grossCents": -216,
+          "taxCents": -17
+        },
+        {
+          "id": "tax_1USBQHGgawRtH2qe8W58X6FM",
+          "reference": "re_3USAv7GgawRtH2qe12pXL48s",
+          "grossCents": -324,
+          "taxCents": -25
+        }
+      ]
+    },
+    {
+      "runId": "uco_240916a4109e44c38252610a5df298e9",
+      "original": {
+        "id": "tax_1USB1BGgawRtH2qeBltMnZhJ",
+        "reference": "pi_3USB2RGgawRtH2qe1s7YKSoK",
+        "grossCents": 812,
+        "taxCents": 62
+      },
+      "reversals": [
+        {
+          "id": "tax_1USB4JGgawRtH2qeyWHQg0us",
+          "reference": "re_3USB2RGgawRtH2qe1t1cB59R",
+          "grossCents": -135,
+          "taxCents": -10
+        },
+        {
+          "id": "tax_1USB4jGgawRtH2qe0gZoBQkw",
+          "reference": "re_3USB2RGgawRtH2qe1DjR7GNM",
+          "grossCents": -271,
+          "taxCents": -21
+        },
+        {
+          "id": "tax_1USBD8GgawRtH2qelEmUMDel",
+          "reference": "re_3USB2RGgawRtH2qe1dK80QNr",
+          "grossCents": -406,
+          "taxCents": -31
+        }
+      ]
+    }
+  ]
+}

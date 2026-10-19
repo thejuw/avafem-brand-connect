@@ -1,0 +1,224 @@
+# Local request examples. Tokens below are FAKE placeholders, never real secrets.
+# Send requests individually after replacing placeholders. Nothing in this file
+# runs automatically. Sandbox actions mutate only the local app unless explicitly
+# labeled as a provider call / outbound webhook registration.
+
+@baseUrl = http://127.0.0.1:4317
+@brandId = brand_bloom
+@bagId = REPLACE_WITH_OWN_BAG_ID
+@importId = REPLACE_WITH_IMPORT_ID
+@webhookEndpointId = REPLACE_WITH_ENDPOINT_ID
+@eventId = REPLACE_WITH_OWN_EVENT_ID
+@apiKey = avf_test_REPLACE_WITH_KEY_FROM_OWNER_WORKSPACE
+@clientId = REPLACE_WITH_AVAFEM_OAUTH_CLIENT_ID
+@clientSecret = REPLACE_WITH_AVAFEM_OAUTH_CLIENT_SECRET
+@accessToken = REPLACE_WITH_ONE_HOUR_AVAFEM_ACCESS_TOKEN
+@sessionCookie = avf_session=REPLACE_WITH_LOCAL_OWNER_COOKIE
+@csrfToken = REPLACE_WITH_LOCAL_OWNER_CSRF_TOKEN
+
+### Health; no authentication required
+GET {{baseUrl}}/health
+
+### Local browser bootstrap: copy csrfToken and Set-Cookie for OWNER examples.
+# Only available on the loopback development listener. Do not expose publicly.
+GET {{baseUrl}}/api/session
+
+### OWNER: create a scoped static brand API key (shown once)
+POST {{baseUrl}}/api/brands/{{brandId}}/credentials
+Cookie: {{sessionCookie}}
+X-CSRF-Token: {{csrfToken}}
+Content-Type: application/json
+
+{
+  "kind": "api_key",
+  "label": "Local integration example",
+  "scopes": ["catalog:read", "catalog:write", "orders:read", "orders:fulfill", "payouts:read", "refunds:write"]
+}
+
+### OWNER: create an Avafem OAuth client (not a Shopify OAuth client)
+POST {{baseUrl}}/api/brands/{{brandId}}/credentials
+Cookie: {{sessionCookie}}
+X-CSRF-Token: {{csrfToken}}
+Content-Type: application/json
+
+{
+  "kind": "oauth_client",
+  "label": "Local OAuth example",
+  "scopes": ["orders:read", "orders:fulfill", "payouts:read", "refunds:write"]
+}
+
+### Exchange Avafem client credentials for a one-hour bearer token
+# Replace placeholders; requested scopes must be a subset of the client grant.
+POST {{baseUrl}}/oauth/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials&client_id={{clientId}}&client_secret={{clientSecret}}&scope=orders%3Aread%20orders%3Afulfill%20payouts%3Aread%20refunds%3Awrite
+
+### Read own Bags with a static API key
+GET {{baseUrl}}/v1/bags?status=awaiting_shipment
+Authorization: Bearer {{apiKey}}
+
+### Read one own Bag with an OAuth access token
+GET {{baseUrl}}/v1/bags/{{bagId}}
+Authorization: Bearer {{accessToken}}
+
+### Create a SYNTHETIC order for the credential's own brand
+# No card is charged. Reusing the same key/body replays for 24h.
+# Change the idempotency key only when intentionally creating another order.
+POST {{baseUrl}}/v1/sandbox/orders
+Authorization: Bearer {{apiKey}}
+Idempotency-Key: local-synthetic-order-001
+Content-Type: application/json
+
+{}
+
+### Record ONE COMPLETE synthetic shipment; omitted items mean the entire Bag
+# Shipment recording is local and does not buy a shipping label/contact a carrier.
+POST {{baseUrl}}/v1/bags/{{bagId}}/shipments
+Authorization: Bearer {{apiKey}}
+Idempotency-Key: local-shipment-001
+Content-Type: application/json
+
+{
+  "carrier": "USPS",
+  "trackingNumber": "SANDBOX-TRACKING-0001",
+  "trackingUrl": null
+}
+
+### Propose a FULL-BAG refund; this endpoint does not issue a payment refund
+# An owner must review/approve the local proposal. Do not use partial amounts.
+POST {{baseUrl}}/v1/bags/{{bagId}}/refunds
+Authorization: Bearer {{apiKey}}
+Idempotency-Key: local-refund-proposal-001
+Content-Type: application/json
+
+{
+  "reason": "Synthetic return requested for local testing"
+}
+
+### Read simulated payout/credit summary; requires payouts:read
+GET {{baseUrl}}/v1/payouts/summary
+Authorization: Bearer {{apiKey}}
+
+### Read own catalog
+GET {{baseUrl}}/v1/products
+Authorization: Bearer {{apiKey}}
+
+### Queue a synthetic catalog import; requires catalog:write
+# The tax code is intentionally a placeholder; it is NOT a tax classification.
+# Catalog evidence/claims require human review before approval.
+POST {{baseUrl}}/v1/products/import
+Authorization: Bearer {{apiKey}}
+Idempotency-Key: local-catalog-import-001
+Content-Type: application/json
+
+{
+  "rows": [
+    {
+      "sku": "EXAMPLE-COTTON-01",
+      "title": "Synthetic cotton product",
+      "description": "Local catalog fixture; do not publish.",
+      "category": "period-care/example",
+      "priceCents": 2400,
+      "inventoryQty": 10,
+      "images": ["https://example.com/synthetic-product.png"],
+      "variants": [],
+      "evidence": {"ingredients_inci": ["Synthetic example material"], "certifications": [], "claims": [], "contraindications": ""},
+      "taxCode": "REPLACE_WITH_REVIEWED_TAX_CODE",
+      "shippingProfile": "standard"
+    }
+  ]
+}
+
+### Read import job progress after jobs run; requires catalog:read
+GET {{baseUrl}}/v1/products/import/{{importId}}
+Authorization: Bearer {{apiKey}}
+
+### Set stock for an own SKU; requires catalog:write
+# PATCH is not part of the POST idempotency store.
+PATCH {{baseUrl}}/v1/inventory/EXAMPLE-COTTON-01
+Authorization: Bearer {{apiKey}}
+Content-Type: application/json
+
+{"qty": 8}
+
+### OPTIONAL: register an outbound webhook on an HTTPS endpoint YOU CONTROL
+# This can cause REAL network requests by the worker. The .invalid placeholder
+# is deliberately rejected; replace only when ready to receive sandbox events.
+# The endpoint inherits allowed event families from this credential's scopes.
+POST {{baseUrl}}/v1/webhook-endpoints
+Authorization: Bearer {{apiKey}}
+Idempotency-Key: local-webhook-registration-001
+Content-Type: application/json
+
+{"url": "https://REPLACE-WITH-YOUR-ENDPOINT.invalid/avafem"}
+
+### Replay an own event to an existing own endpoint
+POST {{baseUrl}}/v1/webhook-endpoints/{{webhookEndpointId}}/replay
+Authorization: Bearer {{apiKey}}
+Idempotency-Key: local-webhook-replay-001
+Content-Type: application/json
+
+{"eventId": "{{eventId}}"}
+
+### OWNER: run the bounded worker now (local accounting/imports/handoffs;
+# configured outbound endpoints may receive real HTTPS delivery attempts)
+POST {{baseUrl}}/api/jobs/run
+Cookie: {{sessionCookie}}
+X-CSRF-Token: {{csrfToken}}
+Content-Type: application/json
+
+{}
+
+### OWNER: create a private one-use onboarding invitation
+# Open the returned /onboard/<token> path locally; do not share the token publicly.
+POST {{baseUrl}}/api/brands/{{brandId}}/invite
+Cookie: {{sessionCookie}}
+X-CSRF-Token: {{csrfToken}}
+Content-Type: application/json
+
+{}
+
+### OWNER: Shopify preflight is a REAL READ-ONLY provider call if configured
+POST {{baseUrl}}/api/connections/shopify/preflight
+Cookie: {{sessionCookie}}
+X-CSRF-Token: {{csrfToken}}
+Content-Type: application/json
+
+{}
+
+### MCP initialize: use the same scoped Avafem bearer token
+POST {{baseUrl}}/mcp
+Authorization: Bearer {{apiKey}}
+Accept: application/json, text/event-stream
+MCP-Protocol-Version: 2025-06-18
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"local-brand-example","version":"1.0.0"}}}
+
+### MCP tool discovery
+POST {{baseUrl}}/mcp
+Authorization: Bearer {{apiKey}}
+Accept: application/json, text/event-stream
+MCP-Protocol-Version: 2025-06-18
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+
+### MCP scoped Bag read
+POST {{baseUrl}}/mcp
+Authorization: Bearer {{apiKey}}
+Accept: application/json, text/event-stream
+MCP-Protocol-Version: 2025-06-18
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_bag","arguments":{"id":"{{bagId}}"}}}
+
+### MCP refund proposal ONLY; requires refunds:write and never issues money
+POST {{baseUrl}}/mcp
+Authorization: Bearer {{apiKey}}
+Accept: application/json, text/event-stream
+MCP-Protocol-Version: 2025-06-18
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"refund_order","arguments":{"id":"{{bagId}}","refund":{"reason":"Synthetic MCP return proposal"},"idempotencyKey":"local-mcp-refund-001"}}}

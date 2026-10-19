@@ -1,0 +1,33 @@
+{
+  "name": "avafem-brand-connect",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Avafem brand operations, canonical Bags and connector service",
+  "engines": { "node": ">=24.0.0" },
+  "scripts": {
+    "dev": "node --watch server/start.mjs",
+    "dev:web": "vite --host 127.0.0.1",
+    "start": "node server/start.mjs",
+    "build": "vite build",
+    "test": "node --test tests/*.test.mjs web/lib/*.test.mjs",
+    "check": "node --check server/app.mjs && node --check server/start.mjs",
+    "acceptance:preflight": "node scripts/acceptance-preflight.mjs --check"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "0.5.10",
+    "@fastify/cookie": "latest",
+    "@fastify/rate-limit": "latest",
+    "@fastify/static": "latest",
+    "@modelcontextprotocol/sdk": "latest",
+    "csv-parse": "latest",
+    "fastify": "5.12.7",
+    "lucide-react": "latest",
+    "pg": "8.23.1",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "stripe": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": { "vite": "8.3.4" }
+}

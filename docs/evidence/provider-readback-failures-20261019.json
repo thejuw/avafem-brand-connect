@@ -1,0 +1,220 @@
+{
+  "id": "frb_aa64ca09bd8346f4b4e589b86eeb4a45",
+  "source": "real_provider_snapshot_with_local_injected_fault",
+  "test": true,
+  "fullAcceptancePassed": false,
+  "realProviderFailureExecuted": false,
+  "scope": "existing_main_readbacks_shadow_only",
+  "providerMutations": 0,
+  "supportedFaults": [
+    "refund_readback_mismatch",
+    "parent_charge_mismatch",
+    "unknown_refund_id_hold"
+  ],
+  "unsupportedFaults": [
+    "transfer_fault_injection",
+    "payout_fault_injection"
+  ],
+  "cases": [
+    {
+      "caseId": "store_2_refund_amount",
+      "expectedCode": "STRIPE_REFUND_MISMATCH",
+      "observedCode": "STRIPE_REFUND_MISMATCH",
+      "expectedState": null,
+      "observedState": null,
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_2_refund_currency",
+      "expectedCode": "STRIPE_REFUND_MISMATCH",
+      "observedCode": "STRIPE_REFUND_MISMATCH",
+      "expectedState": null,
+      "observedState": null,
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_2_refund_live",
+      "expectedCode": "STRIPE_REFUND_MISMATCH",
+      "observedCode": "STRIPE_REFUND_MISMATCH",
+      "expectedState": null,
+      "observedState": null,
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_2_refund_metadata",
+      "expectedCode": "STRIPE_REFUND_MISMATCH",
+      "observedCode": "STRIPE_REFUND_MISMATCH",
+      "expectedState": null,
+      "observedState": null,
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_2_charge_live",
+      "expectedCode": "STRIPE_REFUND_MISMATCH",
+      "observedCode": "STRIPE_REFUND_MISMATCH",
+      "expectedState": null,
+      "observedState": null,
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_2_charge_amount",
+      "expectedCode": "STRIPE_REFUND_MISMATCH",
+      "observedCode": "STRIPE_REFUND_MISMATCH",
+      "expectedState": null,
+      "observedState": null,
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_2_refund_id_unknown",
+      "expectedCode": null,
+      "observedCode": null,
+      "expectedState": "refund_uncertain",
+      "observedState": "refund_uncertain",
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_4_refund_amount",
+      "expectedCode": "STRIPE_REFUND_MISMATCH",
+      "observedCode": "STRIPE_REFUND_MISMATCH",
+      "expectedState": null,
+      "observedState": null,
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_4_refund_currency",
+      "expectedCode": "STRIPE_REFUND_MISMATCH",
+      "observedCode": "STRIPE_REFUND_MISMATCH",
+      "expectedState": null,
+      "observedState": null,
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_4_refund_live",
+      "expectedCode": "STRIPE_REFUND_MISMATCH",
+      "observedCode": "STRIPE_REFUND_MISMATCH",
+      "expectedState": null,
+      "observedState": null,
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_4_refund_metadata",
+      "expectedCode": "STRIPE_REFUND_MISMATCH",
+      "observedCode": "STRIPE_REFUND_MISMATCH",
+      "expectedState": null,
+      "observedState": null,
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_4_charge_live",
+      "expectedCode": "STRIPE_REFUND_MISMATCH",
+      "observedCode": "STRIPE_REFUND_MISMATCH",
+      "expectedState": null,
+      "observedState": null,
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_4_charge_amount",
+      "expectedCode": "STRIPE_REFUND_MISMATCH",
+      "observedCode": "STRIPE_REFUND_MISMATCH",
+      "expectedState": null,
+      "observedState": null,
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_4_refund_id_unknown",
+      "expectedCode": null,
+      "observedCode": null,
+      "expectedState": "refund_uncertain",
+      "observedState": "refund_uncertain",
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_6_refund_amount",
+      "expectedCode": "STRIPE_REFUND_MISMATCH",
+      "observedCode": "STRIPE_REFUND_MISMATCH",
+      "expectedState": null,
+      "observedState": null,
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_6_refund_currency",
+      "expectedCode": "STRIPE_REFUND_MISMATCH",
+      "observedCode": "STRIPE_REFUND_MISMATCH",
+      "expectedState": null,
+      "observedState": null,
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_6_refund_live",
+      "expectedCode": "STRIPE_REFUND_MISMATCH",
+      "observedCode": "STRIPE_REFUND_MISMATCH",
+      "expectedState": null,
+      "observedState": null,
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_6_refund_metadata",
+      "expectedCode": "STRIPE_REFUND_MISMATCH",
+      "observedCode": "STRIPE_REFUND_MISMATCH",
+      "expectedState": null,
+      "observedState": null,
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_6_charge_live",
+      "expectedCode": "STRIPE_REFUND_MISMATCH",
+      "observedCode": "STRIPE_REFUND_MISMATCH",
+      "expectedState": null,
+      "observedState": null,
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_6_charge_amount",
+      "expectedCode": "STRIPE_REFUND_MISMATCH",
+      "observedCode": "STRIPE_REFUND_MISMATCH",
+      "expectedState": null,
+      "observedState": null,
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    },
+    {
+      "caseId": "store_6_refund_id_unknown",
+      "expectedCode": null,
+      "observedCode": null,
+      "expectedState": "refund_uncertain",
+      "observedState": "refund_uncertain",
+      "pass": true,
+      "forbiddenWriteAttempts": 0
+    }
+  ],
+  "checkedAt": "2026-10-19T16:47:37.585Z",
+  "sourceRunUnchanged": true,
+  "sourceFinancialRowsUnchanged": true,
+  "providerReads": 17,
+  "forbiddenWriteAttempts": 0,
+  "summary": {
+    "total": 21,
+    "passed": 21,
+    "failed": 0
+  },
+  "status": "passed_local_injected_guards"
+}

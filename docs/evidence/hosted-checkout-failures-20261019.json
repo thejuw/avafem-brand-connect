@@ -1,0 +1,901 @@
+{
+  "source": "actual_Stripe_TEST_Checkout_and_native_Shopify_fixture_mutations_via_loopback_owner",
+  "recordedAt": "2026-10-19T17:01:35.471Z",
+  "test": true,
+  "localOnly": true,
+  "platformAccountId": "acct_1U74iQGgawRtH2qe",
+  "fullAcceptancePassed": false,
+  "summary": {
+    "total": 7,
+    "passed": 7,
+    "failed": 0,
+    "declineCases": 1,
+    "postAuthorizationStockCases": 3,
+    "postAuthorizationPriceCases": 3,
+    "capturedCents": 0,
+    "orders": 0,
+    "ledgerJournals": 0,
+    "transfers": 0,
+    "refunds": 0
+  },
+  "cases": [
+    {
+      "runId": "uco_4144310ce5fe4c57a5496b2a4403f6f4",
+      "caseId": "declined_payment",
+      "operationId": "failure_decline_20261019_v1",
+      "state": "authorization_cancelled",
+      "test": true,
+      "isolation": "separate_failure_database_no_worker",
+      "currency": "USD",
+      "maxTotalCents": 1000,
+      "expectedCapturedCents": 0,
+      "sessionId": "cs_test_b1rnusL2Vgnqbq3b3p2lseAfFS8ZQ9XG5DeT22KGMBYrW5TT8KxqFJlOtQ",
+      "paymentIntentId": "pi_3USJoiGgawRtH2qe0xTY3qCl",
+      "observation": {
+        "status": "canceled",
+        "sessionId": "cs_test_b1rnusL2Vgnqbq3b3p2lseAfFS8ZQ9XG5DeT22KGMBYrW5TT8KxqFJlOtQ",
+        "sessionStatus": "expired",
+        "sessionTotalCents": 812,
+        "paymentIntentId": "pi_3USJoiGgawRtH2qe0xTY3qCl",
+        "paymentStatus": "canceled",
+        "capturedCents": 0,
+        "chargeId": "ch_3USJoiGgawRtH2qe03CIY9Ju",
+        "chargeCaptured": false,
+        "declined": false,
+        "observedAt": "2026-10-19T16:54:05.628Z"
+      },
+      "baseline": [
+        {
+          "shop": "i4vd1u-s8.myshopify.com",
+          "productId": "gid://shopify/Product/15428714102971",
+          "variantId": "gid://shopify/ProductVariant/67755079729339",
+          "inventoryItemId": "gid://shopify/InventoryItem/69742488551611",
+          "locationId": "gid://shopify/Location/94653743291",
+          "sku": "AVF-CONNECT-TEST-FAIL-002",
+          "priceCents": 100,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        },
+        {
+          "shop": "qpsd02-jz.myshopify.com",
+          "productId": "gid://shopify/Product/15428714135739",
+          "variantId": "gid://shopify/ProductVariant/67755079762107",
+          "inventoryItemId": "gid://shopify/InventoryItem/69742488584379",
+          "locationId": "gid://shopify/Location/94655676603",
+          "sku": "AVF-CONNECT-TEST-FAIL-004",
+          "priceCents": 200,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        },
+        {
+          "shop": "ir7112-v1.myshopify.com",
+          "productId": "gid://shopify/Product/15278926659802",
+          "variantId": "gid://shopify/ProductVariant/67578426130650",
+          "inventoryItemId": "gid://shopify/InventoryItem/69553985913050",
+          "locationId": "gid://shopify/Location/96190431450",
+          "sku": "AVF-CONNECT-TEST-FAIL-006",
+          "priceCents": 300,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        }
+      ],
+      "mutationObserved": null,
+      "declineEvidence": {
+        "status": "requires_payment_method",
+        "sessionId": "cs_test_b1rnusL2Vgnqbq3b3p2lseAfFS8ZQ9XG5DeT22KGMBYrW5TT8KxqFJlOtQ",
+        "sessionStatus": "open",
+        "sessionTotalCents": 812,
+        "paymentIntentId": "pi_3USJoiGgawRtH2qe0xTY3qCl",
+        "paymentStatus": "requires_payment_method",
+        "capturedCents": 0,
+        "chargeId": "ch_3USJoiGgawRtH2qe03CIY9Ju",
+        "chargeCaptured": false,
+        "declined": true,
+        "observedAt": "2026-10-19T16:53:49.867Z",
+        "paymentErrorCode": "card_declined",
+        "declineCode": "generic_decline"
+      },
+      "raceCancellationEvidence": null,
+      "casePassed": true,
+      "lastError": null,
+      "cleanup": "authorization_cancel_verified",
+      "localRecords": {
+        "orders": 0,
+        "bags": 0,
+        "ledger_journals": 0,
+        "transfers": 0,
+        "refunds": 0
+      },
+      "createdAt": "2026-10-19T16:51:18.979Z",
+      "updatedAt": "2026-10-19T16:54:06.094Z",
+      "fullAcceptancePassed": false,
+      "authorizationBeforeMutation": null
+    },
+    {
+      "runId": "uco_3a6305bc0ff64ce398c499485d150d0d",
+      "caseId": "stock_changed_002",
+      "operationId": "failure_stock_002_20261019_v1",
+      "state": "authorization_cancelled",
+      "test": true,
+      "isolation": "separate_failure_database_no_worker",
+      "currency": "USD",
+      "maxTotalCents": 1000,
+      "expectedCapturedCents": 0,
+      "sessionId": "cs_test_b1xue7q8O7LycpyTIfh1hpeWetp1uK0RNu9R8CP92GUgLGk3Tex5cgi6o0",
+      "paymentIntentId": "pi_3USJqMGgawRtH2qe1f9GelbS",
+      "observation": {
+        "status": "canceled",
+        "sessionId": "cs_test_b1xue7q8O7LycpyTIfh1hpeWetp1uK0RNu9R8CP92GUgLGk3Tex5cgi6o0",
+        "sessionStatus": "complete",
+        "sessionTotalCents": 812,
+        "paymentIntentId": "pi_3USJqMGgawRtH2qe1f9GelbS",
+        "paymentStatus": "canceled",
+        "capturedCents": 0,
+        "chargeId": "ch_3USJqMGgawRtH2qe1kLpBLNU",
+        "chargeCaptured": false,
+        "declined": false,
+        "observedAt": "2026-10-19T16:56:10.339Z"
+      },
+      "baseline": [
+        {
+          "shop": "i4vd1u-s8.myshopify.com",
+          "productId": "gid://shopify/Product/15428714102971",
+          "variantId": "gid://shopify/ProductVariant/67755079729339",
+          "inventoryItemId": "gid://shopify/InventoryItem/69742488551611",
+          "locationId": "gid://shopify/Location/94653743291",
+          "sku": "AVF-CONNECT-TEST-FAIL-002",
+          "priceCents": 100,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        },
+        {
+          "shop": "qpsd02-jz.myshopify.com",
+          "productId": "gid://shopify/Product/15428714135739",
+          "variantId": "gid://shopify/ProductVariant/67755079762107",
+          "inventoryItemId": "gid://shopify/InventoryItem/69742488584379",
+          "locationId": "gid://shopify/Location/94655676603",
+          "sku": "AVF-CONNECT-TEST-FAIL-004",
+          "priceCents": 200,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        },
+        {
+          "shop": "ir7112-v1.myshopify.com",
+          "productId": "gid://shopify/Product/15278926659802",
+          "variantId": "gid://shopify/ProductVariant/67578426130650",
+          "inventoryItemId": "gid://shopify/InventoryItem/69553985913050",
+          "locationId": "gid://shopify/Location/96190431450",
+          "sku": "AVF-CONNECT-TEST-FAIL-006",
+          "priceCents": 300,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        }
+      ],
+      "mutationObserved": {
+        "shop": "i4vd1u-s8.myshopify.com",
+        "kind": "out_of_stock",
+        "providerReadVerified": true,
+        "observedAt": "2026-10-19T16:56:07.640Z"
+      },
+      "declineEvidence": null,
+      "raceCancellationEvidence": {
+        "paymentIntentId": "pi_3USJqMGgawRtH2qe1f9GelbS",
+        "paymentStatus": "canceled",
+        "capturedCents": 0,
+        "mutation": {
+          "shop": "i4vd1u-s8.myshopify.com",
+          "kind": "out_of_stock",
+          "providerReadVerified": true,
+          "observedAt": "2026-10-19T16:56:07.640Z"
+        },
+        "observedAt": "2026-10-19T16:56:10.339Z",
+        "verification": "unified_pre_capture_revalidation_cancelled"
+      },
+      "casePassed": true,
+      "lastError": null,
+      "cleanup": null,
+      "localRecords": {
+        "orders": 0,
+        "bags": 0,
+        "ledger_journals": 0,
+        "transfers": 0,
+        "refunds": 0
+      },
+      "createdAt": "2026-10-19T16:54:03.956Z",
+      "updatedAt": "2026-10-19T16:56:10.807Z",
+      "fullAcceptancePassed": false,
+      "authorizationBeforeMutation": {
+        "status": "requires_capture",
+        "sessionId": "cs_test_b1xue7q8O7LycpyTIfh1hpeWetp1uK0RNu9R8CP92GUgLGk3Tex5cgi6o0",
+        "sessionStatus": "complete",
+        "sessionTotalCents": 812,
+        "paymentIntentId": "pi_3USJqMGgawRtH2qe1f9GelbS",
+        "paymentStatus": "requires_capture",
+        "capturedCents": 0,
+        "chargeId": "ch_3USJqMGgawRtH2qe1kLpBLNU",
+        "chargeCaptured": false,
+        "declined": false,
+        "observedAt": "2026-10-19T16:55:32.619Z"
+      }
+    },
+    {
+      "runId": "uco_9dd2202bfc8e4685b337bebd7a4b1974",
+      "caseId": "stock_changed_004",
+      "operationId": "failure_stock_changed_004_20261019_v1",
+      "state": "authorization_cancelled",
+      "test": true,
+      "isolation": "separate_failure_database_no_worker",
+      "currency": "USD",
+      "maxTotalCents": 1000,
+      "expectedCapturedCents": 0,
+      "sessionId": "cs_test_b1xxNG3mXa5H2NP1VLo0CIbzwvkuMj5d879EbkxghYYy1ODhLcvjzwE44D",
+      "paymentIntentId": "pi_3USJsLGgawRtH2qe0hHDzaoQ",
+      "observation": {
+        "status": "canceled",
+        "sessionId": "cs_test_b1xxNG3mXa5H2NP1VLo0CIbzwvkuMj5d879EbkxghYYy1ODhLcvjzwE44D",
+        "sessionStatus": "complete",
+        "sessionTotalCents": 812,
+        "paymentIntentId": "pi_3USJsLGgawRtH2qe0hHDzaoQ",
+        "paymentStatus": "canceled",
+        "capturedCents": 0,
+        "chargeId": "ch_3USJsLGgawRtH2qe0noNuNny",
+        "chargeCaptured": false,
+        "declined": false,
+        "observedAt": "2026-10-19T16:57:46.162Z"
+      },
+      "baseline": [
+        {
+          "shop": "i4vd1u-s8.myshopify.com",
+          "productId": "gid://shopify/Product/15428714102971",
+          "variantId": "gid://shopify/ProductVariant/67755079729339",
+          "inventoryItemId": "gid://shopify/InventoryItem/69742488551611",
+          "locationId": "gid://shopify/Location/94653743291",
+          "sku": "AVF-CONNECT-TEST-FAIL-002",
+          "priceCents": 100,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        },
+        {
+          "shop": "qpsd02-jz.myshopify.com",
+          "productId": "gid://shopify/Product/15428714135739",
+          "variantId": "gid://shopify/ProductVariant/67755079762107",
+          "inventoryItemId": "gid://shopify/InventoryItem/69742488584379",
+          "locationId": "gid://shopify/Location/94655676603",
+          "sku": "AVF-CONNECT-TEST-FAIL-004",
+          "priceCents": 200,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        },
+        {
+          "shop": "ir7112-v1.myshopify.com",
+          "productId": "gid://shopify/Product/15278926659802",
+          "variantId": "gid://shopify/ProductVariant/67578426130650",
+          "inventoryItemId": "gid://shopify/InventoryItem/69553985913050",
+          "locationId": "gid://shopify/Location/96190431450",
+          "sku": "AVF-CONNECT-TEST-FAIL-006",
+          "priceCents": 300,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        }
+      ],
+      "mutationObserved": {
+        "shop": "qpsd02-jz.myshopify.com",
+        "kind": "out_of_stock",
+        "providerReadVerified": true,
+        "observedAt": "2026-10-19T16:57:43.428Z"
+      },
+      "declineEvidence": null,
+      "raceCancellationEvidence": {
+        "paymentIntentId": "pi_3USJsLGgawRtH2qe0hHDzaoQ",
+        "paymentStatus": "canceled",
+        "capturedCents": 0,
+        "mutation": {
+          "shop": "qpsd02-jz.myshopify.com",
+          "kind": "out_of_stock",
+          "providerReadVerified": true,
+          "observedAt": "2026-10-19T16:57:43.428Z"
+        },
+        "observedAt": "2026-10-19T16:57:46.162Z",
+        "verification": "unified_pre_capture_revalidation_cancelled"
+      },
+      "casePassed": true,
+      "lastError": null,
+      "cleanup": null,
+      "localRecords": {
+        "orders": 0,
+        "bags": 0,
+        "ledger_journals": 0,
+        "transfers": 0,
+        "refunds": 0
+      },
+      "createdAt": "2026-10-19T16:56:28.553Z",
+      "updatedAt": "2026-10-19T16:57:46.687Z",
+      "fullAcceptancePassed": false,
+      "authorizationBeforeMutation": {
+        "status": "requires_capture",
+        "sessionId": "cs_test_b1xxNG3mXa5H2NP1VLo0CIbzwvkuMj5d879EbkxghYYy1ODhLcvjzwE44D",
+        "sessionStatus": "complete",
+        "sessionTotalCents": 812,
+        "paymentIntentId": "pi_3USJsLGgawRtH2qe0hHDzaoQ",
+        "paymentStatus": "requires_capture",
+        "capturedCents": 0,
+        "chargeId": "ch_3USJsLGgawRtH2qe0noNuNny",
+        "chargeCaptured": false,
+        "declined": false,
+        "observedAt": "2026-10-19T16:57:38.823Z"
+      }
+    },
+    {
+      "runId": "uco_668220fe62664928a4ea630ad3227b43",
+      "caseId": "stock_changed_006",
+      "operationId": "failure_stock_changed_006_20261019_v1",
+      "state": "authorization_cancelled",
+      "test": true,
+      "isolation": "separate_failure_database_no_worker",
+      "currency": "USD",
+      "maxTotalCents": 1000,
+      "expectedCapturedCents": 0,
+      "sessionId": "cs_test_b1IWfwFQlItRi4dvHJgH7Og15YO5hxGmegJW0S8KgVouyofzZBz73qPOqd",
+      "paymentIntentId": "pi_3USJswGgawRtH2qe18FTxO9b",
+      "observation": {
+        "status": "canceled",
+        "sessionId": "cs_test_b1IWfwFQlItRi4dvHJgH7Og15YO5hxGmegJW0S8KgVouyofzZBz73qPOqd",
+        "sessionStatus": "complete",
+        "sessionTotalCents": 812,
+        "paymentIntentId": "pi_3USJswGgawRtH2qe18FTxO9b",
+        "paymentStatus": "canceled",
+        "capturedCents": 0,
+        "chargeId": "ch_3USJswGgawRtH2qe1GKTAzAp",
+        "chargeCaptured": false,
+        "declined": false,
+        "observedAt": "2026-10-19T16:58:23.192Z"
+      },
+      "baseline": [
+        {
+          "shop": "i4vd1u-s8.myshopify.com",
+          "productId": "gid://shopify/Product/15428714102971",
+          "variantId": "gid://shopify/ProductVariant/67755079729339",
+          "inventoryItemId": "gid://shopify/InventoryItem/69742488551611",
+          "locationId": "gid://shopify/Location/94653743291",
+          "sku": "AVF-CONNECT-TEST-FAIL-002",
+          "priceCents": 100,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        },
+        {
+          "shop": "qpsd02-jz.myshopify.com",
+          "productId": "gid://shopify/Product/15428714135739",
+          "variantId": "gid://shopify/ProductVariant/67755079762107",
+          "inventoryItemId": "gid://shopify/InventoryItem/69742488584379",
+          "locationId": "gid://shopify/Location/94655676603",
+          "sku": "AVF-CONNECT-TEST-FAIL-004",
+          "priceCents": 200,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        },
+        {
+          "shop": "ir7112-v1.myshopify.com",
+          "productId": "gid://shopify/Product/15278926659802",
+          "variantId": "gid://shopify/ProductVariant/67578426130650",
+          "inventoryItemId": "gid://shopify/InventoryItem/69553985913050",
+          "locationId": "gid://shopify/Location/96190431450",
+          "sku": "AVF-CONNECT-TEST-FAIL-006",
+          "priceCents": 300,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        }
+      ],
+      "mutationObserved": {
+        "shop": "ir7112-v1.myshopify.com",
+        "kind": "out_of_stock",
+        "providerReadVerified": true,
+        "observedAt": "2026-10-19T16:58:20.084Z"
+      },
+      "declineEvidence": null,
+      "raceCancellationEvidence": {
+        "paymentIntentId": "pi_3USJswGgawRtH2qe18FTxO9b",
+        "paymentStatus": "canceled",
+        "capturedCents": 0,
+        "mutation": {
+          "shop": "ir7112-v1.myshopify.com",
+          "kind": "out_of_stock",
+          "providerReadVerified": true,
+          "observedAt": "2026-10-19T16:58:20.084Z"
+        },
+        "observedAt": "2026-10-19T16:58:23.192Z",
+        "verification": "unified_pre_capture_revalidation_cancelled"
+      },
+      "casePassed": true,
+      "lastError": null,
+      "cleanup": null,
+      "localRecords": {
+        "orders": 0,
+        "bags": 0,
+        "ledger_journals": 0,
+        "transfers": 0,
+        "refunds": 0
+      },
+      "createdAt": "2026-10-19T16:56:34.312Z",
+      "updatedAt": "2026-10-19T16:58:23.718Z",
+      "fullAcceptancePassed": false,
+      "authorizationBeforeMutation": {
+        "status": "requires_capture",
+        "sessionId": "cs_test_b1IWfwFQlItRi4dvHJgH7Og15YO5hxGmegJW0S8KgVouyofzZBz73qPOqd",
+        "sessionStatus": "complete",
+        "sessionTotalCents": 812,
+        "paymentIntentId": "pi_3USJswGgawRtH2qe18FTxO9b",
+        "paymentStatus": "requires_capture",
+        "capturedCents": 0,
+        "chargeId": "ch_3USJswGgawRtH2qe1GKTAzAp",
+        "chargeCaptured": false,
+        "declined": false,
+        "observedAt": "2026-10-19T16:58:15.524Z"
+      }
+    },
+    {
+      "runId": "uco_5c8e61edd7d348e48a1b1622ac4bab34",
+      "caseId": "price_changed_002",
+      "operationId": "failure_price_changed_002_20261019_v1",
+      "state": "authorization_cancelled",
+      "test": true,
+      "isolation": "separate_failure_database_no_worker",
+      "currency": "USD",
+      "maxTotalCents": 1000,
+      "expectedCapturedCents": 0,
+      "sessionId": "cs_test_b1jkcuIrD1eWC2qOhiiSzQm1SrE28w4k4Lmy066enbXrmx3JqAxgBBmP3H",
+      "paymentIntentId": "pi_3USJtwGgawRtH2qe0ub5tOpY",
+      "observation": {
+        "status": "canceled",
+        "sessionId": "cs_test_b1jkcuIrD1eWC2qOhiiSzQm1SrE28w4k4Lmy066enbXrmx3JqAxgBBmP3H",
+        "sessionStatus": "complete",
+        "sessionTotalCents": 812,
+        "paymentIntentId": "pi_3USJtwGgawRtH2qe0ub5tOpY",
+        "paymentStatus": "canceled",
+        "capturedCents": 0,
+        "chargeId": "ch_3USJtwGgawRtH2qe0PsFH89R",
+        "chargeCaptured": false,
+        "declined": false,
+        "observedAt": "2026-10-19T16:59:30.303Z"
+      },
+      "baseline": [
+        {
+          "shop": "i4vd1u-s8.myshopify.com",
+          "productId": "gid://shopify/Product/15428714102971",
+          "variantId": "gid://shopify/ProductVariant/67755079729339",
+          "inventoryItemId": "gid://shopify/InventoryItem/69742488551611",
+          "locationId": "gid://shopify/Location/94653743291",
+          "sku": "AVF-CONNECT-TEST-FAIL-002",
+          "priceCents": 100,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        },
+        {
+          "shop": "qpsd02-jz.myshopify.com",
+          "productId": "gid://shopify/Product/15428714135739",
+          "variantId": "gid://shopify/ProductVariant/67755079762107",
+          "inventoryItemId": "gid://shopify/InventoryItem/69742488584379",
+          "locationId": "gid://shopify/Location/94655676603",
+          "sku": "AVF-CONNECT-TEST-FAIL-004",
+          "priceCents": 200,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        },
+        {
+          "shop": "ir7112-v1.myshopify.com",
+          "productId": "gid://shopify/Product/15278926659802",
+          "variantId": "gid://shopify/ProductVariant/67578426130650",
+          "inventoryItemId": "gid://shopify/InventoryItem/69553985913050",
+          "locationId": "gid://shopify/Location/96190431450",
+          "sku": "AVF-CONNECT-TEST-FAIL-006",
+          "priceCents": 300,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        }
+      ],
+      "mutationObserved": {
+        "shop": "i4vd1u-s8.myshopify.com",
+        "kind": "price_changed",
+        "providerReadVerified": true,
+        "observedAt": "2026-10-19T16:59:27.744Z"
+      },
+      "declineEvidence": null,
+      "raceCancellationEvidence": {
+        "paymentIntentId": "pi_3USJtwGgawRtH2qe0ub5tOpY",
+        "paymentStatus": "canceled",
+        "capturedCents": 0,
+        "mutation": {
+          "shop": "i4vd1u-s8.myshopify.com",
+          "kind": "price_changed",
+          "providerReadVerified": true,
+          "observedAt": "2026-10-19T16:59:27.744Z"
+        },
+        "observedAt": "2026-10-19T16:59:30.303Z",
+        "verification": "unified_pre_capture_revalidation_cancelled"
+      },
+      "casePassed": true,
+      "lastError": null,
+      "cleanup": null,
+      "localRecords": {
+        "orders": 0,
+        "bags": 0,
+        "ledger_journals": 0,
+        "transfers": 0,
+        "refunds": 0
+      },
+      "createdAt": "2026-10-19T16:56:39.556Z",
+      "updatedAt": "2026-10-19T16:59:30.826Z",
+      "fullAcceptancePassed": false,
+      "authorizationBeforeMutation": {
+        "status": "requires_capture",
+        "sessionId": "cs_test_b1jkcuIrD1eWC2qOhiiSzQm1SrE28w4k4Lmy066enbXrmx3JqAxgBBmP3H",
+        "sessionStatus": "complete",
+        "sessionTotalCents": 812,
+        "paymentIntentId": "pi_3USJtwGgawRtH2qe0ub5tOpY",
+        "paymentStatus": "requires_capture",
+        "capturedCents": 0,
+        "chargeId": "ch_3USJtwGgawRtH2qe0PsFH89R",
+        "chargeCaptured": false,
+        "declined": false,
+        "observedAt": "2026-10-19T16:59:22.633Z"
+      }
+    },
+    {
+      "runId": "uco_33f10bff137d406baee910273a2085df",
+      "caseId": "price_changed_004",
+      "operationId": "failure_price_changed_004_20261019_v1",
+      "state": "authorization_cancelled",
+      "test": true,
+      "isolation": "separate_failure_database_no_worker",
+      "currency": "USD",
+      "maxTotalCents": 1000,
+      "expectedCapturedCents": 0,
+      "sessionId": "cs_test_b1DyvD3cSL6F8IdYR4zvIqopKPQLTCI3YwuaZWzTg3lrw8NTIbRyGAK6Wq",
+      "paymentIntentId": "pi_3USJupGgawRtH2qe1LblGmos",
+      "observation": {
+        "status": "canceled",
+        "sessionId": "cs_test_b1DyvD3cSL6F8IdYR4zvIqopKPQLTCI3YwuaZWzTg3lrw8NTIbRyGAK6Wq",
+        "sessionStatus": "complete",
+        "sessionTotalCents": 812,
+        "paymentIntentId": "pi_3USJupGgawRtH2qe1LblGmos",
+        "paymentStatus": "canceled",
+        "capturedCents": 0,
+        "chargeId": "ch_3USJupGgawRtH2qe12XSCVKk",
+        "chargeCaptured": false,
+        "declined": false,
+        "observedAt": "2026-10-19T17:00:21.416Z"
+      },
+      "baseline": [
+        {
+          "shop": "i4vd1u-s8.myshopify.com",
+          "productId": "gid://shopify/Product/15428714102971",
+          "variantId": "gid://shopify/ProductVariant/67755079729339",
+          "inventoryItemId": "gid://shopify/InventoryItem/69742488551611",
+          "locationId": "gid://shopify/Location/94653743291",
+          "sku": "AVF-CONNECT-TEST-FAIL-002",
+          "priceCents": 100,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        },
+        {
+          "shop": "qpsd02-jz.myshopify.com",
+          "productId": "gid://shopify/Product/15428714135739",
+          "variantId": "gid://shopify/ProductVariant/67755079762107",
+          "inventoryItemId": "gid://shopify/InventoryItem/69742488584379",
+          "locationId": "gid://shopify/Location/94655676603",
+          "sku": "AVF-CONNECT-TEST-FAIL-004",
+          "priceCents": 200,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        },
+        {
+          "shop": "ir7112-v1.myshopify.com",
+          "productId": "gid://shopify/Product/15278926659802",
+          "variantId": "gid://shopify/ProductVariant/67578426130650",
+          "inventoryItemId": "gid://shopify/InventoryItem/69553985913050",
+          "locationId": "gid://shopify/Location/96190431450",
+          "sku": "AVF-CONNECT-TEST-FAIL-006",
+          "priceCents": 300,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        }
+      ],
+      "mutationObserved": {
+        "shop": "qpsd02-jz.myshopify.com",
+        "kind": "price_changed",
+        "providerReadVerified": true,
+        "observedAt": "2026-10-19T17:00:18.422Z"
+      },
+      "declineEvidence": null,
+      "raceCancellationEvidence": {
+        "paymentIntentId": "pi_3USJupGgawRtH2qe1LblGmos",
+        "paymentStatus": "canceled",
+        "capturedCents": 0,
+        "mutation": {
+          "shop": "qpsd02-jz.myshopify.com",
+          "kind": "price_changed",
+          "providerReadVerified": true,
+          "observedAt": "2026-10-19T17:00:18.422Z"
+        },
+        "observedAt": "2026-10-19T17:00:21.416Z",
+        "verification": "unified_pre_capture_revalidation_cancelled"
+      },
+      "casePassed": true,
+      "lastError": null,
+      "cleanup": null,
+      "localRecords": {
+        "orders": 0,
+        "bags": 0,
+        "ledger_journals": 0,
+        "transfers": 0,
+        "refunds": 0
+      },
+      "createdAt": "2026-10-19T16:56:45.344Z",
+      "updatedAt": "2026-10-19T17:00:21.915Z",
+      "fullAcceptancePassed": false,
+      "authorizationBeforeMutation": {
+        "status": "requires_capture",
+        "sessionId": "cs_test_b1DyvD3cSL6F8IdYR4zvIqopKPQLTCI3YwuaZWzTg3lrw8NTIbRyGAK6Wq",
+        "sessionStatus": "complete",
+        "sessionTotalCents": 812,
+        "paymentIntentId": "pi_3USJupGgawRtH2qe1LblGmos",
+        "paymentStatus": "requires_capture",
+        "capturedCents": 0,
+        "chargeId": "ch_3USJupGgawRtH2qe12XSCVKk",
+        "chargeCaptured": false,
+        "declined": false,
+        "observedAt": "2026-10-19T17:00:13.382Z"
+      }
+    },
+    {
+      "runId": "uco_592a48a5099d46d2ba24021dd4f03110",
+      "caseId": "price_changed_006",
+      "operationId": "failure_price_changed_006_20261019_v1",
+      "state": "authorization_cancelled",
+      "test": true,
+      "isolation": "separate_failure_database_no_worker",
+      "currency": "USD",
+      "maxTotalCents": 1000,
+      "expectedCapturedCents": 0,
+      "sessionId": "cs_test_b1pJAbCyISvNymmuXqWzO2V4BL4CA49rDCvbo2U87apXIZ93AGmT5xzuaN",
+      "paymentIntentId": "pi_3USJvXGgawRtH2qe0YXZwHFf",
+      "observation": {
+        "status": "canceled",
+        "sessionId": "cs_test_b1pJAbCyISvNymmuXqWzO2V4BL4CA49rDCvbo2U87apXIZ93AGmT5xzuaN",
+        "sessionStatus": "complete",
+        "sessionTotalCents": 812,
+        "paymentIntentId": "pi_3USJvXGgawRtH2qe0YXZwHFf",
+        "paymentStatus": "canceled",
+        "capturedCents": 0,
+        "chargeId": "ch_3USJvXGgawRtH2qe0JFWSyyX",
+        "chargeCaptured": false,
+        "declined": false,
+        "observedAt": "2026-10-19T17:01:07.295Z"
+      },
+      "baseline": [
+        {
+          "shop": "i4vd1u-s8.myshopify.com",
+          "productId": "gid://shopify/Product/15428714102971",
+          "variantId": "gid://shopify/ProductVariant/67755079729339",
+          "inventoryItemId": "gid://shopify/InventoryItem/69742488551611",
+          "locationId": "gid://shopify/Location/94653743291",
+          "sku": "AVF-CONNECT-TEST-FAIL-002",
+          "priceCents": 100,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        },
+        {
+          "shop": "qpsd02-jz.myshopify.com",
+          "productId": "gid://shopify/Product/15428714135739",
+          "variantId": "gid://shopify/ProductVariant/67755079762107",
+          "inventoryItemId": "gid://shopify/InventoryItem/69742488584379",
+          "locationId": "gid://shopify/Location/94655676603",
+          "sku": "AVF-CONNECT-TEST-FAIL-004",
+          "priceCents": 200,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        },
+        {
+          "shop": "ir7112-v1.myshopify.com",
+          "productId": "gid://shopify/Product/15278926659802",
+          "variantId": "gid://shopify/ProductVariant/67578426130650",
+          "inventoryItemId": "gid://shopify/InventoryItem/69553985913050",
+          "locationId": "gid://shopify/Location/96190431450",
+          "sku": "AVF-CONNECT-TEST-FAIL-006",
+          "priceCents": 300,
+          "inventoryQty": 10,
+          "status": "ACTIVE"
+        }
+      ],
+      "mutationObserved": {
+        "shop": "ir7112-v1.myshopify.com",
+        "kind": "price_changed",
+        "providerReadVerified": true,
+        "observedAt": "2026-10-19T17:01:03.917Z"
+      },
+      "declineEvidence": null,
+      "raceCancellationEvidence": {
+        "paymentIntentId": "pi_3USJvXGgawRtH2qe0YXZwHFf",
+        "paymentStatus": "canceled",
+        "capturedCents": 0,
+        "mutation": {
+          "shop": "ir7112-v1.myshopify.com",
+          "kind": "price_changed",
+          "providerReadVerified": true,
+          "observedAt": "2026-10-19T17:01:03.917Z"
+        },
+        "observedAt": "2026-10-19T17:01:07.295Z",
+        "verification": "unified_pre_capture_revalidation_cancelled"
+      },
+      "casePassed": true,
+      "lastError": null,
+      "cleanup": null,
+      "localRecords": {
+        "orders": 0,
+        "bags": 0,
+        "ledger_journals": 0,
+        "transfers": 0,
+        "refunds": 0
+      },
+      "createdAt": "2026-10-19T16:56:50.422Z",
+      "updatedAt": "2026-10-19T17:01:07.822Z",
+      "fullAcceptancePassed": false,
+      "authorizationBeforeMutation": {
+        "status": "requires_capture",
+        "sessionId": "cs_test_b1pJAbCyISvNymmuXqWzO2V4BL4CA49rDCvbo2U87apXIZ93AGmT5xzuaN",
+        "sessionStatus": "complete",
+        "sessionTotalCents": 812,
+        "paymentIntentId": "pi_3USJvXGgawRtH2qe0YXZwHFf",
+        "paymentStatus": "requires_capture",
+        "capturedCents": 0,
+        "chargeId": "ch_3USJvXGgawRtH2qe0JFWSyyX",
+        "chargeCaptured": false,
+        "declined": false,
+        "observedAt": "2026-10-19T17:00:58.140Z"
+      }
+    }
+  ],
+  "fixtureRestorations": [
+    {
+      "shop": "i4vd1u-s8.myshopify.com",
+      "state": "prepared",
+      "fixture": {
+        "productId": "gid://shopify/Product/15428714102971",
+        "variantId": "gid://shopify/ProductVariant/67755079729339",
+        "inventoryItemId": "gid://shopify/InventoryItem/69742488551611",
+        "locationId": "gid://shopify/Location/94653743291",
+        "priceCents": 100,
+        "inventoryQty": 10,
+        "status": "ACTIVE",
+        "sku": "AVF-CONNECT-TEST-FAIL-002",
+        "handle": "avafem-failure-test-002-do-not-ship"
+      },
+      "cleanupRequired": false,
+      "completedScenarios": [
+        "catalog:out_of_stock",
+        "catalog:price_changed",
+        "catalog:archived",
+        "checkout:out_of_stock"
+      ]
+    },
+    {
+      "shop": "qpsd02-jz.myshopify.com",
+      "state": "prepared",
+      "fixture": {
+        "productId": "gid://shopify/Product/15428714135739",
+        "variantId": "gid://shopify/ProductVariant/67755079762107",
+        "inventoryItemId": "gid://shopify/InventoryItem/69742488584379",
+        "locationId": "gid://shopify/Location/94655676603",
+        "priceCents": 200,
+        "inventoryQty": 10,
+        "status": "ACTIVE",
+        "sku": "AVF-CONNECT-TEST-FAIL-004",
+        "handle": "avafem-failure-test-004-do-not-ship"
+      },
+      "cleanupRequired": false,
+      "completedScenarios": [
+        "catalog:out_of_stock",
+        "catalog:price_changed",
+        "catalog:archived",
+        "checkout:out_of_stock"
+      ]
+    },
+    {
+      "shop": "ir7112-v1.myshopify.com",
+      "state": "prepared",
+      "fixture": {
+        "productId": "gid://shopify/Product/15278926659802",
+        "variantId": "gid://shopify/ProductVariant/67578426130650",
+        "inventoryItemId": "gid://shopify/InventoryItem/69553985913050",
+        "locationId": "gid://shopify/Location/96190431450",
+        "priceCents": 300,
+        "inventoryQty": 10,
+        "status": "ACTIVE",
+        "sku": "AVF-CONNECT-TEST-FAIL-006",
+        "handle": "avafem-failure-test-006-do-not-ship"
+      },
+      "cleanupRequired": false,
+      "completedScenarios": [
+        "catalog:out_of_stock",
+        "catalog:price_changed",
+        "catalog:archived",
+        "checkout:out_of_stock"
+      ]
+    },
+    {
+      "shop": "i4vd1u-s8.myshopify.com",
+      "state": "prepared",
+      "fixture": {
+        "productId": "gid://shopify/Product/15428714102971",
+        "variantId": "gid://shopify/ProductVariant/67755079729339",
+        "inventoryItemId": "gid://shopify/InventoryItem/69742488551611",
+        "locationId": "gid://shopify/Location/94653743291",
+        "priceCents": 100,
+        "inventoryQty": 10,
+        "status": "ACTIVE",
+        "sku": "AVF-CONNECT-TEST-FAIL-002",
+        "handle": "avafem-failure-test-002-do-not-ship"
+      },
+      "cleanupRequired": false,
+      "completedScenarios": [
+        "catalog:out_of_stock",
+        "catalog:price_changed",
+        "catalog:archived",
+        "checkout:out_of_stock",
+        "checkout:price_changed"
+      ]
+    },
+    {
+      "shop": "qpsd02-jz.myshopify.com",
+      "state": "prepared",
+      "fixture": {
+        "productId": "gid://shopify/Product/15428714135739",
+        "variantId": "gid://shopify/ProductVariant/67755079762107",
+        "inventoryItemId": "gid://shopify/InventoryItem/69742488584379",
+        "locationId": "gid://shopify/Location/94655676603",
+        "priceCents": 200,
+        "inventoryQty": 10,
+        "status": "ACTIVE",
+        "sku": "AVF-CONNECT-TEST-FAIL-004",
+        "handle": "avafem-failure-test-004-do-not-ship"
+      },
+      "cleanupRequired": false,
+      "completedScenarios": [
+        "catalog:out_of_stock",
+        "catalog:price_changed",
+        "catalog:archived",
+        "checkout:out_of_stock",
+        "checkout:price_changed"
+      ]
+    },
+    {
+      "shop": "ir7112-v1.myshopify.com",
+      "state": "prepared",
+      "fixture": {
+        "productId": "gid://shopify/Product/15278926659802",
+        "variantId": "gid://shopify/ProductVariant/67578426130650",
+        "inventoryItemId": "gid://shopify/InventoryItem/69553985913050",
+        "locationId": "gid://shopify/Location/96190431450",
+        "priceCents": 300,
+        "inventoryQty": 10,
+        "status": "ACTIVE",
+        "sku": "AVF-CONNECT-TEST-FAIL-006",
+        "handle": "avafem-failure-test-006-do-not-ship"
+      },
+      "cleanupRequired": false,
+      "completedScenarios": [
+        "catalog:out_of_stock",
+        "catalog:price_changed",
+        "catalog:archived",
+        "checkout:out_of_stock",
+        "checkout:price_changed"
+      ]
+    }
+  ],
+  "limits": [
+    "Stripe-documented sandbox cards, not real issuer events.",
+    "Capture and order writers are independently forbidden in the isolated harness.",
+    "No provider outage, actual throttling, or bank/reversal failure induced.",
+    "Signed public webhook delivery remains excluded by local-only scope.",
+    "An initial native-navigation typo sent one disposable TEST Session URL to browser search; no credentials or real shopper data were in it. That exact Session was subsequently expired, its PaymentIntent cancelled, and zero capture verified."
+  ]
+}

@@ -1,0 +1,242 @@
+{
+  "source": "actual_local_HTTP_not_provider_acceptance",
+  "testOnly": true,
+  "externalRequests": 0,
+  "providerAcceptancePassed": false,
+  "existingRunMutationsRequested": 0,
+  "summary": {
+    "total": 30,
+    "passed": 30,
+    "failed": 0
+  },
+  "cases": [
+    {
+      "caseId": "independent_owner_session",
+      "status": 200,
+      "expected": 200,
+      "pass": true,
+      "errorCode": null
+    },
+    {
+      "caseId": "completed_three_store_targets",
+      "status": 200,
+      "expected": 200,
+      "pass": true,
+      "errorCode": null
+    },
+    {
+      "caseId": "no_cookie_refund",
+      "status": 401,
+      "expected": 401,
+      "pass": true,
+      "errorCode": "AUTHENTICATION_REQUIRED"
+    },
+    {
+      "caseId": "missing_csrf_refund",
+      "status": 403,
+      "expected": 403,
+      "pass": true,
+      "errorCode": "CSRF_REQUIRED"
+    },
+    {
+      "caseId": "no_cookie_fulfill",
+      "status": 401,
+      "expected": 401,
+      "pass": true,
+      "errorCode": "AUTHENTICATION_REQUIRED"
+    },
+    {
+      "caseId": "missing_csrf_fulfill",
+      "status": 403,
+      "expected": 403,
+      "pass": true,
+      "errorCode": "CSRF_REQUIRED"
+    },
+    {
+      "caseId": "no_cookie_reconcile",
+      "status": 401,
+      "expected": 401,
+      "pass": true,
+      "errorCode": "AUTHENTICATION_REQUIRED"
+    },
+    {
+      "caseId": "missing_csrf_reconcile",
+      "status": 403,
+      "expected": 403,
+      "pass": true,
+      "errorCode": "CSRF_REQUIRED"
+    },
+    {
+      "caseId": "no_cookie_saved_run",
+      "status": 401,
+      "expected": 401,
+      "pass": true,
+      "errorCode": "AUTHENTICATION_REQUIRED"
+    },
+    {
+      "caseId": "bad_host_saved_run",
+      "status": 403,
+      "expected": 403,
+      "pass": true,
+      "errorCode": "INVALID_HOST"
+    },
+    {
+      "caseId": "bad_origin_saved_run",
+      "status": 403,
+      "expected": 403,
+      "pass": true,
+      "errorCode": "ORIGIN_DENIED"
+    },
+    {
+      "caseId": "store_2_scope_selected",
+      "status": 200,
+      "expected": 200,
+      "pass": true,
+      "errorCode": null
+    },
+    {
+      "caseId": "store_2_owner_endpoint_denied",
+      "status": 403,
+      "expected": 403,
+      "pass": true,
+      "errorCode": "ADMIN_REQUIRED"
+    },
+    {
+      "caseId": "store_2_owner_mutation_denied",
+      "status": 403,
+      "expected": 403,
+      "pass": true,
+      "errorCode": "ADMIN_REQUIRED"
+    },
+    {
+      "caseId": "store_2_cannot_read_store_4_bag",
+      "status": 404,
+      "expected": [
+        403,
+        404
+      ],
+      "pass": true,
+      "errorCode": "NOT_FOUND"
+    },
+    {
+      "caseId": "store_2_cannot_read_store_6_bag",
+      "status": 404,
+      "expected": [
+        403,
+        404
+      ],
+      "pass": true,
+      "errorCode": "NOT_FOUND"
+    },
+    {
+      "caseId": "store_4_scope_selected",
+      "status": 200,
+      "expected": 200,
+      "pass": true,
+      "errorCode": null
+    },
+    {
+      "caseId": "store_4_owner_endpoint_denied",
+      "status": 403,
+      "expected": 403,
+      "pass": true,
+      "errorCode": "ADMIN_REQUIRED"
+    },
+    {
+      "caseId": "store_4_owner_mutation_denied",
+      "status": 403,
+      "expected": 403,
+      "pass": true,
+      "errorCode": "ADMIN_REQUIRED"
+    },
+    {
+      "caseId": "store_4_cannot_read_store_2_bag",
+      "status": 404,
+      "expected": [
+        403,
+        404
+      ],
+      "pass": true,
+      "errorCode": "NOT_FOUND"
+    },
+    {
+      "caseId": "store_4_cannot_read_store_6_bag",
+      "status": 404,
+      "expected": [
+        403,
+        404
+      ],
+      "pass": true,
+      "errorCode": "NOT_FOUND"
+    },
+    {
+      "caseId": "store_6_scope_selected",
+      "status": 200,
+      "expected": 200,
+      "pass": true,
+      "errorCode": null
+    },
+    {
+      "caseId": "store_6_owner_endpoint_denied",
+      "status": 403,
+      "expected": 403,
+      "pass": true,
+      "errorCode": "ADMIN_REQUIRED"
+    },
+    {
+      "caseId": "store_6_owner_mutation_denied",
+      "status": 403,
+      "expected": 403,
+      "pass": true,
+      "errorCode": "ADMIN_REQUIRED"
+    },
+    {
+      "caseId": "store_6_cannot_read_store_2_bag",
+      "status": 404,
+      "expected": [
+        403,
+        404
+      ],
+      "pass": true,
+      "errorCode": "NOT_FOUND"
+    },
+    {
+      "caseId": "store_6_cannot_read_store_4_bag",
+      "status": 404,
+      "expected": [
+        403,
+        404
+      ],
+      "pass": true,
+      "errorCode": "NOT_FOUND"
+    },
+    {
+      "caseId": "store_2_invalid_shopify_signature",
+      "status": 401,
+      "expected": 401,
+      "pass": true,
+      "errorCode": "INVALID_SIGNATURE"
+    },
+    {
+      "caseId": "store_4_invalid_shopify_signature",
+      "status": 401,
+      "expected": 401,
+      "pass": true,
+      "errorCode": "INVALID_SIGNATURE"
+    },
+    {
+      "caseId": "store_6_invalid_shopify_signature",
+      "status": 401,
+      "expected": 401,
+      "pass": true,
+      "errorCode": "INVALID_SIGNATURE"
+    },
+    {
+      "caseId": "independent_session_restored_admin",
+      "status": 200,
+      "expected": 200,
+      "pass": true,
+      "errorCode": null
+    }
+  ]
+}

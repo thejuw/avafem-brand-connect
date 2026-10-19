@@ -1,0 +1,25 @@
+{
+  "recordedAt": "2026-10-19T16:51:12.052Z",
+  "source": "actual_local_commands",
+  "node": "v25.8.1",
+  "isolatedTests": {
+    "command": "node --test --test-concurrency=2 tests/*.test.mjs web/lib/*.test.mjs",
+    "tests": 565,
+    "passed": 565,
+    "failed": 0,
+    "cancelled": 0,
+    "skipped": 0,
+    "durationMs": 267991.324208
+  },
+  "syntax": {
+    "command": "npm run check",
+    "passed": true
+  },
+  "build": {
+    "command": "npm run build",
+    "passed": true,
+    "durationMs": 261,
+    "nonBlockingWarning": "Existing lucide-react use-client module directives"
+  },
+  "providerAcceptancePassed": false
+}
