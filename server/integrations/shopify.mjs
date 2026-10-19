@@ -125,6 +125,30 @@ export function createShopifyAdapter(config = {}) {
   const environmentTokenShop = normalizeShop(env.SHOPIFY_SHOP ?? DEFAULT_SHOPIFY_SHOP);
   const directToken = () => config.accessToken ?? (shop === environmentTokenShop ? env.SHOPIFY_ACCESS_TOKEN ?? env.SHOPIFY_AVA4_TOKEN : undefined);
 
+  // Dev/trial stores accept only a few orderCreate calls per minute. Pace locally,
+  // BEFORE the write, so a refusal can never mean an order was created.
+  const ordersPerMinute = Number(config.ordersPerMinute ?? env.SHOPIFY_ORDERS_PER_MINUTE ?? 0);
+  const orderStamps = [];
+  const clockMs = config.clock ?? (() => Date.now());
+  function reserveOrderSlot() {
+    if (!(ordersPerMinute > 0)) return;
+    const t = clockMs();
+    while (orderStamps.length && t - orderStamps[0] >= 60_000) orderStamps.shift();
+    if (orderStamps.length >= ordersPerMinute) {
+      throw new IntegrationError('Shopify order rate limit reached for this store; retry later.', { code: 'SHOPIFY_ORDER_RATE_LIMITED', statusCode: 429, retryable: true,
+        details: { retryAfterMs: 60_000 - (t - orderStamps[0]), ordersPerMinute } });
+    }
+    orderStamps.push(t);
+  }
+  function retryAfterMs(response) {
+    const raw = response.headers?.get?.('retry-after');
+    if (raw == null) return undefined;
+    const seconds = Number(raw);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, 3_600_000);
+    const at = Date.parse(raw);
+    return Number.isFinite(at) ? Math.max(0, Math.min(at - Date.now(), 3_600_000)) : undefined;
+  }
+
   async function timedFetch(url, options) {
     return fetchImpl(url, { ...options, redirect: 'error', signal: AbortSignal.timeout(config.timeoutMs ?? 15_000) });
   }
@@ -162,7 +186,7 @@ export function createShopifyAdapter(config = {}) {
     try {
       response = await timedFetch(`https://${shop}/admin/api/${apiVersion}/graphql.json`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-shopify-access-token': token }, body: JSON.stringify({ query, variables }) });
       if (write && response.status >= 500) throw new UncertainOperationError('Shopify', write.operation, write.reference);
-      if (!response.ok) throw new IntegrationError('Shopify API request was rejected.', { code: response.status === 401 ? 'SHOPIFY_DISCONNECTED' : 'SHOPIFY_HTTP_ERROR', statusCode: response.status === 401 ? 401 : 502, retryable: !writeReference && (response.status === 429 || response.status >= 500), details: { upstreamStatus: response.status } });
+      if (!response.ok) throw new IntegrationError('Shopify API request was rejected.', { code: response.status === 401 ? 'SHOPIFY_DISCONNECTED' : 'SHOPIFY_HTTP_ERROR', statusCode: response.status === 401 ? 401 : 502, retryable: !writeReference && (response.status === 429 || response.status >= 500), details: { upstreamStatus: response.status, ...(response.status === 429 && retryAfterMs(response) !== undefined ? { retryAfterMs: retryAfterMs(response) } : {}) } });
       json = await response.json();
     } catch (cause) {
       if (cause instanceof IntegrationError) throw cause;
@@ -501,6 +525,7 @@ export function createShopifyAdapter(config = {}) {
     try {
       const existing = await findOrder(safe.bag_id);
       if (existing) return { order: existing, mapping: { bagId: safe.bag_id, shop, orderId: existing.id }, alreadyExists: true };
+      reserveOrderSlot();
       const data = await graphql(`mutation AvafemCreateOrder($order:OrderCreateOrderInput!,$options:OrderCreateOptionsInput) { orderCreate(order:$order,options:$options) { order { ${ORDER_FIELDS} } userErrors { field code message } } }`, { order, options: { sendReceipt: false, sendFulfillmentReceipt: false, inventoryBehaviour } }, safe.bag_id);
       const result = data?.orderCreate;
       if (result?.userErrors?.length && !result.order?.id) throw new IntegrationError('Shopify rejected the order. Inspect the field errors before changing the Bag.', { code: 'SHOPIFY_ORDER_REJECTED', statusCode: 422, details: { errors: result.userErrors.map(e => ({ field: e.field, code: e.code, message: String(e.message).slice(0, 400) })) } });
