@@ -11,6 +11,9 @@ export const PLATFORM_SECTIONS = [
   { id: 'alerts', label: 'Alerts', path: '/api/admin/alerts', adminOnly: true, actions: [{ label: 'Scan now', path: '/api/admin/alerts/scan' }, { label: 'Run pre-payout checks', path: '/api/admin/payout-checks' }] },
   { id: 'salestax', label: 'Sales tax by state', path: '/api/reports/sales-tax', adminOnly: true, note: 'CSV: add ?format=csv to the API path.' },
   { id: 'payouts', label: 'Annual payouts (1099-K data)', path: '/api/reports/brand-payouts' },
+  { id: 'review', label: 'Catalog review queue', path: '/api/portal/review-queue', adminOnly: true, note: 'Approve or reject with the existing catalog review action; compliance flags appear per product.' },
+  { id: 'placements', label: 'Placements', path: '/api/placements' },
+  { id: 'billing', label: 'Placement billing', path: '/api/billing' },
 ];
 export function platformRows(data) {
   if (Array.isArray(data)) return data;

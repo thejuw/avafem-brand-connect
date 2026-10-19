@@ -58,3 +58,21 @@ unified/test checkout flows (deliberately, to keep their behaviour and tests int
 and 1099-K outputs are data exports for an accountant, not filings.
 
 Tests: `tests/platform-money.test.mjs`.
+
+## Phase 3 — Brand side
+
+| Capability | Where |
+|---|---|
+| Public self-serve signup (rate limited 5/min): creates an `invited` brand, encrypted contact, and a 48 h invite; accepting the invite (existing `/api/invites/:token/accept`) signs the agreement and opens a brand session | `POST /api/portal/signup` |
+| Onboarding checklist: signup → agreement → profile (ship-from, shipping table, support email) → store connection → Stripe Express → catalog submitted → catalog approved → live, plus the core `onboardingRequirements` | `GET /api/portal/:brandId/status`, `PATCH …/profile`, MCP `get_onboarding_status` |
+| Stripe Express onboarding (**mocked** AccountLink + simulated `account.updated`; uses `acct_sandbox_…` ids) | `POST /api/portal/:brandId/stripe/link`, `…/stripe/return` |
+| Store connection: WooCommerce (consumer key/secret), BigCommerce (store hash + token), CSV, or Shopify (hands off to the existing OAuth install). Credentials are verified, then stored AES‑GCM encrypted; disconnect wipes them | `POST /api/portal/:brandId/connect`, `GET …/connectors`, `DELETE …/connectors/:platform` |
+| Connector adapters behind one interface (`verify`, `listProducts`, `createOrder`), all HTTP via injected `fetch` | `server/platform/connectors.mjs` |
+| Catalog sync from Woo/BigCommerce and CSV fallback (Avafem columns or Shopify product export) into the core catalog (products land in draft/in_review with validation issues) | `POST …/connectors/:platform/sync`, `POST /api/portal/:brandId/catalog/csv`, `POST /v1/catalog/csv`, MCP `upload_catalog_csv` |
+| Catalog approval queue (validation issues + Phase 4 compliance flags); approve with the existing `POST /api/products/:id/review` | `GET /api/portal/review-queue` |
+| Operator activation (refuses while core requirements remain) | `POST /api/portal/:brandId/activate` |
+| Push a Bag to the brand's Woo/BigCommerce store (idempotent per Bag) | `POST /api/connectors/orders/:bagId/push` |
+| Brand analytics: sales (gross, net, AOV, commission), returns (rate), conversion (swipes, likes, liked→purchased rate, placement impressions/clicks/CTR), top products | `GET /api/brands/:id/analytics`, `GET /v1/analytics`, MCP `get_brand_analytics` |
+| Paid placements: `featured_spot` ($25/day), `sponsored_swipe` ($10 per 1,000 impressions), `sampling_box` ($1.50/unit); approved product only; operator approval creates an `invoiced` billing record (`invoice` or `payout_offset`); cancel before start voids it; shopper feed caps sponsored swipes at purchased impressions | `/api/placements…`, `/api/billing…`, `/v1/placements`, `/v1/billing`, MCP `list_placements`, `request_placement` |
+
+Tests: `tests/platform-brands.test.mjs` (WooCommerce/BigCommerce HTTP fully mocked).
