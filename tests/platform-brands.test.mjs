@@ -49,7 +49,7 @@ test('connector adapters normalize WooCommerce and BigCommerce products and reje
   assert.equal(rows.length, 1); assert.equal(rows[0].priceCents, 1200); assert.deepEqual(rows[0].images, ['https://img.example.com/1.jpg', 'https://img.example.com/2.jpg']);
 });
 
-test('self-serve portal: signup -> invite -> profile -> Stripe Express (mocked) -> WooCommerce connect + sync -> review queue -> live', { timeout: 90_000 }, async t => {
+test('explicit legacy server-owned fixture: portal profile -> mocked Stripe -> Woo sync -> review queue -> live', { timeout: 90_000 }, async t => {
   const f = await platformFixture(t);
   f.platform.brands.resolve = publicResolve;
   const calls = []; f.platform.brands.fetch = mockStores(calls);
@@ -59,6 +59,10 @@ test('self-serve portal: signup -> invite -> profile -> Stripe Express (mocked) 
   assert.ok(!raw.includes('founder@fernflow.com'), 'contact encrypted');
   const accept = await f.request({ method: 'POST', url: `/api/invites/${signup.inviteToken}/accept`, payload: { acceptedSandboxTerms: true } });
   assert.equal(accept.statusCode, 200, accept.body);
+  // This compatibility test intentionally opts its isolated fixture back into
+  // the old simulated portal. Public invitation acceptance always enters the
+  // two-step flow; there is no request field or production opt-out for this.
+  await f.db.query("UPDATE brands SET onboarding_mode='legacy',onboarding_state='{}',payout_setup='pending' WHERE id=$1", [signup.brandId]);
   const cookie = String(accept.headers['set-cookie']).split(';')[0]; const csrf = accept.json().data.csrfToken;
   const brand = o => f.request({ ...o, headers: { cookie, 'x-csrf-token': csrf, ...o.headers } });
   const brandId = signup.brandId;

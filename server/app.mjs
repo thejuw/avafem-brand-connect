@@ -627,8 +627,12 @@ export async function createApp(options = {}) {
   app.post('/api/invites/:token/accept', async (request, reply) => {
     const input = z.object({ acceptedSandboxTerms: z.literal(true) }).parse(request.body);
     const invite = await auth.consumeInvite(request.params.token, 'sandbox-draft-v1');
-    const session = await auth.createSession({ brandId: invite.brandId }); setSessionCookie(reply, session);
+    // Every public invitation enters the safe two-step lifecycle before any
+    // tenant session is minted. Legacy simulated payout actions must not be
+    // reachable in the gap before the merchant chooses/detects a store.
+    await domain.enterTwoStepOnboarding(invite.brandId, { actor: 'invite-accept' });
     await domain.updateBrand(invite.brandId, { agreementSigned: input.acceptedSandboxTerms });
+    const session = await auth.createSession({ brandId: invite.brandId }); setSessionCookie(reply, session);
     return data({ csrfToken: session.csrfToken, brandId: session.brandId, role: 'brand', sandbox: true });
   });
   app.post('/oauth/token', { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async request => {

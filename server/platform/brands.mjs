@@ -135,6 +135,8 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
     const brand=await first(tx,'SELECT onboarding_state,status FROM brands WHERE id=$1',[brandId]),current=brand?.onboardingState?.catalogLease;
     if(!lease || current?.token!==lease.token || current.provider!==lease.provider || current.catalogKey!==lease.catalogKey || !current.expiresAt || new Date(current.expiresAt)<=wall())
       fail('The catalog import lease expired or was replaced; refresh the source snapshot.',409,'CATALOG_IMPORT_STALE');
+    if((brand.onboardingState?.connectionVersion ?? null)!==(lease.connectionVersion ?? null))
+      fail('The selected store connection changed while its catalog was loading.',409,'STORE_CONNECTION_CHANGED');
     if(brand.onboardingState?.platform && (['paused','disconnected'].includes(brand.status) || !brand.onboardingState.connected || brand.onboardingState.platform!==lease.provider))
       fail('The selected store changed while its catalog was loading.',409,'STORE_CONNECTION_CHANGED');
   }
@@ -146,6 +148,7 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
       const brand=await first(tx,'SELECT onboarding_state FROM brands WHERE id=$1',[brandId]);if(!brand)fail('Brand not found.',404,'NOT_FOUND');
       const previous=brand.onboardingState?.catalogLease;
       if(previous?.token && new Date(previous.expiresAt)>wall())fail('A catalog import is already reading or applying this brand’s snapshot.',409,'CATALOG_IMPORT_BUSY');
+      lease.connectionVersion=brand.onboardingState?.connectionVersion ?? null;
       await tx.query('UPDATE brands SET onboarding_state=onboarding_state||$2::jsonb WHERE id=$1',[brandId,JSON.stringify({catalogLease:lease})]);
     });
     try {

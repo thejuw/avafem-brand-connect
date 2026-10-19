@@ -145,6 +145,10 @@ jobs create deduplicated admin/dashboard prompts; they do not claim external
 email delivery.
 
 The new flow rejects the legacy portal's simulated Express link/return shortcut.
+Acceptance enters the new mode before issuing the brand session. Existing
+legacy brands entering the new flow cannot carry simulated account flags into
+verified payout eligibility. Raw account IDs or enabled flags are not proof of
+completed setup; absent a server-configured verifier, releases stay held.
 Without an injected configured test payout adapter, setup remains unavailable.
 An eligible future adapter may supply an allowlisted HTTPS hosted provider URL;
 the UI refuses simulated results/URLs. Opening a link is not completion, and

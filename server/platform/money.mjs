@@ -1,9 +1,16 @@
 import { id, sha, keyring, first, rows, fail, text, int, DAY } from './util.mjs';
 
+const needsPayoutProof=brand=>brand?.onboardingMode==='two_step' || Boolean(brand?.onboardingState?.platform || brand?.onboardingState?.source || brand?.onboardingState?.connected);
+async function payoutProofReady(brand,domain,tx) {
+  if(!brand)return false;
+  if(!needsPayoutProof(brand))return Boolean(brand.payoutsEnabled && brand.stripeAccountId);
+  return typeof domain?.twoStepPayoutReady==='function' && await domain.twoStepPayoutReady(brand.id,{tx});
+}
+
 /** Beauty Bank closed-loop credits. Lots move LAB (pending) -> VAULT (spendable) once the
  * earning Bag is delivered and its return window has passed; REVERSED on refund; EXPIRED
  * after expiry. Redemptions consume VAULT lots soonest-to-expire first. Integer cents. */
-export function createBeautyBank(db, { clock, earnBps = 300, expiryDays = 365 }) {
+export function createBeautyBank(db, { clock, domain, earnBps = 300, expiryDays = 365 }) {
   const now = () => clock();
   const ev = (q, lot, kind, from, to, amount, ref = null) => q.query('INSERT INTO bank_events(lot_id,shopper_id,kind,from_state,to_state,amount_cents,ref,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)',
     [lot.id, lot.shopperId, kind, from, to, amount, ref, now()]);
@@ -67,6 +74,7 @@ export function createBeautyBank(db, { clock, earnBps = 300, expiryDays = 365 })
     async mature() {
       return db.transaction(async tx => {
         const due = await rows(tx, `SELECT l.*, b.delivered_at, b.return_window_days, b.payout_due_at,
+          br.id AS payout_brand_id,br.onboarding_mode,br.onboarding_state,
           br.return_window_days AS current_return_window_days,t.due_at AS transfer_due_at,j.due_at AS job_due_at
           FROM bank_lots l JOIN bags b ON b.id=l.bag_id JOIN brands br ON br.id=b.brand_id
           LEFT JOIN transfers t ON t.bag_id=b.id LEFT JOIN jobs j ON j.bag_id=b.id AND j.kind='sandbox_payout'
@@ -79,6 +87,7 @@ export function createBeautyBank(db, { clock, earnBps = 300, expiryDays = 365 })
           FOR UPDATE OF l`);
         let moved = 0;
         for (const lot of due) {
+          if(needsPayoutProof(lot) && !(await payoutProofReady({id:lot.payoutBrandId,onboardingMode:lot.onboardingMode,onboardingState:lot.onboardingState},domain,tx)))continue;
           const days = Math.max(7,lot.returnWindowDays ?? 30,lot.currentReturnWindowDays ?? 30);
           const matures = new Date(Math.max(Date.parse(lot.deliveredAt) + days * DAY,
             ...[lot.maturesAt,lot.payoutDueAt,lot.transferDueAt,lot.jobDueAt].filter(Boolean).map(Date.parse)));
@@ -135,7 +144,7 @@ export function createBeautyBank(db, { clock, earnBps = 300, expiryDays = 365 })
 }
 
 /** Rule-based risk scoring for checkouts and pre-payout brand checks. */
-export function createRisk(db, { clock }) {
+export function createRisk(db, { clock, domain }) {
   const now = () => clock();
   const save = (type, subject, score, signals) => {
     const decision = score >= 70 ? 'block' : score >= 40 ? 'review' : 'allow';
@@ -166,7 +175,7 @@ export function createRisk(db, { clock }) {
         COUNT(*) FILTER (WHERE status='awaiting_shipment' AND ship_by<$2)::int AS late FROM bags WHERE brand_id=$1`, [brandId, now()]);
       const disputes = await first(db, "SELECT COUNT(*) FILTER (WHERE status IN ('needs_response','under_review'))::int AS open, COUNT(*) FILTER (WHERE status='lost')::int AS lost FROM disputes WHERE brand_id=$1", [brandId]);
       const reasons = [];
-      if (!brand.payoutsEnabled || !brand.stripeAccountId) reasons.push('PAYOUTS_NOT_ENABLED');
+      if (!await payoutProofReady(brand,domain)) reasons.push('PAYOUTS_NOT_ENABLED');
       if (['paused', 'disconnected'].includes(brand.status)) reasons.push('BRAND_UNAVAILABLE');
       if (stats.bags >= 5 && stats.refunded / stats.bags > 0.2) reasons.push('HIGH_REFUND_RATE');
       if (disputes.open > 0) reasons.push('OPEN_DISPUTE');
@@ -233,7 +242,8 @@ export function createConsole(db, { clock, domain, risk, secret, creditExpiryDay
     const refunds = await rows(tx, 'SELECT * FROM refunds WHERE bag_id=$1 FOR UPDATE', [bagId]);
     const resolutions = await rows(tx, 'SELECT * FROM financial_resolutions WHERE bag_id=$1 FOR UPDATE', [bagId]);
     const lots = await rows(tx, "SELECT * FROM bank_lots WHERE bag_id=$1 AND state IN ('LAB','VAULT') ORDER BY id FOR UPDATE", [bagId]);
-    return { bag, brand, transfer, job, credit, disputes, refunds, resolutions, lots };
+    const payoutVerified=await payoutProofReady(brand,domain,tx);
+    return { bag, brand, transfer, job, credit, disputes, refunds, resolutions, lots,payoutVerified };
   }
   function eligibility(s, { credit = false, lot = null } = {}) {
     const reasons = [];
@@ -241,7 +251,7 @@ export function createConsole(db, { clock, domain, risk, secret, creditExpiryDay
     if (s.bag.status !== 'delivered' || !s.bag.deliveredAt) reasons.push('DELIVERY_REQUIRED');
     if (s.bag.refundedCents > 0 || s.refunds.some(r => r.status === 'proposed' || r.status === 'approved')) reasons.push('REFUND_REVIEW_REQUIRED');
     if (s.disputes.some(d => ['needs_response', 'under_review'].includes(d.status) || (d.status === 'lost' && !s.resolutions.some(r => r.disputeId === d.id && r.kind === 'lost_dispute' && r.action === 'operator_verified_recovery')))) reasons.push('DISPUTE_RECOVERY_REQUIRED');
-    if (!s.brand || !['ready', 'live'].includes(s.brand.status) || !s.brand.connectionHealthy || !s.brand.payoutsEnabled || !s.brand.stripeAccountId) reasons.push('BRAND_UNAVAILABLE');
+    if (!s.brand || !['ready', 'live'].includes(s.brand.status) || !s.brand.connectionHealthy || !s.payoutVerified) reasons.push('BRAND_UNAVAILABLE');
     if (!s.transfer || ['cancelled', 'reversed'].includes(s.transfer.status) || s.resolutions.some(r => r.kind === 'lost_dispute' && r.action === 'writeoff')) reasons.push('PAYABLE_UNAVAILABLE');
     if (s.transfer && (s.transfer.amountCents !== s.bag.transferCents || s.transfer.reversedCents > 0 || (s.transfer.paidAt && s.transfer.status !== 'paid'))) reasons.push('PAYABLE_RECONCILIATION_REQUIRED');
     if (!credit && (!s.job || !['held', 'scheduled'].includes(s.job.status))) reasons.push('PAYOUT_JOB_REVIEW');
@@ -423,8 +433,8 @@ export function createConsole(db, { clock, domain, risk, secret, creditExpiryDay
         // A separate won dispute never implicitly releases a Bag with a lost
         // history, even after recovery: that needs the explicit audited release.
         const blockers = await first(tx, "SELECT (SELECT COUNT(*) FROM refunds WHERE bag_id=$1 AND status='proposed')::int + (SELECT COUNT(*) FROM disputes WHERE bag_id=$1 AND status IN ('needs_response','under_review','lost'))::int AS c", [d.bagId]);
-        const brand = await first(tx, 'SELECT status,connection_healthy,payouts_enabled,stripe_account_id FROM brands WHERE id=$1', [d.brandId]);
-        if (outcome === 'won' && blockers.c === 0 && ['ready', 'live'].includes(brand?.status) && brand.connectionHealthy && brand.payoutsEnabled && brand.stripeAccountId) {
+        const brand = await first(tx, 'SELECT * FROM brands WHERE id=$1 FOR UPDATE', [d.brandId]);
+        if (outcome === 'won' && blockers.c === 0 && ['ready', 'live'].includes(brand?.status) && brand.connectionHealthy && await payoutProofReady(brand,domain,tx)) {
           await tx.query("UPDATE transfers SET status='scheduled' WHERE bag_id=$1 AND status='held'", [d.bagId]);
           await tx.query("UPDATE jobs SET status='scheduled' WHERE bag_id=$1 AND status='held' AND kind='sandbox_payout'", [d.bagId]);
         }

@@ -38,7 +38,7 @@ const address = value => {
 /** Sandbox business core. Amounts are integer USD cents. Optional brandId
  * arguments constrain reads and writes to that tenant; admin authorization is
  * supplied by the HTTP layer. Every mutation and its outbox event commit together. */
-export function createDomain(db, { clock = () => new Date(), protectShipping, revealShipping, beforeProductApproval } = {}) {
+export function createDomain(db, { clock = () => new Date(), protectShipping, revealShipping, beforeProductApproval, verifyTwoStepPayout } = {}) {
   const now = () => new Date(typeof clock === 'function' ? clock() : clock.now());
   const iso = () => now().toISOString();
   const protectedAddress=value=>value && typeof value==='object' && Object.hasOwn(value,'encryptedShipping');
@@ -117,8 +117,19 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
   const credit = (account, creditCents) => ({ account, creditCents, debitCents: 0 });
 
   const releaseDays=(bag,brand)=>Math.max(7,bag.returnWindowDays??30,brand.returnWindowDays??30);
-  const payoutReady = brand => Boolean(brand.stripeAccountId && brand.chargesEnabled && brand.payoutsEnabled
-    && (brand.onboardingMode !== 'two_step' || brand.payoutSetup === 'complete'));
+  const twoStep = brand => brand.onboardingMode==='two_step' || Boolean(brand.onboardingState?.platform || brand.onboardingState?.source || brand.onboardingState?.connected);
+  // Legacy mock flags are deliberately not a provider proof. A future payout
+  // driver must supply this server-owned, transaction-local durable verifier;
+  // no current HTTP payload or JSON flag can enable two-step payouts.
+  async function payoutReady(brand,tx) {
+    if(!brand.stripeAccountId || !brand.chargesEnabled || !brand.payoutsEnabled) return false;
+    if(!twoStep(brand))return true;
+    if(brand.payoutSetup!=='complete' || !/^acct_[A-Za-z0-9]{8,64}$/.test(brand.stripeAccountId) || typeof verifyTwoStepPayout!=='function')return false;
+    try {
+      const proof=await verifyTwoStepPayout({brandId:brand.id,accountId:brand.stripeAccountId},tx);
+      return proof?.verified===true && proof.provider==='stripe' && proof.mode==='test' && proof.brandId===brand.id && proof.accountId===brand.stripeAccountId && proof.chargesEnabled===true && proof.payoutsEnabled===true;
+    } catch {return false;}
+  }
   async function extendScheduledWindow(tx,bag,brand) {
     if (!bag.deliveredAt) return bag;
     const transfer=await first(tx,'SELECT * FROM transfers WHERE bag_id=$1',[bag.id]);
@@ -225,6 +236,29 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
       return Promise.all(result.map(brand => decorateBrand(db,brand)));
     },
     async getBrand(brandId) { return decorateBrand(db,await brandRow(db,brandId)); },
+    async twoStepPayoutReady(brandId,{tx}={}) {const q=tx||db;if(tx)await tx.query('SELECT id FROM brands WHERE id=$1 FOR UPDATE',[brandId]);return payoutReady({...await brandRow(q,brandId),onboardingMode:'two_step'},q);},
+    async enterTwoStepOnboarding(brandId,{actor='system:onboarding'}={}) {
+      if(!/^[A-Za-z0-9_:-]{1,120}$/.test(actor))fail('Use a server-owned onboarding actor.');
+      return db.transaction(async tx=>{
+        await tx.query('SELECT id FROM brands WHERE id=$1 FOR UPDATE',[brandId]);
+        const brand=await brandRow(tx,brandId),verified=await payoutReady({...brand,onboardingMode:'two_step'},tx);
+        const setup=verified?'complete':'deferred',status=brand.onboardingMode!=='two_step' && ['invited','ready','live'].includes(brand.status)?'onboarding':brand.status;
+        const changed=brand.onboardingMode!=='two_step' || brand.payoutSetup!==setup || (!verified && Boolean(brand.stripeAccountId || brand.chargesEnabled || brand.payoutsEnabled));
+        const result=await first(tx,`UPDATE brands SET onboarding_mode='two_step',payout_setup=$2,status=$3,
+          stripe_account_id=CASE WHEN $4 THEN stripe_account_id ELSE NULL END,charges_enabled=CASE WHEN $4 THEN charges_enabled ELSE FALSE END,
+          payouts_enabled=CASE WHEN $4 THEN payouts_enabled ELSE FALSE END,updated_at=$5 WHERE id=$1 RETURNING *`,[brandId,setup,status,verified,iso()]);
+        if(!verified) {
+          await tx.query("UPDATE transfers SET status='held' WHERE brand_id=$1 AND status='scheduled'",[brandId]);
+          await tx.query("UPDATE jobs SET status='held',last_error='Verified two-step payout setup required' WHERE bag_id IN(SELECT id FROM bags WHERE brand_id=$1) AND kind='sandbox_payout' AND status IN('scheduled','failed')",[brandId]);
+        }
+        if(changed) {
+          await tx.query(`INSERT INTO curation_audit(id,brand_id,actor,action,reason,payload,created_at) VALUES($1,$2,$3,'two_step_entered',$4,$5,$6)`,
+            [id('curation'),brandId,actor,'Two-step payout authority is separate from legacy simulated onboarding.',json({payoutSetup:setup,payoutVerified:verified,legacySimulationDiscarded:!verified && Boolean(brand.stripeAccountId || brand.chargesEnabled || brand.payoutsEnabled)}),iso()]);
+          await event(tx,'brand.onboarding_entered',brandId,brandId,{onboardingMode:'two_step',payoutSetup:setup,payoutVerified:verified});
+        }
+        return decorateBrand(tx,result);
+      });
+    },
     async activateConnectedBrand(brandId,{actor='system:onboarding',payoutSetup='deferred'} = {}) {
       if (!/^[A-Za-z0-9_:-]{1,120}$/.test(actor) || !['deferred','pending'].includes(payoutSetup)) fail('Use a server-owned onboarding actor and payout choice.');
       return db.transaction(async tx => {
@@ -238,8 +272,14 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
         if (!connection) fail('The selected store connection is not verified.',409,'ONBOARDING_INCOMPLETE');
         const products=await rows(tx,'SELECT * FROM products WHERE brand_id=$1 AND source_deleted_at IS NULL',[brandId]);
         if (products.some(product=>checkProduct(product).status!=='pass')) fail('Flagged catalog listings need admin review; brand auto-activation is held.',409,'ONBOARDING_COMPLIANCE_REVIEW');
-        const payout=brand.stripeAccountId && brand.chargesEnabled && brand.payoutsEnabled?'complete':payoutSetup;
-        const result=await first(tx,"UPDATE brands SET onboarding_mode='two_step',payout_setup=$2,status='live',updated_at=$3 WHERE id=$1 RETURNING *",[brandId,payout,iso()]);
+        const verified=await payoutReady({...brand,onboardingMode:'two_step'},tx),payout=verified?'complete':payoutSetup;
+        const result=await first(tx,`UPDATE brands SET onboarding_mode='two_step',payout_setup=$2,status='live',
+          stripe_account_id=CASE WHEN $3 THEN stripe_account_id ELSE NULL END,charges_enabled=CASE WHEN $3 THEN charges_enabled ELSE FALSE END,
+          payouts_enabled=CASE WHEN $3 THEN payouts_enabled ELSE FALSE END,updated_at=$4 WHERE id=$1 RETURNING *`,[brandId,payout,verified,iso()]);
+        if(!verified) {
+          await tx.query("UPDATE transfers SET status='held' WHERE brand_id=$1 AND status='scheduled'",[brandId]);
+          await tx.query("UPDATE jobs SET status='held',last_error='Verified two-step payout setup required' WHERE bag_id IN(SELECT id FROM bags WHERE brand_id=$1) AND kind='sandbox_payout' AND status IN('scheduled','failed')",[brandId]);
+        }
         await tx.query(`INSERT INTO curation_audit(id,brand_id,actor,action,reason,payload,created_at) VALUES($1,$2,$3,'brand_connected_activation',$4,$5,$6)`,
           [id('curation'),brandId,actor,'Verified clean connected brand; product approvals remain independent.',json({productCount:products.length,approvedProducts:products.filter(p=>p.status==='approved').length,payoutSetup:payout}),iso()]);
         await event(tx,'brand.activated',brandId,brandId,{status:'live',onboardingMode:'two_step',payoutSetup:payout,productsAutoapproved:false});
@@ -262,6 +302,8 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
     async updateBrand(brandId, input = {}) {
       return db.transaction(async tx => {
         const existing = await brandRow(tx,brandId);
+        if(twoStep(existing) && (input.stripeAccountId || input.chargesEnabled===true || input.payoutsEnabled===true))
+          fail('A verified server-owned payout flow is required for two-step brands.',409,'USE_ONBOARDING_PAYOUT_FLOW');
         const merged = { ...existing };
         for (const field of ['name','commissionBps','status','connectionTier','agreementSigned','stripeAccountId','chargesEnabled','payoutsEnabled','returnWindowDays','shipFromAddress','shippingTable','supportEmail','testOrderPassed','connectionHealthy'])
           if (input[field] !== undefined) merged[field] = input[field];
@@ -449,7 +491,7 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14) RETURNING *`,
             [id('bag'),orderId,group.brand.id,json(group.items),json(storedShipTo),group.subtotal,group.shipping,group.tax,group.commission,
             group.subtotal-group.commission+group.shipping,group.subtotal+group.shipping+group.tax,new Date(now().getTime()+3*DAY).toISOString(),group.brand.returnWindowDays,iso()]);
-          const payoutHeld=group.brand.onboardingMode==='two_step' && !payoutReady(group.brand);
+          const payoutHeld=twoStep(group.brand) && !(await payoutReady(group.brand,tx));
           await tx.query("INSERT INTO transfers(id,bag_id,brand_id,amount_cents,status,created_at) VALUES($1,$2,$3,$4,$5,$6)",
             [id('tr'),bag.id,bag.brandId,bag.transferCents,payoutHeld?'held':'scheduled',iso()]);
           if (payoutHeld) await tx.query("INSERT INTO jobs(id,kind,bag_id,status,due_at,last_error,created_at) VALUES($1,'sandbox_payout',$2,'held',$3,'Payout onboarding required; delivery still required',$4)",
@@ -525,7 +567,7 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
           bag.payoutDueAt?new Date(bag.payoutDueAt).getTime():0)).toISOString();
         const result=await first(tx,"UPDATE bags SET status='delivered',delivered_at=$2,payout_due_at=$3,updated_at=$4 WHERE id=$1 RETURNING *",[bagId,deliveredAt.toISOString(),dueAt,iso()]);
         const pending=await first(tx,"SELECT COUNT(*)::integer AS count FROM refunds WHERE bag_id=$1 AND status='proposed'",[bagId]);
-        const held=Boolean(pending.count) || !payoutReady(brand);
+        const held=Boolean(pending.count) || !(await payoutReady(brand,tx));
         await tx.query('UPDATE transfers SET due_at=$2,status=$3 WHERE bag_id=$1',[bagId,dueAt,held?'held':'scheduled']);
         await tx.query(`INSERT INTO jobs(id,kind,bag_id,status,due_at,created_at) VALUES($1,'sandbox_payout',$2,$3,$4,$5)
           ON CONFLICT(kind,bag_id) DO UPDATE SET due_at=GREATEST(jobs.due_at,EXCLUDED.due_at),status=EXCLUDED.status`,[id('job'),bagId,held?'held':'scheduled',dueAt,iso()]);
@@ -604,7 +646,7 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
           }
           const brand=await brandRow(tx,bag.brandId);
           bag=await extendScheduledWindow(tx,bag,brand);
-          if (!payoutReady(brand)) {
+          if (!(await payoutReady(brand,tx))) {
             await tx.query("UPDATE jobs SET status='held',last_error='Payout onboarding required' WHERE id=$1",[job.id]);
             await tx.query("UPDATE transfers SET status='held' WHERE bag_id=$1 AND status='scheduled'",[bag.id]);
             await event(tx,'payout.held',bag.id,bag.brandId,{bagId:bag.id,reason:'payout_onboarding_required'});

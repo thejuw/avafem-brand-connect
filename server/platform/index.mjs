@@ -20,8 +20,8 @@ export async function createPlatform(db, options) {
   const health = await createHealthVault(db, { secret, clock });
   const platform = { db, domain, auth, clock, health };
   platform.crm = createCrm(db, { secret, clock, health, domain, get bank() { return platform.bank; } });
-  platform.bank = createBeautyBank(db, { clock, ...(options.bank || {}) });
-  platform.risk = createRisk(db, { clock });
+  platform.bank = createBeautyBank(db, { clock, ...(options.bank || {}),domain });
+  platform.risk = createRisk(db, { clock,domain });
   platform.console = createConsole(db, { clock, domain, risk: platform.risk, secret,creditExpiryDays:options.bank?.expiryDays ?? 365 });
   platform.reports = createReports(db, { domain });
   platform.brands = createBrandSide(db, { clock, domain, auth, secret, shopifyConnections: options.shopifyConnections, ...(options.fetch ? { fetch: options.fetch } : {}),

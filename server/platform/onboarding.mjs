@@ -85,21 +85,23 @@ export function createOnboarding(db,{domain,auth,brands,curation,compliance,shop
     async status(brandId) {
       const b=await load(brandId),s=b.onboardingState || {},counts=await first(db,`SELECT COUNT(*)::int AS imported,COUNT(*) FILTER(WHERE status='approved' AND source_deleted_at IS NULL)::int AS approved,
         COUNT(*) FILTER(WHERE status IN('draft','in_review'))::int AS pending_curation FROM products WHERE brand_id=$1`,[brandId]);
+      const payoutVerified=await domain.twoStepPayoutReady(brandId),payoutStatus=payoutVerified?'complete':b.payoutSetup==='pending'?'pending':'deferred';
       const connected=Boolean(s.connected && b.connectionHealthy && !['disconnected','paused'].includes(b.status));
       return {brand:{id:b.id,name:b.name,logoUrl:b.logoUrl,returnPolicy:b.returnPolicy,supportEmail:b.supportEmail,status:b.status},
         steps:{store:{complete:connected && s.catalogImportComplete===true,status:connected?'connected':s.activeOperation?'review_required':'not_connected'},
-          payouts:{status:b.payoutsEnabled && b.stripeAccountId ? 'complete' : b.payoutSetup,deferred:b.payoutSetup==='deferred'}},
+          payouts:{status:payoutStatus,deferred:payoutStatus==='deferred'}},
         connection:{platform:s.platform || null,storeUrl:s.storeUrl || null,status:connected?'connected':'not_connected',verified:connected,
           configured:Boolean(storeAdapters[s.platform] || ['csv','woocommerce','bigcommerce'].includes(s.platform)),simulated:storeAdapters[s.platform]?.simulated===true},
         catalog:{...counts,productsAreCurated:true,newProductsListedAutomatically:false},
         activation:{status:b.status,blockedReason:s.activationBlock || null,brandActive:['ready','live'].includes(b.status),productsRemainCurated:true},
         profile:{name:b.name,logoUrl:b.logoUrl,supportEmail:b.supportEmail,returnPolicy:b.returnPolicy,provenance:s.profileProvenance || 'invitation',requiresReview:s.profileRequiresReview!==false,fields:s.storeProfileFields || []},
-        capabilities:{localOnly,discovery:detector.capabilities(),payouts:{configured:Boolean(payoutAdapter),mode:payoutAdapter?.mode || 'unconfigured',simulated:payoutAdapter?.simulated===true,providerVerified:false,embedded:false},
+        capabilities:{localOnly,discovery:detector.capabilities(),payouts:{configured:Boolean(payoutAdapter),mode:payoutAdapter?.mode || 'unconfigured',simulated:payoutAdapter?.simulated===true,providerVerified:payoutVerified,embedded:false},
           approvals:{shopify:'public_oauth_configuration_required',woocommerce:'manual_credentials_only',bigcommerce:'manual_credentials_only'},emailDelivery:'separate_server_configuration_required'},
-        payoutNotice:!b.payoutsEnabled ? 'You can finish store onboarding now. Payouts are held until payout onboarding is verified; product approval is separate.' : null,
+        payoutNotice:!payoutVerified ? 'You can finish store onboarding now. Payouts are held until payout onboarding is verified; product approval is separate.' : null,
         lastError:s.lastError || null};
     },
     async detect(brandId,{storeUrl},ctx) {
+      await domain.enterTwoStepOnboarding(brandId,{actor:actorName(ctx)});
       const b=await load(brandId);
       if(b.onboardingState?.connected)fail('Disconnect the current store before choosing a different store.',409,'STORE_ALREADY_CONNECTED');
       const detected=await detector.detect({storeUrl});
@@ -108,6 +110,7 @@ export function createOnboarding(db,{domain,auth,brands,curation,compliance,shop
     },
     async connect(brandId,{platform,credentials={}},ctx={}) {
       if(!PLATFORMS.includes(platform))fail('Select a supported store or CSV fallback.');
+      await domain.enterTwoStepOnboarding(brandId,{actor:actorName(ctx)});
       const b=await load(brandId);
       if(b.status==='paused' || (b.status==='disconnected' && b.onboardingMode!=='two_step'))fail('An operator must reopen this brand before onboarding.',409,'BRAND_UNAVAILABLE');
       if(b.onboardingState?.connected) {
@@ -156,6 +159,7 @@ export function createOnboarding(db,{domain,auth,brands,curation,compliance,shop
       }
     },
     async syncCatalog(brandId,ctx={},expectedConnectionVersion) {
+      await domain.enterTwoStepOnboarding(brandId,{actor:actorName(ctx)});
       const b=await load(brandId),s=b.onboardingState || {},adapter=storeAdapters[s.platform];
       if(expectedConnectionVersion && s.connectionVersion!==expectedConnectionVersion)fail('The selected store changed before its catalog started.',409,'STORE_CONNECTION_CHANGED');
       if(!s.connected || !b.connectionHealthy)fail('Connect a store before importing products.',409,'STORE_CONNECTION_REQUIRED');
@@ -174,6 +178,7 @@ export function createOnboarding(db,{domain,auth,brands,curation,compliance,shop
       await activate(brandId);return api.status(brandId);
     },
     async importCsv(brandId,{csv},ctx) {
+      await domain.enterTwoStepOnboarding(brandId,{actor:actorName(ctx)});
       let b=await load(brandId);
       if(!b.onboardingState?.connected)await api.connect(brandId,{platform:'csv'},ctx);
       b=await load(brandId);
@@ -206,13 +211,15 @@ export function createOnboarding(db,{domain,auth,brands,curation,compliance,shop
       });return api.status(brandId);
     },
     async deferPayouts(brandId,ctx) {
+      await domain.enterTwoStepOnboarding(brandId,{actor:actorName(ctx)});
       await db.transaction(async tx=>{
         await tx.query('SELECT id FROM brands WHERE id=$1 FOR UPDATE',[brandId]);const b=await load(brandId,tx);
-        if(!b.payoutsEnabled || !b.stripeAccountId)await tx.query("UPDATE brands SET payout_setup='deferred' WHERE id=$1",[brandId]);
+        if(!await domain.twoStepPayoutReady(brandId,{tx}))await tx.query("UPDATE brands SET payout_setup='deferred' WHERE id=$1",[brandId]);
         await audit(tx,brandId,actorName(ctx),'onboarding.payout_setup_deferred');
       });return api.status(brandId);
     },
     async startPayouts(brandId,ctx) {
+      await domain.enterTwoStepOnboarding(brandId,{actor:actorName(ctx)});
       const b=await load(brandId);if(!payoutAdapter || payoutAdapter.mode!=='test' || typeof payoutAdapter.begin!=='function')unavailable();
       // No bank details or agreement acceptance are collected by Avafem here.
       const result=await payoutAdapter.begin({brandId,profile:{name:b.name,contactEmail:b.supportEmail},returnPath:'/'});
@@ -230,6 +237,7 @@ export function createOnboarding(db,{domain,auth,brands,curation,compliance,shop
       return {prompted:due.length,channel:'admin_alert_and_brand_dashboard',externalEmailDelivered:false};
     },
     async authorizeShopify(brandId) {
+      await domain.enterTwoStepOnboarding(brandId,{actor:'onboarding-worker'});
       const b=await load(brandId),s=b.onboardingState || {};
       if(!s.storeUrl || s.platform!=='shopify')fail('Detect the exact Shopify store first.',409,'SHOPIFY_STORE_REQUIRED');
       const shop=new URL(s.storeUrl).hostname;
@@ -237,6 +245,7 @@ export function createOnboarding(db,{domain,auth,brands,curation,compliance,shop
       return shopifyConnections.begin(brandId,shop);
     },
     async refreshStore(brandId,ctx={}) {
+      await domain.enterTwoStepOnboarding(brandId,{actor:actorName(ctx)});
       const b=await load(brandId);
       if(b.onboardingState?.platform!=='shopify' || storeAdapters.shopify)return api.syncCatalog(brandId,ctx);
       const operation=id('onb');

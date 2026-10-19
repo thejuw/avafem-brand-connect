@@ -14,6 +14,7 @@ async function invited(f, label) {
   assert.deepEqual(Object.keys(preview.json().data).sort(), ['brand', 'expiresAt', 'sandbox']);
   const accepted = await f.request({ method: 'POST', url: `/api/invites/${signup.inviteToken}/accept`, payload: { acceptedSandboxTerms: true } });
   assert.equal(accepted.statusCode, 200, accepted.body);
+  assert.equal((await f.domain.getBrand(signup.brandId)).onboardingMode, 'two_step', 'invite acceptance enrolls before any store detection');
   const cookie = String(accepted.headers['set-cookie']).split(';')[0], csrf = accepted.json().data.csrfToken;
   const request = o => f.request({ ...o, headers: { cookie, 'x-csrf-token': csrf, ...o.headers } });
   const session = await f.ok(request({ method: 'GET', url: '/api/onboarding/session' }));
@@ -171,13 +172,18 @@ test('profile edits are display-only and survive re-sync; direct sync provider f
 
 test('new onboarding cannot complete deferred payouts through the legacy simulated Stripe link/return paths', async t => {
   const f = await storesFixture(t), b = await invited(f, 'no-legacy-payout');
-  await f.ok(b.request({ method: 'POST', url: `/api/onboarding/${b.brandId}/detect`, payload: { storeUrl: 'https://synthetic-woo.example.com' } }));
   async function legacyBlocked() {
     for (const action of ['link', 'return']) {
       const response = await b.request({ method: 'POST', url: `/api/portal/${b.brandId}/stripe/${action}`, payload: {} });
       assert.equal(response.statusCode, 409, response.body); assert.equal(response.json().error.code, 'USE_ONBOARDING_PAYOUT_FLOW');
     }
   }
+  const accepted = await f.domain.getBrand(b.brandId);
+  assert.equal(accepted.onboardingMode, 'two_step'); assert.equal(accepted.payoutSetup, 'deferred');
+  assert.notEqual(accepted.status, 'live'); assert.notEqual(accepted.status, 'ready');
+  assert.equal(accepted.onboardingState.platform, undefined); assert.notEqual(accepted.onboardingState.connected, true);
+  await legacyBlocked(); // Critical: no detect/connect call has happened yet.
+  await f.ok(b.request({ method: 'POST', url: `/api/onboarding/${b.brandId}/detect`, payload: { storeUrl: 'https://synthetic-woo.example.com' } }));
   await legacyBlocked();
   await f.ok(b.request({ method: 'POST', url: `/api/onboarding/${b.brandId}/connect`, payload: { platform: 'woocommerce', credentials: { storeUrl: 'https://synthetic-woo.example.com' } } }));
   const product = (await f.domain.listProducts({ brandId: b.brandId }))[0];
@@ -192,4 +198,15 @@ test('new onboarding cannot complete deferred payouts through the legacy simulat
   assert.equal((await f.domain.listTransfers({ brandId: b.brandId }))[0].status, 'held');
   assert.equal((await f.db.query('SELECT steps FROM brand_applications WHERE brand_id=$1', [b.brandId])).rows[0].steps.stripePendingAccount, undefined);
   assert.equal((await f.db.query("SELECT COUNT(*)::int AS n FROM ledger_journals WHERE bag_id=$1 AND kind='sandbox_payout'", [order.bags[0].id])).rows[0].n, 0);
+});
+
+test('a failed two-step invitation transition consumes no new session or cookie and cannot expose the legacy payout gap', async t => {
+  const f = await platformFixture(t), invite = await f.auth.createInvite('brand_bloom');
+  const before = (await f.db.query('SELECT COUNT(*)::int AS n FROM auth_sessions')).rows[0].n;
+  t.mock.method(f.domain, 'enterTwoStepOnboarding', async () => { throw Object.assign(new Error('Synthetic onboarding transition blocked.'), { statusCode: 409, code: 'ONBOARDING_TRANSITION_BLOCKED' }); });
+  const response = await f.request({ method: 'POST', url: `/api/invites/${invite.token}/accept`, payload: { acceptedSandboxTerms: true } });
+  assert.equal(response.statusCode, 409, response.body); assert.equal(response.json().error.code, 'ONBOARDING_TRANSITION_BLOCKED');
+  assert.equal(response.headers['set-cookie'], undefined);
+  assert.equal((await f.db.query('SELECT COUNT(*)::int AS n FROM auth_sessions')).rows[0].n, before);
+  assert.equal((await f.request({ method: 'POST', url: `/api/invites/${invite.token}/accept`, payload: { acceptedSandboxTerms: true } })).statusCode, 401);
 });

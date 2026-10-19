@@ -27,7 +27,7 @@ test('public signup cannot use its brand session to request a loopback Woo endpo
   const accept = await f.request({ method: 'POST', url: `/api/invites/${signup.inviteToken}/accept`, payload: { acceptedSandboxTerms: true } });
   assert.equal(accept.statusCode, 200);
   const cookie = String(accept.headers['set-cookie']).split(';')[0];
-  const r = await f.request({ method: 'POST', url: `/api/portal/${signup.brandId}/connect`,
+  const r = await f.request({ method: 'POST', url: `/api/onboarding/${signup.brandId}/connect`,
     headers: { cookie, 'x-csrf-token': accept.json().data.csrfToken },
     payload: { platform: 'woocommerce', credentials: { ...credentials, storeUrl: 'https://127.0.0.1:8443' } } });
   assert.equal(r.statusCode, 422); assert.equal(r.json().error.code, 'CONNECTOR_DESTINATION_DENIED');
