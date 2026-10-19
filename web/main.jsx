@@ -41,6 +41,7 @@ import { normalizeHandoffBag } from './lib/handoff-bag.mjs';
 import { clearStripeSecretForm, configureStripeTestCredentials, isLoopbackHost } from './lib/stripe-test-entry.mjs';
 import TestCheckoutPanel from './TestCheckoutPanel.jsx';
 import UnifiedCheckoutPanel from './UnifiedCheckoutPanel.jsx';
+import PlatformPanel from './PlatformPanel.jsx';
 import { resolveUnifiedCheckoutReturn } from './lib/unified-checkout.mjs';
 
 const NAV = [
@@ -51,6 +52,7 @@ const NAV = [
   ["finance", "Finance", WalletCards],
   ["connections", "Connections", Plug],
   ["events", "Events & jobs", Activity],
+  ["platform", "Backend & CRM", ShieldCheck],
 ];
 const emptyData = {
   dashboard: {},
@@ -3329,6 +3331,7 @@ function App() {
               {page === "finance" && Finance()}
               {page === "connections" && Connections()}
               {page === "events" && Events()}
+              {page === "platform" && <PlatformPanel request={request} owner={owner} />}
             </WorkspaceErrorBoundary>
           )}
           <footer className="main-footer">
