@@ -84,3 +84,23 @@ test('unverified DNS is fail-closed; removed/expired/bad-origin links cannot be 
   const row = (await f.db.query("SELECT * FROM brand_auth_deliveries WHERE state='uncertain'")).rows[0];
   assert.equal(row.error_code, 'AUTH_EMAIL_UNCERTAIN'); assert(!JSON.stringify(row).includes('private details'));
 });
+
+test('batch delivery rechecks removed membership immediately before each message dispatch', { timeout: 30_000 }, async t => {
+  const f = await fixture(t);
+  const a = await f.invite('synthetic-first@example.com');
+  f.advance(1 / 86400);
+  const b = await f.platform.portal.addMember('brand_bloom', { email: 'synthetic-next@example.com', role: 'staff' }, { owner: true, role: 'admin' });
+  let entered, release;
+  const started = new Promise(r => { entered = r; }), gate = new Promise(r => { release = r; });
+  f.control.send = async () => { entered(); await gate; return { accepted: true, id: 'synthetic_receipt' }; };
+  const pending = f.platform.portalDelivery.run();
+  try {
+    await Promise.race([started, pending.then(() => { throw new Error('Expected the first synthetic send to start.'); })]);
+    await f.platform.portal.removeMember('brand_bloom', b.id, { owner: true, role: 'admin' });
+  } finally { release(); }
+  const result = await pending;
+  assert.equal(result.dispatched, 1); assert.equal(result.providerAccepted, 1); assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].to, 'synthetic-first@example.com');
+  assert.equal((await f.db.query("SELECT COUNT(*)::int AS n FROM brand_auth_deliveries WHERE state='expired'")).rows[0].n, 1);
+  assert.equal(a.status, 'invited'); // no real member identity or provider used
+});

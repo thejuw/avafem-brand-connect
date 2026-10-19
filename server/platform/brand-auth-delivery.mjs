@@ -68,12 +68,13 @@ export async function createBrandAuthDelivery(db, { auth, clock = () => new Date
           (SELECT 1 FROM brand_auth_deliveries d WHERE d.mail_id=o.id) ORDER BY o.created_at,o.id LIMIT $1 FOR UPDATE`, [Math.max(1, Math.min(100, Number(limit) || 10))]);
         const claimed = [];
         for (const m of mail) {
-          let state = 'expired', body, recipient;
+          let state = 'expired', body, recipient, tokenHash;
           try {
             body = auth.decrypt(m.bodyEnc); recipient = auth.decrypt(m.toEnc);
             const urls = String(body).match(/https?:\/\/[^\s]+/g) || [];
             const u = urls.length === 1 ? new URL(urls[0]) : null;
             const raw = u && /^#(?:token|invite)=([A-Za-z0-9_-]{43})$/.exec(u.hash)?.[1];
+            tokenHash = raw ? hash(raw) : null;
             await auth.lockBrandMembership(tx, m.brandId);
             const member = await first(tx, "SELECT * FROM brand_members WHERE id=$1 AND brand_id=$2 AND status IN ('invited','active') FOR UPDATE", [m.memberId, m.brandId]);
             const t = raw ? await first(tx, 'SELECT * FROM brand_login_tokens WHERE token_hash=$1 FOR UPDATE', [hash(raw)]) : null;
@@ -82,19 +83,32 @@ export async function createBrandAuthDelivery(db, { auth, clock = () => new Date
             else if (member && t && t.memberId === m.memberId && t.brandId === m.brandId && !t.consumedAt && new Date(t.expiresAt) > clock()) state = 'dispatching';
           } catch { state = 'blocked'; }
           await tx.query('INSERT INTO brand_auth_deliveries(mail_id,state,attempted_at,updated_at) VALUES($1,$2,$3,$3)', [m.id, state, clock()]);
-          if (state === 'dispatching') claimed.push({ mailId: m.id, to: recipient, body });
+          if (state === 'dispatching') claimed.push({ mailId: m.id, memberId: m.memberId, brandId: m.brandId, tokenHash, to: recipient, body });
         }
         return claimed;
       });
-      let accepted = 0;
+      let accepted = 0, dispatched = 0;
       for (const m of claims) {
+        // Earlier sends can wait on provider I/O. Recheck each later claim at
+        // its own dispatch point, not only when the whole batch was reserved.
+        const eligible = await db.transaction(async tx => {
+          await auth.lockBrandMembership(tx, m.brandId);
+          const member = await first(tx, "SELECT id FROM brand_members WHERE id=$1 AND brand_id=$2 AND status IN ('invited','active') FOR UPDATE", [m.memberId, m.brandId]);
+          const t = await first(tx, 'SELECT * FROM brand_login_tokens WHERE token_hash=$1 FOR UPDATE', [m.tokenHash]);
+          const delivery = await first(tx, 'SELECT state FROM brand_auth_deliveries WHERE mail_id=$1 FOR UPDATE', [m.mailId]);
+          const valid = Boolean(member && t && t.memberId === m.memberId && t.brandId === m.brandId && !t.consumedAt && new Date(t.expiresAt) > clock() && delivery?.state === 'dispatching');
+          if (!valid) await tx.query("UPDATE brand_auth_deliveries SET state='expired',updated_at=$2 WHERE mail_id=$1 AND state='dispatching'", [m.mailId, clock()]);
+          return valid;
+        });
+        if (!eligible) continue;
+        dispatched++;
         let receipt;
         try { receipt = await adapter.send({ to: m.to, body: m.body, subject: 'Your Avafem brand sign-in link', operationId: m.mailId }); } catch { /* provider outcome requires review, never replay blindly */ }
         const valid = receipt?.accepted === true && /^[A-Za-z0-9_-]{1,100}$/.test(receipt?.id || '');
         await db.query("UPDATE brand_auth_deliveries SET state=$2,provider_id=$3,error_code=$4,updated_at=$5 WHERE mail_id=$1 AND state='dispatching'", [m.mailId, valid ? 'accepted' : 'uncertain', valid ? receipt.id : null, valid ? null : 'AUTH_EMAIL_UNCERTAIN', clock()]);
         if (valid) accepted++;
       }
-      return { status: 'processed', simulated, dispatched: claims.length, providerAccepted: accepted, delivered: false };
+      return { status: 'processed', simulated, dispatched, providerAccepted: accepted, delivered: false };
     },
   };
 }

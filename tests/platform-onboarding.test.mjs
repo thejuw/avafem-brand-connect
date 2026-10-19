@@ -172,9 +172,18 @@ test('profile edits are display-only and survive re-sync; direct sync provider f
 
 test('new onboarding cannot complete deferred payouts through the legacy simulated Stripe link/return paths', async t => {
   const f = await storesFixture(t), b = await invited(f, 'no-legacy-payout');
+  // The invitation itself is now an onboarding-only capability. Independently
+  // prove the deeper legacy-payout guard still rejects an identified owner.
+  const invitedOwner=await f.platform.portal.addMember(b.brandId,{email:'no-legacy-owner@example.invalid',role:'owner'},{owner:true,role:'admin'});
+  const mail=(await f.platform.portal.outbox({memberId:invitedOwner.id}))[0];
+  const member=await f.platform.portal.consumeLink(/#(?:token|invite)=([A-Za-z0-9_-]{43})/.exec(mail.body)[1]);
+  const session=await f.auth.createSession({brandId:b.brandId,memberId:member.id,memberVersion:member.sessionVersion});
+  const identified=o=>f.request({...o,headers:{cookie:`avf_session=${session.token}`,'x-csrf-token':session.csrfToken,...o.headers}});
   async function legacyBlocked() {
     for (const action of ['link', 'return']) {
-      const response = await b.request({ method: 'POST', url: `/api/portal/${b.brandId}/stripe/${action}`, payload: {} });
+      const request={method:'POST',url:`/api/portal/${b.brandId}/stripe/${action}`,payload:{}};
+      assert.equal((await b.request(request)).statusCode,403,'onboarding invitation has no financial authority');
+      const response = await identified(request);
       assert.equal(response.statusCode, 409, response.body); assert.equal(response.json().error.code, 'USE_ONBOARDING_PAYOUT_FLOW');
     }
   }
