@@ -25,7 +25,7 @@ export const toCsv = (header, list) => [header.join(','), ...list.map(r => heade
 /** Brand portal: member logins (magic link + optional scrypt password),
  * owner/staff/finance team roles, brand-facing review status, statements.
  * Email delivery is a simulated, encrypted outbox only. */
-export function createBrandPortal(db, { auth, domain, brands, reports, secret, clock = () => new Date(), publicBaseUrl }) {
+export function createBrandPortal(db, { auth, domain, brands, reports, secret, clock = () => new Date(), publicBaseUrl, emailCapabilities = () => ({ simulated: true }) }) {
   const now = () => clock();
   const emailKey = email => createHmac('sha256', String(secret)).update('avafem:brand-member-email:v1\0').update(email).digest('hex');
   const view = m => m && ({ id: m.id, brandId: m.brandId, email: auth.decrypt(m.emailEnc), role: m.role, status: m.status, hasPassword: Boolean(m.passwordHash),
@@ -86,7 +86,7 @@ export function createBrandPortal(db, { auth, domain, brands, reports, secret, c
             [id('member'), brandId, key, auth.encrypt(email), role, actorOf(ctx), now()]);
         const sent = await issueLink(tx, member, 'invite');
         await audit(tx, ctx, brandId, 'brand_member.invited', member.id);
-        return { ...view(member), invitation: { simulated: true, delivered: false, queued: sent, recipientHint: mask(email) } };
+        return { ...view(member), invitation: { simulated: emailCapabilities().simulated !== false, delivered: false, queued: sent, recipientHint: mask(email) } };
       });
     },
     async changeRole(brandId, memberId, role, ctx) {

@@ -35,7 +35,8 @@ export async function createPlatform(db, options) {
   const email=options.inviteDelivery || {};
   platform.inviteDelivery=createInviteDelivery(db,{auth,domain,clock,secret,publicBaseUrl:email.publicBaseUrl || options.publicBaseUrl,
     adapter:email.adapter || (email.enableExternal===true ? createResendInviteAdapter({apiKey:email.apiKey,from:email.from}) : null),allowExternal:email.enableExternal===true});
-  platform.portal=createBrandPortal(db,{auth,domain,brands:platform.brands,reports:platform.reports,secret,clock,publicBaseUrl:options.publicBaseUrl});
+  platform.portal=createBrandPortal(db,{auth,domain,brands:platform.brands,reports:platform.reports,secret,clock,publicBaseUrl:options.publicBaseUrl,
+    emailCapabilities:()=>platform.portalDelivery?.capabilities() || {simulated:true}});
   const authEmail=options.portalEmail || {};
   platform.portalDelivery=await createBrandAuthDelivery(db,{auth,clock,publicBaseUrl:options.publicBaseUrl,
     adapter:authEmail.adapter || (authEmail.enableExternal===true ? createResendAuthAdapter(authEmail) : null),enableExternal:authEmail.enableExternal===true});

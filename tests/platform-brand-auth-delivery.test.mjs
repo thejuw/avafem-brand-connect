@@ -47,6 +47,15 @@ test('default/local-only email makes no calls even when an external adapter is s
   assert.equal((await f.db.query('SELECT * FROM brand_auth_deliveries')).rows.length, 0);
 });
 
+test('invitation metadata follows server-configured delivery without claiming that a queued email was delivered', async t => {
+  let sends = 0;
+  const adapter = { provider: 'synthetic_external_shape', simulated: false, checkDomain: async () => true, send: async () => { sends++; return { id: 'synthetic_receipt', accepted: true }; } };
+  const f = await platformFixture(t, { platform: { publicBaseUrl: 'https://portal.example.com', portalEmail: { adapter, enableExternal: true } } });
+  const member = await f.platform.portal.addMember('brand_bloom', { email: 'synthetic-configured@example.invalid', role: 'staff' }, { owner: true, role: 'admin' });
+  assert.equal(member.invitation.simulated, false); assert.equal(member.invitation.queued, true); assert.equal(member.invitation.delivered, false); assert.equal(sends, 0);
+  assert.equal((await f.platform.portalDelivery.run()).providerAccepted, 1); assert.equal(sends, 1);
+});
+
 test('queued auth email dispatch is outside login HTTP, once across concurrent workers; accepted is never delivered', async t => {
   const f = await fixture(t);
   await f.invite('synthetic-auth@example.com');
