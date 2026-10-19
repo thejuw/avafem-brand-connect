@@ -187,3 +187,14 @@ for the dedicated test command and restrictions.
 * WooCommerce/BigCommerce: real store credentials, webhooks for order/fulfillment sync back.
 * A shopper-facing auth layer (shopper endpoints are operator-only here).
 * Legal/tax review of the compliance rule lists, sales-tax nexus/filing, credit (Beauty Bank) escheat rules, and HIPAA/state health-privacy (e.g. WA MHMDA) obligations.
+
+## Brand portal (sandbox)
+
+Open `/brand/login`. Everything below is browser-session + CSRF only; API/OAuth bearer keys are rejected on these routes.
+
+- **Login:** email magic link (single-use, 15 minutes, SHA-256 hashed at rest, newest link supersedes older ones, max 3 per member per 15 minutes, generic responses, IP rate limits) or an optional scrypt password (N=16384, 5 failures lock for 15 minutes). Login destroys any previous session on the browser; logout destroys the server session. Links arrive in the **simulated, AES-GCM encrypted** `brand_auth_outbox`; the owner workspace can read it at `GET /api/admin/brand-auth/outbox` (audit-logged). Tokens travel in the URL fragment (`/brand/login#token=…`), which the page strips immediately. Signed invite links (`/onboard/…`) still work and act as the brand owner.
+- **Team roles:** `owner` (all brand scopes + `members:manage`, `credentials:manage`, `reports:read`), `staff` (catalog, orders, fulfilment, refund proposals), `finance` (`payouts:read`, `reports:read`). Role and status are read live on every request; demotion or removal takes effect immediately, removal deletes the member's sessions and links, and the last owner can't be demoted or removed. All changes go to `audit_log` as `member:<id>`.
+- **Product status:** `GET /api/brand-portal/products` gives each product's status with validation issues, compliance flags (with the matched phrase and field), reviewer notes and `canResubmit`. `POST …/products/:id/resubmit` moves a draft or *edited* rejected product back to `in_review`. It never approves anything.
+- **Statements/reports:** `GET /api/brand-portal/statements?month=YYYY-MM[&format=csv]` and `GET /api/brand-portal/reports/annual?year=YYYY[&format=csv]`, own brand only, finance/owner only. CSV cells are formula-escaped; the connected account ID is not exposed; each download is audit-logged.
+- **Dashboard:** `GET /api/brand-portal/dashboard` gives sales vs prior 30 days, swipe→purchase, returns, upcoming payout, top products, listed/in-review counts and placement pricing, with each section included only when the role has its scope.
+- **MCP:** `get_product_review_status` (catalog:read), `get_payout_statement` (payouts:read).
