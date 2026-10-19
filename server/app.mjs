@@ -33,6 +33,8 @@ import { createProviderTaxReconciliation } from './provider-tax-reconciliation.m
 import { loadObservedTaxEvidence } from './provider-tax-observation.mjs';
 import { createProviderPlatformSwitch, APPROVED_TEST_PLATFORM_SWITCH } from './provider-platform-switch.mjs';
 import { createProviderAutomation } from './provider-automation.mjs';
+import { createPlatform } from './platform/index.mjs';
+import { registerPlatformRoutes, platformMcpTools } from './platform/routes.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const fail = (statusCode, code, message) => Object.assign(new Error(message), { statusCode, code });
@@ -93,12 +95,13 @@ export async function createApp(options = {}) {
   providerEvents = await createProviderEvents(db, auth, { unifiedCheckout, stores: testStores, providerMoney, providerFulfillment, providerCatalog });
   const providerJobs = createProviderJobs(db, { unifiedCheckout, providerEvents, providerMoney, providerFulfillment,
     catalog: providerCatalog, reconciliation: providerReconciliation, taxReconciliation: providerTaxReconciliation, automation: providerAutomation });
+  const platform = await createPlatform(db, { domain, auth, secret: config.encryptionKey, ...(options.domainOptions?.clock ? { clock: options.domainOptions.clock } : {}), ...(options.platform || {}) });
   if (options.seed !== false) await seedDatabase(db, domain);
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 3 * 1024 * 1024, trustProxy: false });
   await app.register(cookie);
   await app.register(rateLimit, { max: 300, timeWindow: '1 minute' });
   app.decorate('avafem', { db, domain, auth, operations, config, shopifyConnections, testCheckout,
-    testStores, unifiedCheckout, providerMoney, providerFulfillment, providerEvents, providerJobs, providerFixtures, providerFailureFixtures, providerFailureCheckouts, providerFailureReadbacks, providerCatalog, providerReconciliation, providerTaxReconciliation, providerPlatformSwitch, providerAutomation });
+    testStores, unifiedCheckout, providerMoney, providerFulfillment, providerEvents, providerJobs, providerFixtures, providerFailureFixtures, providerFailureCheckouts, providerFailureReadbacks, providerCatalog, providerReconciliation, providerTaxReconciliation, providerPlatformSwitch, providerAutomation, platform });
   app.removeContentTypeParser('application/json');
   app.addContentTypeParser('application/json', { parseAs: 'buffer' }, (request, body, done) => {
     request.rawBody = body;
@@ -692,7 +695,8 @@ export async function createApp(options = {}) {
   app.get('/openapi.json', async () => openApiDocument(config.publicBaseUrl || `http://127.0.0.1:${config.port}`));
   app.get('/.well-known/oauth-authorization-server', async () => ({ issuer: config.publicBaseUrl || `http://127.0.0.1:${config.port}`, token_endpoint: `${config.publicBaseUrl || `http://127.0.0.1:${config.port}`}/oauth/token`, grant_types_supported: ['client_credentials'], token_endpoint_auth_methods_supported: ['client_secret_basic','client_secret_post'], scopes_supported: BRAND_SCOPES }));
   app.get('/.well-known/oauth-protected-resource', async () => ({ resource: `${config.publicBaseUrl || `http://127.0.0.1:${config.port}`}/mcp`, authorization_servers: [config.publicBaseUrl || `http://127.0.0.1:${config.port}`], scopes_supported: BRAND_SCOPES, bearer_methods_supported: ['header'] }));
-  await registerMcp(app, { auth, context, actions });
+  registerPlatformRoutes(app, { platform, browserRoute, context, brandScope, requireAdmin, data, apiMutation });
+  await registerMcp(app, { auth, context, actions, extraTools: platformMcpTools(platform) });
   const dist = resolve(ROOT, 'dist');
   if (existsSync(dist)) await app.register(staticFiles, { root: dist, prefix: '/' });
   app.setNotFoundHandler((request, reply) => {
@@ -703,6 +707,7 @@ export async function createApp(options = {}) {
   if (options.worker !== false) { interval = setInterval(async () => {
     try {
       const result = await providerJobs.run(); await operations.runJobs();
+      await platform.jobs().catch(error => app.log.error({ code: error.code || 'PLATFORM_JOB_ERROR' }, 'Platform job failed'));
       // Swallowed per-run failures (e.g. nightly_reconciliation_pending) must reach an operator.
       const pending = [...new Set((result?.lifecycle ?? []).map(entry => entry.state).filter(state => /_pending$|_review$/.test(String(state))))].sort();
       const key = pending.join(',');

@@ -2,7 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 
-export async function registerMcp(app, { auth, context, actions }) {
+export async function registerMcp(app, { auth, context, actions, extraTools }) {
   app.post('/mcp', async (request, reply) => {
     reply.header('WWW-Authenticate', 'Bearer resource_metadata="/.well-known/oauth-protected-resource"');
     const ctx = await context(request);
@@ -31,6 +31,7 @@ export async function registerMcp(app, { auth, context, actions }) {
     write('update_inventory', 'Update stock for one of your own catalog SKUs.', { sku: z.string(), qty: z.number().int().min(0) }, 'mcp:update_inventory', input => actions.inventory(ctx, input));
     write('import_products', 'Queue up to 5,000 catalog rows for validation and human review.', { rows: z.array(z.record(z.string(), z.unknown())).min(1).max(5000) }, 'mcp:import_products', input => actions.importProducts(ctx, input));
     write('refund_order', 'Submit a full-Bag refund proposal. A human must approve it; this tool cannot issue a payment refund.', { id: z.string(), refund: z.object({ reason: z.string().min(3), amountCents: z.number().int().positive().optional() }) }, 'mcp:refund_order', input => actions.refund(ctx, input));
+    if (extraTools) extraTools({ read, write, ctx, z });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     await server.connect(transport);
     reply.hijack();
