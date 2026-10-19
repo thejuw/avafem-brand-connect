@@ -1,3 +1,4 @@
+import { mergePlatformPaths } from './platform/openapi.mjs';
 export function openApiDocument(baseUrl) {
   const json = schema => ({ content: { 'application/json': { schema } } });
   const response = { '200': { description: 'Successful operation', ...json({ type: 'object', properties: { data: {} } }) },
@@ -7,7 +8,7 @@ export function openApiDocument(baseUrl) {
   const path = name => ({ name, in: 'path', required: true, schema: { type: 'string' } });
   const operation = (operationId, scope, schema, parameters = []) => ({ operationId, security: [{ oauth2: [scope] }, { apiKey: [] }], parameters,
     ...(schema ? { requestBody: { required: true, ...json(schema) } } : {}), responses: response });
-  return {
+  return mergePlatformPaths({
     openapi: '3.1.0', info: { title: 'Avafem Brand Connect API', version: '0.1.0', description: 'Sandbox implementation. Brand credentials cannot access another brand’s Bags. All POST mutations require 24-hour idempotency keys. Money is represented in integer USD cents. Refunds create human-reviewed proposals.' },
     servers: [{ url: baseUrl }],
     paths: {
@@ -49,5 +50,5 @@ export function openApiDocument(baseUrl) {
         },
       },
     },
-  };
+  }, operation);
 }

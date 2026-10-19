@@ -14,7 +14,9 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The expanded isolated suite reported 804 passes on the hosted runner at
+    # the old 20-minute cutoff, leaving no time for cleanup and the build.
+    timeout-minutes: 30
     steps:
       - name: Check out source without persisting credentials
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # verified v6
@@ -40,3 +42,38 @@ jobs:
 
       - name: Build dashboard
         run: npm run build
+
+  postgres-concurrency:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: avafem_test
+          POSTGRES_PASSWORD: isolated_ci_only
+          POSTGRES_DB: avafem_concurrency
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U avafem_test -d avafem_concurrency"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Check out source without persisting credentials
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Set up Node.js 24
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Concurrent workers against real isolated PostgreSQL
+        env:
+          AVAFEM_REQUIRE_POSTGRES: '1'
+          AVAFEM_TEST_POSTGRES_URL: postgresql://avafem_test:isolated_ci_only@127.0.0.1:5432/avafem_concurrency
+        run: npm run test:postgres

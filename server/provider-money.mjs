@@ -204,9 +204,9 @@ export async function createProviderMoney(db, auth, { runtime, stores, getStripe
       [debit(op.afterTransfer ? 'brand_receivable' : 'brand_payable', op.recoveryCents), debit('commission_revenue', op.commissionCents),
         debit('tax_payable', op.taxCents), credit('stripe_platform_clearing', op.amountCents)],
       async tx => {
-        await tx.query(`INSERT INTO refunds(id,bag_id,brand_id,amount_cents,reason,status,approved_at,created_at)
-          VALUES($1,$2,$3,$4,'Explicit owner-approved actual provider TEST refund','approved',$5,$5) ON CONFLICT DO NOTHING`,
-        [op.id, bag.id, bag.brandId, op.amountCents, ctx.wallNow()]);
+        await tx.query(`INSERT INTO refunds(id,bag_id,brand_id,amount_cents,reason,status,approved_at,created_at,subtotal_cents,shipping_cents,tax_cents,commission_cents)
+          VALUES($1,$2,$3,$4,'Explicit owner-approved actual provider TEST refund','approved',$5,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING`,
+        [op.id, bag.id, bag.brandId, op.amountCents, ctx.wallNow(), op.subtotalCents, op.shippingCents, op.taxCents, op.commissionCents]);
         await tx.query(`UPDATE bags SET refunded_cents=refunded_cents+$2,
           status=CASE WHEN refunded_cents+$2=total_cents THEN 'refunded' ELSE status END,updated_at=$3 WHERE id=$1`, [bag.id, op.amountCents, ctx.wallNow()]);
         await tx.query(`UPDATE orders SET refunded_cents=refunded_cents+$2,

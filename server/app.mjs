@@ -3,7 +3,7 @@ import cookie from '@fastify/cookie';
 import rateLimit from '@fastify/rate-limit';
 import staticFiles from '@fastify/static';
 import { existsSync } from 'node:fs';
-import { randomUUID, randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomUUID, randomBytes, timingSafeEqual, createHash } from 'node:crypto';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
@@ -33,6 +33,8 @@ import { createProviderTaxReconciliation } from './provider-tax-reconciliation.m
 import { loadObservedTaxEvidence } from './provider-tax-observation.mjs';
 import { createProviderPlatformSwitch, APPROVED_TEST_PLATFORM_SWITCH } from './provider-platform-switch.mjs';
 import { createProviderAutomation } from './provider-automation.mjs';
+import { createPlatform } from './platform/index.mjs';
+import { registerPlatformRoutes, platformMcpTools } from './platform/routes.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const fail = (statusCode, code, message) => Object.assign(new Error(message), { statusCode, code });
@@ -52,7 +54,7 @@ const productSchema = z.object({ title: z.string().trim().min(1).max(500), descr
 const refundSchema = z.object({ reason: z.string().trim().min(3).max(1000), amountCents: z.number().int().positive().optional(), amount: z.number().int().positive().optional() });
 
 export async function createApp(options = {}) {
-  const config = { mode: 'sandbox', host: '127.0.0.1', port: 4317, allowLocalBootstrap: true,
+  const config = { mode: 'sandbox', host: '127.0.0.1', port: 4317, allowLocalBootstrap: true, allowAuthOutbox:false,
     sessionSecret: randomBytes(48).toString('base64url'), encryptionKey: randomBytes(48).toString('base64url'), ...options.config };
   if (config.mode !== 'sandbox') throw new Error('This initial release is sandbox-only. Live payments and production launch are deliberately disabled.');
   if (!['127.0.0.1', 'localhost', '::1'].includes(config.host) && config.allowLocalBootstrap) throw new Error('Local owner bootstrap may only be enabled on a loopback listener.');
@@ -61,7 +63,15 @@ export async function createApp(options = {}) {
   const db = options.db || await createDatabase({ dataDir: options.dataDir, connectionString: options.connectionString });
   await db.migrate();
   const auth = await createAuth(db, { sessionSecret: config.sessionSecret, encryptionKey: config.encryptionKey, issuer: config.publicBaseUrl || 'avafem-local' });
-  const domain = createDomain(db, { ...options.domainOptions, protectShipping: auth.encrypt, revealShipping: auth.decrypt });
+  let platform;
+  const domain = createDomain(db, { ...options.domainOptions, protectShipping: auth.encrypt, revealShipping: auth.decrypt,
+    beforeProductApproval: async (product, tx) => {
+      const productId = product.id;
+      if (options.domainOptions?.beforeProductApproval) await options.domainOptions.beforeProductApproval(product, tx);
+      if (!platform?.compliance) throw fail(503, 'COMPLIANCE_UNAVAILABLE', 'Listing compliance is not initialized.');
+      const result = await platform.compliance.check(productId, tx);
+      if (!result?.canGoLive) throw fail(409, 'COMPLIANCE_BLOCKED', 'Resolve blocking compliance findings or approve an exact-content override.');
+    } });
   await domain.encryptExistingShipping();
   const shopifyConnections = await createShopifyConnections(db, auth, { publicBaseUrl: config.publicBaseUrl, ...(options.shopifyOAuth || {}) });
   let testStores, unifiedCheckout, providerEvents;
@@ -93,12 +103,13 @@ export async function createApp(options = {}) {
   providerEvents = await createProviderEvents(db, auth, { unifiedCheckout, stores: testStores, providerMoney, providerFulfillment, providerCatalog });
   const providerJobs = createProviderJobs(db, { unifiedCheckout, providerEvents, providerMoney, providerFulfillment,
     catalog: providerCatalog, reconciliation: providerReconciliation, taxReconciliation: providerTaxReconciliation, automation: providerAutomation });
+  platform = await createPlatform(db, { domain, auth, shopifyConnections,publicBaseUrl:config.publicBaseUrl, secret: config.encryptionKey, ...(options.domainOptions?.clock ? { clock: options.domainOptions.clock } : {}), ...(options.platform || {}) });
   if (options.seed !== false) await seedDatabase(db, domain);
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 3 * 1024 * 1024, trustProxy: false });
   await app.register(cookie);
   await app.register(rateLimit, { max: 300, timeWindow: '1 minute' });
   app.decorate('avafem', { db, domain, auth, operations, config, shopifyConnections, testCheckout,
-    testStores, unifiedCheckout, providerMoney, providerFulfillment, providerEvents, providerJobs, providerFixtures, providerFailureFixtures, providerFailureCheckouts, providerFailureReadbacks, providerCatalog, providerReconciliation, providerTaxReconciliation, providerPlatformSwitch, providerAutomation });
+    testStores, unifiedCheckout, providerMoney, providerFulfillment, providerEvents, providerJobs, providerFixtures, providerFailureFixtures, providerFailureCheckouts, providerFailureReadbacks, providerCatalog, providerReconciliation, providerTaxReconciliation, providerPlatformSwitch, providerAutomation, platform });
   app.removeContentTypeParser('application/json');
   app.addContentTypeParser('application/json', { parseAs: 'buffer' }, (request, body, done) => {
     request.rawBody = body;
@@ -140,6 +151,13 @@ export async function createApp(options = {}) {
     if (browser && ctx.bearer) throw fail(403, 'BROWSER_SESSION_REQUIRED', 'Use the scoped /v1 API for brand integration credentials.');
     if (!ctx.bearer && !['GET','HEAD','OPTIONS'].includes(request.method)
       && !safeEqual(ctx.csrfToken, request.headers['x-csrf-token'])) throw fail(403, 'CSRF_REQUIRED', 'Refresh your session before making changes.');
+    // Finance is deliberately not a general brand/customer-data role. Keep a
+    // narrow browser allowlist as a second boundary around old unscoped routes.
+    if(browser && ctx.brandId && ctx.memberRole==='finance') {
+      const path=request.url.split('?')[0],allowed=request.method==='GET' && ['/api/brand-auth/me','/api/brand-portal/dashboard','/api/brand-portal/statements','/api/brand-portal/reports/annual','/api/finance','/api/reports/brand-payouts','/api/billing'].includes(path)
+        || request.method==='POST' && path==='/api/brand-auth/logout' || request.method==='PUT' && path==='/api/brand-auth/password';
+      if(!allowed)throw fail(403,'SCOPE_REQUIRED','Finance sessions may read financial statements and payouts, not operational/customer or store settings data.');
+    }
     if (scope && ctx.role !== 'admin') requireScope(ctx, scope);
     return ctx;
   }
@@ -151,6 +169,12 @@ export async function createApp(options = {}) {
     return requested || null;
   }
   async function browserRoute(request, scope) { return context(request, { browser: true, scope }); }
+  function identifiedOwner(ctx) {
+    if(ctx.owner)return;
+    if(!ctx.memberId)throw fail(403,'MEMBER_SESSION_REQUIRED','Sign in with your own owner email before managing team members or API keys.');
+    if(ctx.memberRole!=='owner')throw fail(403,'OWNER_REQUIRED','An identified brand owner is required.');
+  }
+  function settingsOwner(ctx) {if(ctx.memberId && ctx.memberRole!=='owner' && !ctx.owner)throw fail(403,'OWNER_REQUIRED','Brand owner or onboarding invitation required for store settings.');}
   async function localTestOwner(request) {
     const host = String(request.headers.host || '').replace(/:\d+$/, '');
     if (!config.allowLocalBootstrap || !['127.0.0.1','localhost','[::1]'].includes(host)
@@ -183,8 +207,8 @@ export async function createApp(options = {}) {
     await auth.switchBrand(ctx, brandId);
     return data({ csrfToken: ctx.csrfToken, brandId, role: brandId ? 'brand' : 'admin', sandbox: true, owner: ctx.owner });
   });
-  app.get('/api/dashboard', async request => data(await domain.dashboard({ brandId: (await browserRoute(request)).brandId })));
-  app.get('/api/brands', async request => { const ctx = await browserRoute(request); return data(ctx.brandId ? [await domain.getBrand(ctx.brandId)] : await domain.listBrands()); });
+  app.get('/api/dashboard', async request => {const ctx=await browserRoute(request,'orders:read');if(ctx.brandId){requireScope(ctx,'catalog:read');requireScope(ctx,'payouts:read');}return data(await domain.dashboard({brandId:ctx.brandId}));});
+  app.get('/api/brands', async request => { const ctx = await browserRoute(request,'catalog:read'); return data(ctx.brandId ? [await domain.getBrand(ctx.brandId)] : await domain.listBrands()); });
   app.post('/api/brands', async request => { const ctx = await browserRoute(request); requireAdmin(ctx); const created = await domain.createBrand(request.body); const result = await domain.updateBrand(created.id, request.body); await auth.audit(ctx, 'brand.created', result.id); return data(result); });
   app.patch('/api/brands/:id', async request => { const ctx = await browserRoute(request); requireAdmin(ctx); return data(await domain.updateBrand(request.params.id, request.body)); });
   app.get('/api/products', async request => { const ctx = await browserRoute(request, 'catalog:read'); return data(await domain.listProducts({ brandId: brandScope(ctx, request.query.brandId), status: request.query.status || undefined })); });
@@ -204,7 +228,7 @@ export async function createApp(options = {}) {
       paidCents: transfers.filter(t => t.status === 'paid').reduce((s,t) => s + t.amountCents - (t.reversedCents || 0), 0), sandbox: true } });
   });
   app.get('/api/events', async request => {
-    const ctx = await browserRoute(request);
+    const ctx = await browserRoute(request,'orders:read');if(ctx.brandId)requireScope(ctx,'payouts:read');
     const [events, jobs] = await Promise.all([domain.listEvents(), domain.listJobs()]);
     return data({ events: ctx.brandId ? events.filter(e => e.brandId === ctx.brandId) : events, jobs: ctx.brandId ? jobs.filter(j => j.brandId === ctx.brandId) : jobs,
       inbox: await operations.listInbox(ctx.brandId) });
@@ -574,11 +598,28 @@ export async function createApp(options = {}) {
       items: selected.map(p => ({ brandId: p.brandId, sku: p.sku, qty: 1 })) });
   }
   app.post('/api/sandbox/orders', async request => { requireAdmin(await browserRoute(request)); return data(await sandboxOrder(request.body)); });
-  app.post('/api/brands/:id/credentials', async request => { requireAdmin(await browserRoute(request)); await domain.getBrand(request.params.id); return data(await auth.createCredential(request.params.id, request.body)); });
-  app.get('/api/brands/:id/credentials', async request => { const ctx = await browserRoute(request); brandScope(ctx, request.params.id); return data(await auth.listCredentials(request.params.id)); });
-  app.delete('/api/brands/:id/credentials/:credentialId', async request => { requireAdmin(await browserRoute(request)); return data(await auth.revokeCredential(request.params.id, request.params.credentialId)); });
-  app.post('/api/brands/:id/invite', async request => { requireAdmin(await browserRoute(request)); await domain.getBrand(request.params.id); const invite = await auth.createInvite(request.params.id); return data({ ...invite, path: `/onboard/${invite.token}` }); });
-  app.get('/api/brands/:id/shopify', async request => { const ctx = await browserRoute(request); brandScope(ctx, request.params.id); return data(await shopifyConnections.status(request.params.id)); });
+  app.post('/api/brands/:id/credentials', async request => {
+    const ctx=await browserRoute(request);brandScope(ctx,request.params.id);identifiedOwner(ctx);await domain.getBrand(request.params.id);
+    if(ctx.role==='admin' && request.body?.operationId===undefined){const out=await auth.createCredential(request.params.id,request.body);await auth.audit({...ctx,brandId:request.params.id},'credential.created',out.id);return data(out);}
+    if(ctx.role!=='admin')requireScope(ctx,'credentials:manage');
+    const i=z.object({operationId:z.string().regex(/^[A-Za-z0-9_-]{8,100}$/),kind:z.literal('api_key').optional(),label:z.string().trim().min(1).max(100),scopes:z.array(z.enum(BRAND_SCOPES)).min(1).max(BRAND_SCOPES.length)}).strict().parse(request.body);
+    return data(await auth.createManagedApiKey(request.params.id,i,ctx));
+  });
+  app.get('/api/brands/:id/credentials', async request => { const ctx = await browserRoute(request);brandScope(ctx,request.params.id);identifiedOwner(ctx);if(ctx.role!=='admin')requireScope(ctx,'credentials:manage');const rows=await auth.listCredentials(request.params.id);return data(ctx.role==='admin'?rows:rows.filter(row=>row.kind==='api_key')); });
+  app.delete('/api/brands/:id/credentials/:credentialId', async request => {
+    const ctx=await browserRoute(request);brandScope(ctx,request.params.id);identifiedOwner(ctx);
+    if(ctx.role==='admin'){const out=await auth.revokeCredential(request.params.id,request.params.credentialId);await auth.audit({...ctx,brandId:request.params.id},'credential.revoked',request.params.credentialId);return data(out);}
+    requireScope(ctx,'credentials:manage');return data(await auth.revokeManagedApiKey(request.params.id,request.params.credentialId,ctx));
+  });
+  app.post('/api/brands/:id/invite', async(request,reply)=>{
+    const ctx=await browserRoute(request);requireAdmin(ctx);await domain.getBrand(request.params.id);
+    const supplied=request.headers['idempotency-key'],key=typeof supplied==='string' && /^[A-Za-z0-9_-]{8,100}$/.test(supplied) ? supplied : randomUUID();
+    const result=await auth.idempotent('admin:owner',`POST /api/brands/${request.params.id}/invite`,key,{},async()=>{
+      const invite=await auth.createInvite(request.params.id),delivery=await platform.inviteDelivery.send({brandId:request.params.id,invite,operationId:key});
+      await auth.audit(ctx,'brand.invite_created',invite.id);return {...invite,path:`/onboard/${invite.token}`,delivery};
+    });reply.code(result.statusCode);if(result.replayed)reply.header('Idempotent-Replayed','true');return result.error ? {error:result.error} : data(result.data);
+  });
+  app.get('/api/brands/:id/shopify', async request => { const ctx = await browserRoute(request,'catalog:read');settingsOwner(ctx); brandScope(ctx, request.params.id); return data(await shopifyConnections.status(request.params.id)); });
   app.post('/api/brands/:id/shopify/authorize', async (request, reply) => {
     requireAdmin(await browserRoute(request));
     const pending = await shopifyConnections.begin(request.params.id, limitedString.parse(request.body?.shop));
@@ -591,6 +632,11 @@ export async function createApp(options = {}) {
     const installed = await shopifyConnections.complete(params, request.cookies.avf_shopify_oauth);
     reply.clearCookie('avf_shopify_oauth', { path: '/oauth/shopify/callback', secure: true, sameSite: 'lax' });
     await domain.updateBrand(installed.brandId, { connectionTier: 'shopify', connectionHealthy: true });
+    const onboarding=(await db.query('SELECT onboarding_state FROM brands WHERE id=$1',[installed.brandId])).rows[0]?.onboarding_state;
+    if(onboarding?.platform==='shopify') {
+      try {await platform.onboarding.refreshStore(installed.brandId);}
+      catch {return data({connection:installed,catalogNeedsReview:true,message:'Store authorization is saved. Resume the brand onboarding screen to review the catalog import; do not reinstall to retry it.'});}
+    }
     // Token exchange establishes the connector, never an owner/browser login.
     return data({ connection: installed, message: 'Store authorization saved. Catalog, webhook and payment acceptance tests are still required.' });
   });
@@ -604,8 +650,13 @@ export async function createApp(options = {}) {
   app.post('/api/invites/:token/accept', async (request, reply) => {
     const input = z.object({ acceptedSandboxTerms: z.literal(true) }).parse(request.body);
     const invite = await auth.consumeInvite(request.params.token, 'sandbox-draft-v1');
-    const session = await auth.createSession({ brandId: invite.brandId }); setSessionCookie(reply, session);
+    // Every public invitation enters the safe two-step lifecycle before any
+    // tenant session is minted. Legacy simulated payout actions must not be
+    // reachable in the gap before the merchant chooses/detects a store.
+    await domain.enterTwoStepOnboarding(invite.brandId, { actor: 'invite-accept' });
     await domain.updateBrand(invite.brandId, { agreementSigned: input.acceptedSandboxTerms });
+    const previous=await auth.resolveSession(request.cookies.avf_session);if(previous)await auth.deleteSession(previous.tokenHash);
+    const session = await auth.createSession({ brandId: invite.brandId }); setSessionCookie(reply, session);
     return data({ csrfToken: session.csrfToken, brandId: session.brandId, role: 'brand', sandbox: true });
   });
   app.post('/oauth/token', { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async request => {
@@ -670,9 +721,18 @@ export async function createApp(options = {}) {
     if (!SHOPIFY_ALLOWED_WEBHOOK_TOPICS.includes(topic)) throw fail(400, 'WEBHOOK_TOPIC_NOT_ALLOWED', 'This Shopify topic is outside the configured subscription allowlist.');
     if (topic === 'app/uninstalled' && request.body?.myshopify_domain !== expected)
       throw fail(400, 'SHOP_MISMATCH', 'The signed uninstall payload does not match the webhook store.');
-    if (registry) await providerEvents.queue({ provider: 'shopify', deliveryId: request.headers['x-shopify-webhook-id'], topic,
+    // Event-Id spans subscriptions/topics/API serializations. The durable queue
+    // binds an exact envelope, so use the delivery ID, not that broader identity.
+    // Legacy Event-Id-only senders get a scoped envelope key; normal retries of
+    // the same signed body still dedupe, while valid variants remain independent.
+    const webhookId = String(request.headers['x-shopify-webhook-id'] || '');
+    const eventId = String(request.headers['x-shopify-event-id'] || '');
+    const shopifyDeliveryId = webhookId || (eventId ? `shopify-event:${createHash('sha256').update(JSON.stringify([
+      expected,topic,eventId,String(request.headers['x-shopify-api-version'] || ''),String(request.headers['x-shopify-triggered-at'] || ''),request.body,
+    ])).digest('hex')}` : undefined);
+    if (registry) await providerEvents.queue({ provider: 'shopify', deliveryId: shopifyDeliveryId, topic,
       shop: expected, payload: request.body, occurredAt: request.headers['x-shopify-triggered-at'] });
-    return operations.saveInbound('shopify', request.headers['x-shopify-webhook-id'], topic, request.rawBody, expected,
+    return operations.saveInbound('shopify', shopifyDeliveryId, topic, request.rawBody, expected,
       { brandId: registry?.brandId || installed?.brandId, occurredAt: request.headers['x-shopify-triggered-at'] });
   });
   app.post('/webhooks/stripe', async request => {
@@ -689,16 +749,27 @@ export async function createApp(options = {}) {
   app.get('/openapi.json', async () => openApiDocument(config.publicBaseUrl || `http://127.0.0.1:${config.port}`));
   app.get('/.well-known/oauth-authorization-server', async () => ({ issuer: config.publicBaseUrl || `http://127.0.0.1:${config.port}`, token_endpoint: `${config.publicBaseUrl || `http://127.0.0.1:${config.port}`}/oauth/token`, grant_types_supported: ['client_credentials'], token_endpoint_auth_methods_supported: ['client_secret_basic','client_secret_post'], scopes_supported: BRAND_SCOPES }));
   app.get('/.well-known/oauth-protected-resource', async () => ({ resource: `${config.publicBaseUrl || `http://127.0.0.1:${config.port}`}/mcp`, authorization_servers: [config.publicBaseUrl || `http://127.0.0.1:${config.port}`], scopes_supported: BRAND_SCOPES, bearer_methods_supported: ['header'] }));
-  await registerMcp(app, { auth, context, actions });
+  registerPlatformRoutes(app, { platform, browserRoute, context, brandScope, requireAdmin, data, apiMutation, setSessionCookie,
+    allowAuthOutbox:config.allowAuthOutbox===true && config.mode==='sandbox' && !config.publicBaseUrl && ['127.0.0.1','localhost','::1'].includes(config.host),
+    clearSessionCookie: reply => reply.clearCookie('avf_session', { path: '/', httpOnly: true, sameSite: 'strict', secure: Boolean(config.publicBaseUrl?.startsWith('https:')) }) });
+  await registerMcp(app, { auth, context, actions, extraTools: platformMcpTools(platform) });
   const dist = resolve(ROOT, 'dist');
   if (existsSync(dist)) await app.register(staticFiles, { root: dist, prefix: '/' });
   app.setNotFoundHandler((request, reply) => {
     if (request.method === 'GET' && !/^\/(api|v1|oauth|webhooks|mcp)(\/|$)/.test(request.url) && existsSync(resolve(dist, 'index.html'))) return reply.sendFile('index.html');
     return reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'Route not found.' } });
   });
-  let interval;
+  let interval; let lastAlertKey = '';
   if (options.worker !== false) { interval = setInterval(async () => {
-    try { await providerJobs.run(); await operations.runJobs(); }
+    try {
+      const result = await providerJobs.run(); await operations.runJobs();
+      await platform.jobs().catch(error => app.log.error({ code: error.code || 'PLATFORM_JOB_ERROR' }, 'Platform job failed'));
+      // Swallowed per-run failures (e.g. nightly_reconciliation_pending) must reach an operator.
+      const pending = [...new Set((result?.lifecycle ?? []).map(entry => entry.state).filter(state => /_pending$|_review$/.test(String(state))))].sort();
+      const key = pending.join(',');
+      if (key && key !== lastAlertKey) app.log.warn({ code: 'WORKER_ATTENTION_REQUIRED', states: pending }, 'Background jobs need attention');
+      lastAlertKey = key;
+    }
     catch (error) { app.log.error({ code: error.code || 'WORKER_ERROR' }, 'Background job failed'); }
   }, 5000); interval.unref(); }
   app.addHook('onClose', async () => { if (interval) clearInterval(interval); await providerFailureCheckouts.close(); operations.clearLocalStripeCredentials(); if (!options.db) await db.close(); });

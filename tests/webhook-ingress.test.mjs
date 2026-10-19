@@ -31,3 +31,16 @@ test('webhook ingress never exposes owner routes or forwards browser credentials
   for (const key of ['cookie', 'authorization', 'origin', 'x-forwarded-for']) assert.equal(received[0].headers[key], undefined);
   assert.equal(result.headers.get('set-cookie'), null);
 });
+
+test('ingress forwards the Shopify event id used for cross-subscription dedupe', async t => {
+  const { createWebhookIngress } = await import('../server/webhook-ingress.mjs');
+  const http = await import('node:http');
+  const received = [];
+  const backend = http.createServer((req, res) => { received.push(req.headers); req.resume(); res.end('{}'); });
+  await new Promise(r => backend.listen(0, '127.0.0.1', r)); t.after(() => backend.close());
+  const ingress = createWebhookIngress({ backendPort: backend.address().port });
+  await new Promise(r => ingress.listen(0, '127.0.0.1', r)); t.after(() => ingress.close());
+  await fetch(`http://127.0.0.1:${ingress.address().port}/webhooks/shopify`, { method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-shopify-event-id': 'evt-fixture-1' }, body: '{}' });
+  assert.equal(received[0]['x-shopify-event-id'], 'evt-fixture-1');
+});

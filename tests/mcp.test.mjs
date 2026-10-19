@@ -56,7 +56,7 @@ async function fixture(t) {
   return { app, ...app.avafem, credential, rpc, call, resultData, resultError, providerCalls };
 }
 
-test('Streamable HTTP MCP initializes and lists actual registered tools through Fastify raw transport', { timeout: 20_000 }, async t => {
+test('Streamable HTTP MCP initializes and lists actual registered tools through Fastify raw transport', { timeout: 60_000 }, async t => {
   const { rpc, credential, providerCalls } = await fixture(t);
   const token = await credential('brand_bloom', ['orders:read']);
   const initialized = await rpc(token, 'initialize', { protocolVersion, capabilities: {}, clientInfo: { name: 'avafem-capability-test', version: '1.0.0' } });

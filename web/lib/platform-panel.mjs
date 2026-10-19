@@ -1,0 +1,44 @@
+export const PLATFORM_SECTIONS = [
+  {id:'recovery',label:'Admin recovery',path:'/api/admin/recovery',adminOnly:true},
+  {id:'curation',label:'Product curation',path:'/api/admin/curation',adminOnly:true},
+  {id:'invites',label:'Brand invites',path:'/api/brands',adminOnly:true},
+  {id:'onboarding',label:'Connect your brand',path:'/api/onboarding/session'},
+  { id: 'shoppers', label: 'Shoppers', path: '/api/crm/shoppers', adminOnly: true, note: 'Masked list. Open a profile via the API; health data needs consent and every read is audited.' },
+  { id: 'segments', label: 'Segments', path: '/api/crm/segments', adminOnly: true },
+  { id: 'campaigns', label: 'Campaigns', path: '/api/crm/campaigns', adminOnly: true, actions: [{ label: 'Run scheduled flows', path: '/api/crm/jobs/run' }] },
+  { id: 'outbox', label: 'Simulated outbox', path: '/api/crm/outbox', adminOnly: true, note: 'Nothing is delivered. Messages are recorded locally with masked recipients.' },
+  { id: 'tickets', label: 'Support inbox', path: '/api/crm/tickets' },
+  { id: 'liability', label: 'Beauty Bank liability', path: '/api/bank/liability', adminOnly: true, actions: [{ label: 'Run maturity/expiry', path: '/api/bank/run' }] },
+  { id: 'disputes', label: 'Disputes', path: '/api/admin/disputes' },
+  { id: 'holds', label: 'Payout holds', path: '/api/admin/holds', adminOnly: true },
+  { id: 'stuck', label: 'Stuck transfers', path: '/api/admin/stuck-transfers', adminOnly: true },
+  { id: 'alerts', label: 'Alerts', path: '/api/admin/alerts', adminOnly: true, actions: [{ label: 'Scan now', path: '/api/admin/alerts/scan' }, { label: 'Run pre-payout checks', path: '/api/admin/payout-checks' }] },
+  { id: 'salestax', label: 'Sales tax by state', path: '/api/reports/sales-tax', adminOnly: true, note: 'CSV: add ?format=csv to the API path.' },
+  { id: 'payouts', label: 'Annual payouts (1099-K data)', path: '/api/reports/brand-payouts' },
+  { id: 'review', label: 'Catalog review queue', path: '/api/portal/review-queue', adminOnly: true, note: 'Approve or reject with the existing catalog review action; compliance flags appear per product.' },
+  { id: 'placements', label: 'Placements', path: '/api/placements' },
+  { id: 'billing', label: 'Placement billing', path: '/api/billing' },
+  { id: 'subscriptions', label: 'Subscriptions', path: '/api/subscriptions', adminOnly: true, actions: [{ label: 'Run due renewals', path: '/api/subscriptions/run' }] },
+  { id: 'shipping', label: 'Free-shipping rule', path: '/api/shipping/rules', adminOnly: true },
+  { id: 'subsidies', label: 'Shipping subsidies', path: '/api/shipping/subsidies', adminOnly: true },
+  { id: 'privacy', label: 'Privacy requests', path: '/api/privacy/requests', adminOnly: true, note: 'Export and erase run per shopper via the API; erasure needs confirm: "DELETE".' },
+];
+export function platformRows(data) {
+  if (Array.isArray(data)) return data;
+  if (data && typeof data === 'object') {
+    const firstArray = Object.values(data).find(Array.isArray);
+    return firstArray || [data];
+  }
+  return [];
+}
+export function platformColumns(rows, max = 7) {
+  const keys = [];
+  for (const row of rows.slice(0, 20)) for (const k of Object.keys(row || {})) if (!keys.includes(k) && !/enc$|Enc$/.test(k)) keys.push(k);
+  return keys.slice(0, max);
+}
+export function formatCell(key, value) {
+  if (value == null) return '—';
+  if (/Cents$/.test(key) && Number.isSafeInteger(value)) return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(value / 100);
+  if (typeof value === 'object') { const s = JSON.stringify(value); return s.length > 80 ? `${s.slice(0, 77)}…` : s; }
+  return String(value);
+}

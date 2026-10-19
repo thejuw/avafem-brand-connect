@@ -41,6 +41,10 @@ import { normalizeHandoffBag } from './lib/handoff-bag.mjs';
 import { clearStripeSecretForm, configureStripeTestCredentials, isLoopbackHost } from './lib/stripe-test-entry.mjs';
 import TestCheckoutPanel from './TestCheckoutPanel.jsx';
 import UnifiedCheckoutPanel from './UnifiedCheckoutPanel.jsx';
+import PlatformPanel from './PlatformPanel.jsx';
+import BrandOnboarding from './BrandOnboarding.jsx';
+import BrandPortal from './BrandPortal.jsx';
+import {createScopeFence} from './lib/scope-fence.mjs';
 import { resolveUnifiedCheckoutReturn } from './lib/unified-checkout.mjs';
 
 const NAV = [
@@ -51,6 +55,7 @@ const NAV = [
   ["finance", "Finance", WalletCards],
   ["connections", "Connections", Plug],
   ["events", "Events & jobs", Activity],
+  ["platform", "Backend & CRM", ShieldCheck],
 ];
 const emptyData = {
   dashboard: {},
@@ -245,6 +250,7 @@ function App() {
   const toastTimer = useRef(null);
   const csrf = useRef("");
   const activeBrandRef = useRef(null);
+  const scopeFence=useRef(createScopeFence());
   const localStripeOwner = session?.owner === true && session?.role === 'admin' && !session?.brandId;
   const localStripeAllowed = localStripeOwner && isLoopbackHost(window.location.hostname);
   useEffect(() => {
@@ -289,6 +295,7 @@ function App() {
     return payload.data ?? payload;
   }
   const refresh = useCallback(async () => {
+    const stamp=scopeFence.current.begin();
     const paths = {
       dashboard: "/api/dashboard",
       brands: "/api/brands",
@@ -306,6 +313,7 @@ function App() {
         await request(path),
       ]),
     );
+    if(!scopeFence.current.current(stamp))return;
     const next = {};
     const failures = [];
     for (const item of result) {
@@ -326,7 +334,7 @@ function App() {
           : value;
       } else failures.push(item.reason.message);
     }
-    setData((previous) => ({ ...previous, ...next }));
+    setData({ ...emptyData, ...next });
     setRefreshAt(new Date().toISOString());
     setError(failures.length ? [...new Set(failures)].join(" · ") : "");
     setLoading(false);
@@ -339,6 +347,7 @@ function App() {
         if (!current) return;
         csrf.current = nextSession.csrfToken;
         activeBrandRef.current = nextSession.brandId;
+        scopeFence.current.change(nextSession.brandId || 'owner');
         setSession(nextSession);
         await refresh();
       } catch (err) {
@@ -350,6 +359,7 @@ function App() {
     })();
     return () => {
       current = false;
+      scopeFence.current.invalidate();
       clearTimeout(toastTimer.current);
     };
   }, [refresh]);
@@ -394,12 +404,14 @@ function App() {
     };
   }, [modal, drawer]);
   useEffect(() => {
+    let current=true;const stamp=scopeFence.current.capture();
     setCredentialResult(null);
     setApiCredentials([]);
     if (modal?.type === "credentials")
       request(`/api/brands/${modal.item.id}/credentials`)
-        .then((value) => setApiCredentials(list(value)))
-        .catch((err) => notify(err.message, "error"));
+        .then((value) => {if(current && scopeFence.current.sameScope(stamp))setApiCredentials(list(value));})
+        .catch((err) => {if(current && scopeFence.current.sameScope(stamp))notify(err.message, "error");});
+    return()=>{current=false;};
   }, [modal]);
 
   async function action(path, body, message, method = "POST") {
@@ -418,6 +430,8 @@ function App() {
     }
   }
   async function switchBrand(brandId) {
+    scopeFence.current.invalidate();setData(emptyData);setLoading(true);setRefreshAt(null);setError('');
+    closeModal();setDrawer(null);setCredentialResult(null);setApiCredentials([]);setConnectionResult(null);setToast(null);
     setBusy("workspace");
     try {
       const next = await request("/api/session/brand", {
@@ -426,6 +440,7 @@ function App() {
       });
       csrf.current = next.csrfToken || csrf.current;
       activeBrandRef.current = next.brandId;
+      scopeFence.current.change(next.brandId || 'owner');
       setSession(next);
       setDrawer(null);
       setPage("overview");
@@ -437,11 +452,12 @@ function App() {
       );
     } catch (err) {
       notify(err.message, "error");
+      await refresh();
     } finally {
       setBusy("");
     }
   }
-  const owner = !session?.brandId;
+  const owner = session?.owner===true && !session?.brandId;
   const selectedBrand = data.brands.find((b) => b.id === session?.brandId);
   const navigate = (next, nextFilter) => {
     setPage(next);
@@ -3329,6 +3345,7 @@ function App() {
               {page === "finance" && Finance()}
               {page === "connections" && Connections()}
               {page === "events" && Events()}
+              {page === "platform" && <PlatformPanel key={`${session?.brandId || 'owner'}:${session?.role || ''}`} request={request} owner={owner} session={session} />}
             </WorkspaceErrorBoundary>
           )}
           <footer className="main-footer">
@@ -3768,10 +3785,12 @@ function AccessPage({ kind, token }) {
 }
 
 const accessRoute = resolveAccessRoute(window.location.pathname);
+// The brand portal owns its own session; it never bootstraps the owner workspace.
+const brandPortalRoute = /^\/brand(\/|$)/.test(window.location.pathname);
 createRoot(document.getElementById("root")).render(
   <WorkspaceErrorBoundary onRecover={() => window.location.reload()}>
-    {accessRoute ? (
-      <AccessPage kind={accessRoute.kind} token={accessRoute.token} />
+    {brandPortalRoute ? <BrandPortal /> : accessRoute ? (
+      accessRoute.kind==='invite' ? <BrandOnboarding token={accessRoute.token}/> : <AccessPage kind={accessRoute.kind} token={accessRoute.token} />
     ) : (
       <App />
     )}

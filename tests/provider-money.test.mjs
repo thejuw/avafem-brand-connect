@@ -288,6 +288,8 @@ test('actual partial-quantity refund before transfer reduces only its own brand 
   assert.ok(fx.calls.findIndex(call => call.type === 'refundPreview') < fx.calls.findIndex(call => call.type === 'refund'));
   assert.equal(op.nativePreview.amountCents, 108);
   assert.equal((await fx.db.query('SELECT refunded_cents FROM bags WHERE id=$1', [fx.bag.id])).rows[0].refunded_cents, 108);
+  assert.deepEqual((await fx.db.query('SELECT subtotal_cents,shipping_cents,tax_cents,commission_cents FROM refunds WHERE id=$1',[op.id])).rows[0],
+    {subtotal_cents:100,shipping_cents:0,tax_cents:8,commission_cents:15});
   assert.equal((await fx.db.query('SELECT amount_cents FROM transfers WHERE bag_id=$1', [fx.bag.id])).rows[0].amount_cents, 110);
   await fx.advance(30); await fx.money.settle({ runId: RUN });
   assert.equal(fx.calls.find(call => call.type === 'transfer' && call.input.bagId === fx.bag.id).input.amountCents, 110);

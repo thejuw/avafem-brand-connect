@@ -4,6 +4,7 @@ import { randomBytes } from 'node:crypto';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createApp } from './app.mjs';
+import {redactedRequestPath} from './log-redaction.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 if (existsSync(resolve(root,'.env'))) process.loadEnvFile(resolve(root,'.env'));
@@ -19,8 +20,13 @@ catch (error) {
 }
 const host=process.env.HOST||'127.0.0.1'; const port=Number(process.env.PORT||4317);
 const loopback=['127.0.0.1','localhost','::1'].includes(host);
-if (!loopback && (!process.env.AVAFEM_SESSION_SECRET || !process.env.AVAFEM_CREDENTIAL_ENCRYPTION_KEY || !process.env.AVAFEM_ADMIN_TOKEN))
-  throw new Error('A network listener requires explicit session/encryption/admin secrets. Use loopback for local development.');
+// A loopback listener behind a public tunnel (PUBLIC_BASE_URL set) is internet-reachable too:
+// do not fall back to the key file that sits beside the database it encrypts.
+const exposed=!loopback || Boolean(process.env.PUBLIC_BASE_URL);
+if (exposed && (!process.env.AVAFEM_SESSION_SECRET || !process.env.AVAFEM_CREDENTIAL_ENCRYPTION_KEY || !process.env.AVAFEM_ADMIN_TOKEN))
+  throw new Error('A network listener or PUBLIC_BASE_URL tunnel requires explicit session/encryption/admin secrets from the environment or a secret manager. Use plain loopback for local development.');
+if (exposed && Buffer.byteLength(process.env.AVAFEM_CREDENTIAL_ENCRYPTION_KEY)<32)
+  throw new Error('AVAFEM_CREDENTIAL_ENCRYPTION_KEY must be at least 32 bytes of random data.');
 const app=await createApp({
   dataDir:resolve(runtime,'postgres'), connectionString:process.env.DATABASE_URL,
   config:{mode:process.env.AVAFEM_MODE||'sandbox',host,port,
@@ -28,8 +34,11 @@ const app=await createApp({
     sessionSecret:process.env.AVAFEM_SESSION_SECRET||secrets.sessionSecret,
     encryptionKey:process.env.AVAFEM_CREDENTIAL_ENCRYPTION_KEY||secrets.encryptionKey,
     adminToken:process.env.AVAFEM_ADMIN_TOKEN,publicBaseUrl:process.env.PUBLIC_BASE_URL,
-  },logger:{level:'warn',
-    serializers:{req:request=>({method:request.method,path:String(request.url || '').split('?')[0]})},
+    allowAuthOutbox:process.env.AVAFEM_ENABLE_AUTH_OUTBOX==='true',
+  },platform:{onboarding:{localOnly:!process.env.PUBLIC_BASE_URL,allowStoreProbes:process.env.AVAFEM_ENABLE_STORE_DISCOVERY==='true'},
+    inviteDelivery:{enableExternal:process.env.AVAFEM_ENABLE_INVITE_EMAIL==='true',apiKey:process.env.RESEND_API_KEY,from:process.env.AVAFEM_INVITE_EMAIL_FROM},
+    portalEmail:{enableExternal:process.env.AVAFEM_ENABLE_AUTH_EMAIL==='true',apiKey:process.env.RESEND_API_KEY,from:process.env.AVAFEM_AUTH_EMAIL_FROM,domainId:process.env.AVAFEM_AUTH_EMAIL_DOMAIN_ID}},logger:{level:'warn',
+    serializers:{req:request=>({method:request.method,path:redactedRequestPath(request.url)})},
     redact:['req.headers.authorization','req.headers.cookie','req.body','res.headers','err'],
   },
 });

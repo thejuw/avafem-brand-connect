@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { checkProduct, productReviewFingerprint } from './platform/compliance.mjs';
 
 const DAY = 86_400_000;
 const id = prefix => `${prefix}_${randomUUID().replaceAll('-', '')}`;
@@ -37,7 +38,7 @@ const address = value => {
 /** Sandbox business core. Amounts are integer USD cents. Optional brandId
  * arguments constrain reads and writes to that tenant; admin authorization is
  * supplied by the HTTP layer. Every mutation and its outbox event commit together. */
-export function createDomain(db, { clock = () => new Date(), protectShipping, revealShipping } = {}) {
+export function createDomain(db, { clock = () => new Date(), protectShipping, revealShipping, beforeProductApproval, verifyTwoStepPayout } = {}) {
   const now = () => new Date(typeof clock === 'function' ? clock() : clock.now());
   const iso = () => now().toISOString();
   const protectedAddress=value=>value && typeof value==='object' && Object.hasOwn(value,'encryptedShipping');
@@ -70,6 +71,14 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
     return row;
   };
   async function requirements(tx, brand) {
+    if (brand.onboardingMode === 'two_step') {
+      const missing = [];
+      if (!brand.agreementSigned) missing.push('Signed brand agreement');
+      if (!brand.connectionHealthy || brand.status === 'disconnected' || !brand.onboardingState?.connected) missing.push('Healthy verified store connection');
+      if (!brand.onboardingState?.profileVerified) missing.push('Verified connected profile');
+      if (!brand.onboardingState?.catalogImportComplete) missing.push('Complete catalog import');
+      return missing;
+    }
     const approved = (await first(tx, "SELECT COUNT(*)::integer AS count FROM products WHERE brand_id=$1 AND status='approved'", [brand.id])).count;
     const missing = [];
     if (!brand.agreementSigned) missing.push('Signed brand agreement');
@@ -108,6 +117,19 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
   const credit = (account, creditCents) => ({ account, creditCents, debitCents: 0 });
 
   const releaseDays=(bag,brand)=>Math.max(7,bag.returnWindowDays??30,brand.returnWindowDays??30);
+  const twoStep = brand => brand.onboardingMode==='two_step' || Boolean(brand.onboardingState?.platform || brand.onboardingState?.source || brand.onboardingState?.connected);
+  // Legacy mock flags are deliberately not a provider proof. A future payout
+  // driver must supply this server-owned, transaction-local durable verifier;
+  // no current HTTP payload or JSON flag can enable two-step payouts.
+  async function payoutReady(brand,tx) {
+    if(!brand.stripeAccountId || !brand.chargesEnabled || !brand.payoutsEnabled) return false;
+    if(!twoStep(brand))return true;
+    if(brand.payoutSetup!=='complete' || !/^acct_[A-Za-z0-9]{8,64}$/.test(brand.stripeAccountId) || typeof verifyTwoStepPayout!=='function')return false;
+    try {
+      const proof=await verifyTwoStepPayout({brandId:brand.id,accountId:brand.stripeAccountId},tx);
+      return proof?.verified===true && proof.provider==='stripe' && proof.mode==='test' && proof.brandId===brand.id && proof.accountId===brand.stripeAccountId && proof.chargesEnabled===true && proof.payoutsEnabled===true;
+    } catch {return false;}
+  }
   async function extendScheduledWindow(tx,bag,brand) {
     if (!bag.deliveredAt) return bag;
     const transfer=await first(tx,'SELECT * FROM transfers WHERE bag_id=$1',[bag.id]);
@@ -122,6 +144,49 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
     await event(tx,'payout.scheduled',bag.id,bag.brandId,{bagId:bag.id,dueAt,amountCents:transfer.amountCents,
       returnWindowDays:releaseDays(bag,brand),reason:'return_window_extended'});
     return result;
+  }
+
+  // Quotes and order creation share validation, stock accounting and the fixed
+  // sandbox pricing policy. A quote never reserves stock or emits paid orders.
+  async function planSandboxOrder(tx,input,shipTo) {
+    if (input.currency && input.currency!=='USD') fail('Only USD sandbox orders are supported.');
+    if (!Array.isArray(input.items) || !input.items.length || input.items.length>100) fail('Provide 1–100 catalog items.');
+    const grouped=new Map(), allocations=new Map();
+    for (const line of input.items) {
+      const qty=integer(line.qty ?? line.quantity ?? 1,'qty',1,1000);
+      const brand=await brandRow(tx,line.brandId);
+      if (brand.status==='disconnected' || brand.status==='paused') fail('This brand is unavailable for new sandbox orders.',409,'BRAND_UNAVAILABLE');
+      const found=await first(tx,"SELECT * FROM products WHERE brand_id=$1 AND sku=$2 AND status='approved' AND source_deleted_at IS NULL",[brand.id,line.sku]);
+      if (!found) fail(`Approved product ${line.sku} not found for this brand.`,409,'PRODUCT_UNAVAILABLE');
+      if (!allocations.has(found.id)) allocations.set(found.id,structuredClone(found));
+      const product=allocations.get(found.id);
+      let price=product.priceCents,inventory=product.inventoryQty,variantIndex=-1;
+      if (line.variantSku) {
+        variantIndex=product.variants.findIndex(variant=>variant.sku===line.variantSku);
+        if (variantIndex<0) fail('Variant SKU is not part of this brand product.');
+        price=product.variants[variantIndex].price.amount; inventory=product.variants[variantIndex].inventory.qty;
+      }
+      if (inventory<qty) fail(`Insufficient inventory for ${line.variantSku||line.sku}.`,409,'INSUFFICIENT_STOCK');
+      integer(price*qty,'Line total');
+      if (variantIndex<0) product.inventoryQty-=qty;
+      else product.variants[variantIndex].inventory.qty-=qty;
+      if (!grouped.has(brand.id)) grouped.set(brand.id,{brand,items:[],subtotal:0});
+      const group=grouped.get(brand.id);
+      group.items.push({sku:product.sku,...(line.variantSku?{variantSku:line.variantSku}:{}),title:product.title,qty,unitPriceCents:price});
+      group.subtotal+=price*qty;
+    }
+    const groups=[...grouped.values()];
+    for (const group of groups) {
+      group.shipping=group.brand.shippingTable.find(rate=>rate.country===shipTo.country)?.priceCents ?? 0;
+      // Explicitly fixed sandbox fixture, not a live tax engine or tax advice.
+      group.tax=Math.round(group.subtotal*825/10000);
+      group.commission=Math.round(group.subtotal*group.brand.commissionBps/10000);
+    }
+    const subtotal=groups.reduce((sum,g)=>sum+g.subtotal,0),shipping=groups.reduce((sum,g)=>sum+g.shipping,0),tax=groups.reduce((sum,g)=>sum+g.tax,0);
+    integer(subtotal+shipping+tax,'Order total',1);
+    if (input.expectedTotalCents!==undefined && integer(input.expectedTotalCents,'Expected order total',1)!==subtotal+shipping+tax)
+      fail('The sandbox quote changed; no paid order was created.',409,'QUOTE_CHANGED');
+    return {groups,allocations,subtotal,shipping,tax};
   }
 
   async function bagView(tx, bag) {
@@ -171,6 +236,56 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
       return Promise.all(result.map(brand => decorateBrand(db,brand)));
     },
     async getBrand(brandId) { return decorateBrand(db,await brandRow(db,brandId)); },
+    async twoStepPayoutReady(brandId,{tx}={}) {const q=tx||db;if(tx)await tx.query('SELECT id FROM brands WHERE id=$1 FOR UPDATE',[brandId]);return payoutReady({...await brandRow(q,brandId),onboardingMode:'two_step'},q);},
+    async enterTwoStepOnboarding(brandId,{actor='system:onboarding'}={}) {
+      if(!/^[A-Za-z0-9_:-]{1,120}$/.test(actor))fail('Use a server-owned onboarding actor.');
+      return db.transaction(async tx=>{
+        await tx.query('SELECT id FROM brands WHERE id=$1 FOR UPDATE',[brandId]);
+        const brand=await brandRow(tx,brandId),verified=await payoutReady({...brand,onboardingMode:'two_step'},tx);
+        const setup=verified?'complete':'deferred',status=brand.onboardingMode!=='two_step' && ['invited','ready','live'].includes(brand.status)?'onboarding':brand.status;
+        const changed=brand.onboardingMode!=='two_step' || brand.payoutSetup!==setup || (!verified && Boolean(brand.stripeAccountId || brand.chargesEnabled || brand.payoutsEnabled));
+        const result=await first(tx,`UPDATE brands SET onboarding_mode='two_step',payout_setup=$2,status=$3,
+          stripe_account_id=CASE WHEN $4 THEN stripe_account_id ELSE NULL END,charges_enabled=CASE WHEN $4 THEN charges_enabled ELSE FALSE END,
+          payouts_enabled=CASE WHEN $4 THEN payouts_enabled ELSE FALSE END,updated_at=$5 WHERE id=$1 RETURNING *`,[brandId,setup,status,verified,iso()]);
+        if(!verified) {
+          await tx.query("UPDATE transfers SET status='held' WHERE brand_id=$1 AND status='scheduled'",[brandId]);
+          await tx.query("UPDATE jobs SET status='held',last_error='Verified two-step payout setup required' WHERE bag_id IN(SELECT id FROM bags WHERE brand_id=$1) AND kind='sandbox_payout' AND status IN('scheduled','failed')",[brandId]);
+        }
+        if(changed) {
+          await tx.query(`INSERT INTO curation_audit(id,brand_id,actor,action,reason,payload,created_at) VALUES($1,$2,$3,'two_step_entered',$4,$5,$6)`,
+            [id('curation'),brandId,actor,'Two-step payout authority is separate from legacy simulated onboarding.',json({payoutSetup:setup,payoutVerified:verified,legacySimulationDiscarded:!verified && Boolean(brand.stripeAccountId || brand.chargesEnabled || brand.payoutsEnabled)}),iso()]);
+          await event(tx,'brand.onboarding_entered',brandId,brandId,{onboardingMode:'two_step',payoutSetup:setup,payoutVerified:verified});
+        }
+        return decorateBrand(tx,result);
+      });
+    },
+    async activateConnectedBrand(brandId,{actor='system:onboarding',payoutSetup='deferred'} = {}) {
+      if (!/^[A-Za-z0-9_:-]{1,120}$/.test(actor) || !['deferred','pending'].includes(payoutSetup)) fail('Use a server-owned onboarding actor and payout choice.');
+      return db.transaction(async tx => {
+        await tx.query('SELECT id FROM brands WHERE id=$1 FOR UPDATE',[brandId]);
+        const brand=await brandRow(tx,brandId),state=brand.onboardingState||{};
+        if (!state.connected || !state.catalogImportComplete || !state.profileVerified || !brand.agreementSigned || !brand.connectionHealthy || ['paused','disconnected'].includes(brand.status))
+          fail('A verified connection, profile, catalog import and agreement are required.',409,'ONBOARDING_INCOMPLETE');
+        let connection; const source=state.platform || state.source;
+        if (source==='shopify' && brand.connectionTier==='shopify') connection=await first(tx,"SELECT brand_id FROM shopify_connections WHERE brand_id=$1 AND status='connected'",[brandId]);
+        else if (['woocommerce','bigcommerce','csv','feed'].includes(source) && brand.connectionTier===(['csv','feed'].includes(source)?'dashboard':source)) connection=await first(tx,"SELECT brand_id FROM brand_connectors WHERE brand_id=$1 AND platform=$2 AND status='connected'",[brandId,source==='feed'?'csv':source]);
+        if (!connection) fail('The selected store connection is not verified.',409,'ONBOARDING_INCOMPLETE');
+        const products=await rows(tx,'SELECT * FROM products WHERE brand_id=$1 AND source_deleted_at IS NULL',[brandId]);
+        if (products.some(product=>checkProduct(product).status!=='pass')) fail('Flagged catalog listings need admin review; brand auto-activation is held.',409,'ONBOARDING_COMPLIANCE_REVIEW');
+        const verified=await payoutReady({...brand,onboardingMode:'two_step'},tx),payout=verified?'complete':payoutSetup;
+        const result=await first(tx,`UPDATE brands SET onboarding_mode='two_step',payout_setup=$2,status='live',
+          stripe_account_id=CASE WHEN $3 THEN stripe_account_id ELSE NULL END,charges_enabled=CASE WHEN $3 THEN charges_enabled ELSE FALSE END,
+          payouts_enabled=CASE WHEN $3 THEN payouts_enabled ELSE FALSE END,updated_at=$4 WHERE id=$1 RETURNING *`,[brandId,payout,verified,iso()]);
+        if(!verified) {
+          await tx.query("UPDATE transfers SET status='held' WHERE brand_id=$1 AND status='scheduled'",[brandId]);
+          await tx.query("UPDATE jobs SET status='held',last_error='Verified two-step payout setup required' WHERE bag_id IN(SELECT id FROM bags WHERE brand_id=$1) AND kind='sandbox_payout' AND status IN('scheduled','failed')",[brandId]);
+        }
+        await tx.query(`INSERT INTO curation_audit(id,brand_id,actor,action,reason,payload,created_at) VALUES($1,$2,$3,'brand_connected_activation',$4,$5,$6)`,
+          [id('curation'),brandId,actor,'Verified clean connected brand; product approvals remain independent.',json({productCount:products.length,approvedProducts:products.filter(p=>p.status==='approved').length,payoutSetup:payout}),iso()]);
+        await event(tx,'brand.activated',brandId,brandId,{status:'live',onboardingMode:'two_step',payoutSetup:payout,productsAutoapproved:false});
+        return decorateBrand(tx,result);
+      });
+    },
     async createBrand(input = {}) {
       return db.transaction(async tx => {
         const name = text(input.name,160); if (!name) fail('Brand name is required.');
@@ -187,6 +302,8 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
     async updateBrand(brandId, input = {}) {
       return db.transaction(async tx => {
         const existing = await brandRow(tx,brandId);
+        if(twoStep(existing) && (input.stripeAccountId || input.chargesEnabled===true || input.payoutsEnabled===true))
+          fail('A verified server-owned payout flow is required for two-step brands.',409,'USE_ONBOARDING_PAYOUT_FLOW');
         const merged = { ...existing };
         for (const field of ['name','commissionBps','status','connectionTier','agreementSigned','stripeAccountId','chargesEnabled','payoutsEnabled','returnWindowDays','shipFromAddress','shippingTable','supportEmail','testOrderPassed','connectionHealthy'])
           if (input[field] !== undefined) merged[field] = input[field];
@@ -219,24 +336,42 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
       return rows(db,`SELECT * FROM products${query.sql} ORDER BY updated_at DESC,id`,query.params);
     },
     async getProduct(productId, brandId) { return owned(db,'products',productId,brandId); },
-    async upsertProduct(brandId,sku,input = {}) {
+    async upsertProduct(brandId,sku,input = {},{source,beforeUpsert} = {}) {
       return db.transaction(async tx => {
+        if(beforeUpsert) await beforeUpsert(tx);
         await brandRow(tx,brandId);
         sku = text(sku,120); if (!sku) fail('SKU is required.');
-        const existing = await first(tx,'SELECT * FROM products WHERE brand_id=$1 AND sku=$2',[brandId,sku]);
-        const product = { title:'',description:'',category:'',priceCents:0,inventoryQty:0,images:[],variants:[],
+        let existing = await first(tx,'SELECT * FROM products WHERE brand_id=$1 AND sku=$2',[brandId,sku]);
+        if (source) {
+          if (!['shopify','woocommerce','bigcommerce','csv','feed'].includes(source.provider) || !text(source.catalogKey,500) || !text(source.productId,200)) fail('A bounded server-owned catalog identity is required.');
+          const mapped=await rows(tx,'SELECT * FROM products WHERE brand_id=$1 AND source_provider=$2 AND source_catalog_key=$3 AND source_product_id=$4 FOR UPDATE',[brandId,source.provider,source.catalogKey,source.productId]);
+          if(mapped.length>1 || (mapped[0] && existing && mapped[0].id!==existing.id)) fail('This source identity conflicts with another catalog product.',409,'CATALOG_SKU_CONFLICT');
+          if(mapped[0] && mapped[0].sku!==sku) {
+            existing={...mapped[0],status:'in_review',reviewedFingerprint:mapped[0].reviewedFingerprint || (mapped[0].status==='approved'?productReviewFingerprint(mapped[0]):null)};
+            await tx.query("UPDATE products SET sku=$2,status='in_review',review_note='Source SKU changed; human review required.' WHERE id=$1",[existing.id,sku]);
+          }
+          if (existing && (!existing.sourceProvider || existing.sourceProvider!==source.provider || existing.sourceCatalogKey!==source.catalogKey || existing.sourceProductId!==source.productId))
+            fail('This source would overwrite a different or user-managed product.',409,'CATALOG_SKU_CONFLICT');
+        }
+        const product = { title:'',description:'',category:'',priceCents:0,inventoryQty:0,images:[],variants:[],productType:'',tags:[],collections:[],
           evidence:{ingredients_inci:[],certifications:[],claims:[],contraindications:''},taxCode:'',shippingProfile:'standard',...existing };
-        for (const field of ['title','description','category','priceCents','inventoryQty','images','variants','evidence','taxCode','shippingProfile'])
+        product.sku=sku;
+        for (const field of ['title','description','category','priceCents','inventoryQty','images','variants','evidence','taxCode','shippingProfile','productType','tags','collections'])
           if (input[field]!==undefined) product[field]=input[field];
         // Accept the normalized contract's price/inventory aliases as well.
         if (input.price?.amount!==undefined) product.priceCents=input.price.amount;
         if (input.inventory?.qty!==undefined) product.inventoryQty=input.inventory.qty;
         integer(product.priceCents,'priceCents'); integer(product.inventoryQty,'inventoryQty',0,1_000_000);
         product.title=text(product.title,250); product.description=text(product.description,12000); product.category=text(product.category,150);
+        product.productType=text(product.productType,150);
+        for (const field of ['tags','collections']) {
+          if (!Array.isArray(product[field]) || product[field].length>100 || product[field].some(value=>typeof value!=='string' || !text(value,150))) fail(`${field} must contain up to 100 nonempty names.`);
+          product[field]=[...new Set(product[field].map(value=>text(value,150)))].sort();
+        }
         if (!Array.isArray(product.images)) fail('images must be an array.');
         if (!product.evidence || typeof product.evidence!=='object' || Array.isArray(product.evidence)) fail('evidence must be an object.');
         const issues=validateProduct(product);
-        const reviewFields=['title','description','category','images','evidence','taxCode','shippingProfile'];
+        const reviewFields=['title','description','category','images','evidence','taxCode','shippingProfile','productType','tags','collections'];
         const contentChanged=existing && reviewFields.some(field=>!equal(existing[field],product[field]));
         // Variant prices and quantities are commercial edits. Variant identities,
         // options and other descriptive changes still require a fresh review.
@@ -245,33 +380,61 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
         let status=existing?.status || 'in_review';
         if (contentChanged || variantChanged) status='in_review';
         if (issues.length) status='draft';
+        const sourceDeletedAt=source ? (source.active===false?iso():null) : existing?.sourceDeletedAt||null;
+        if (sourceDeletedAt) status='draft';
+        const fingerprint=productReviewFingerprint(product);
+        const reviewedFingerprint=existing?.reviewedFingerprint || (existing?.status==='approved'?productReviewFingerprint(existing):null);
+        const reviewedAt=existing?.reviewedAt || (existing?.status==='approved'?existing.updatedAt:null);
         const result=await first(tx,`INSERT INTO products
-          (id,brand_id,sku,title,description,category,price_cents,inventory_qty,images,variants,evidence,tax_code,shipping_profile,status,validation_issues,review_note,created_at,updated_at)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17)
+          (id,brand_id,sku,title,description,category,price_cents,inventory_qty,images,variants,evidence,tax_code,shipping_profile,status,validation_issues,review_note,created_at,updated_at,
+           product_type,collections,tags,source_provider,source_product_id,source_catalog_key,source_deleted_at,review_fingerprint,reviewed_fingerprint,reviewed_at,compliance_result,compliance_checked_at)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$17)
           ON CONFLICT(brand_id,sku) DO UPDATE SET title=EXCLUDED.title,description=EXCLUDED.description,category=EXCLUDED.category,
           price_cents=EXCLUDED.price_cents,inventory_qty=EXCLUDED.inventory_qty,images=EXCLUDED.images,variants=EXCLUDED.variants,
           evidence=EXCLUDED.evidence,tax_code=EXCLUDED.tax_code,shipping_profile=EXCLUDED.shipping_profile,status=EXCLUDED.status,
-          validation_issues=EXCLUDED.validation_issues,review_note=EXCLUDED.review_note,updated_at=EXCLUDED.updated_at RETURNING *`,
+          validation_issues=EXCLUDED.validation_issues,review_note=EXCLUDED.review_note,updated_at=EXCLUDED.updated_at,
+          product_type=EXCLUDED.product_type,collections=EXCLUDED.collections,tags=EXCLUDED.tags,source_provider=EXCLUDED.source_provider,
+          source_product_id=EXCLUDED.source_product_id,source_catalog_key=EXCLUDED.source_catalog_key,source_deleted_at=EXCLUDED.source_deleted_at,
+          review_fingerprint=EXCLUDED.review_fingerprint,reviewed_fingerprint=EXCLUDED.reviewed_fingerprint,reviewed_at=EXCLUDED.reviewed_at,
+          compliance_result=EXCLUDED.compliance_result,compliance_checked_at=EXCLUDED.compliance_checked_at RETURNING *`,
           [existing?.id||id('prod'),brandId,sku,product.title,product.description,product.category,product.priceCents,product.inventoryQty,
           json(product.images),json(product.variants),json(product.evidence),text(product.taxCode,150),text(product.shippingProfile,100),status,json(issues),
-          contentChanged||variantChanged?'Content changed; human review required.':existing?.reviewNote||'',iso()]);
+          contentChanged||variantChanged?'Content changed; human review required.':existing?.reviewNote||'',iso(),product.productType,json(product.collections),json(product.tags),
+          source?.provider||existing?.sourceProvider||null,source?.productId||existing?.sourceProductId||null,source?.catalogKey||existing?.sourceCatalogKey||null,
+          sourceDeletedAt,fingerprint,reviewedFingerprint,reviewedAt,json(checkProduct(product))]);
         await event(tx,'product.upserted',result.id,brandId,{productId:result.id,sku,status,validationIssues:issues});
         if (existing && existing.inventoryQty!==result.inventoryQty) await event(tx,'inventory.changed',result.id,brandId,{sku,inventoryQty:result.inventoryQty});
         return result;
       });
     },
-    async reviewProduct(productId,input = {},brandId) {
-      return db.transaction(async tx => {
+    async reviewProduct(productId,input = {},brandId,{tx: providedTransaction} = {}) {
+      const review = async tx => {
+        await tx.query('SELECT id FROM products WHERE id=$1 FOR UPDATE',[productId]);
         const product=await owned(tx,'products',productId,brandId);
         const status=input.status || (input.approved===true?'approved':input.approved===false?'rejected':null);
         if (!['approved','rejected'].includes(status)) fail('Review status must be approved or rejected.');
         const issues=validateProduct(product);
         if (status==='approved' && issues.length) fail('Resolve catalog validation issues before approval.',409,'CATALOG_INVALID');
-        const result=await first(tx,'UPDATE products SET status=$2,review_note=$3,validation_issues=$4,updated_at=$5 WHERE id=$1 RETURNING *',
-          [productId,status,text(input.note,2000),json(issues),iso()]);
+        const fingerprint=productReviewFingerprint(product),compliance=checkProduct(product);
+        if (input.fingerprint && input.fingerprint!==fingerprint) fail('The product changed; refresh the review.',409,'CURATION_STALE');
+        if (status==='approved' && product.sourceDeletedAt) fail('A delisted source product cannot be approved.',409,'PRODUCT_DELISTED');
+        if (status==='approved' && compliance.flags.length) {
+          const override=await first(tx,'SELECT * FROM compliance_overrides WHERE product_id=$1',[productId]);
+          if (!override || override.fingerprint!==fingerprint || text(override.reason).length<10) fail('Flagged products require an exact-content override with a reason.',409,'COMPLIANCE_BLOCKED');
+        }
+        if (status==='approved' && beforeProductApproval) await beforeProductApproval(product,tx);
+        if(status==='approved' && productReviewFingerprint(await owned(tx,'products',productId,brandId))!==fingerprint)
+          fail('The listing changed during approval; refresh its exact-content review.',409,'CURATION_STALE');
+        const result=await first(tx,`UPDATE products SET status=$2,review_note=$3,validation_issues=$4,updated_at=$5,
+          review_fingerprint=$6,reviewed_fingerprint=$6,reviewed_at=$5,compliance_result=$7,compliance_checked_at=$5 WHERE id=$1 RETURNING *`,
+          [productId,status,text(input.note,2000),json(issues),iso(),fingerprint,json(compliance)]);
+        await tx.query(`INSERT INTO curation_audit(id,operation_id,brand_id,product_id,actor,action,reason,fingerprint,payload,created_at)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,[id('curation'),input.operationId||null,product.brandId,productId,text(input.actor||'internal:domain',120),
+          status,text(input.note||'Canonical product review.',2000),fingerprint,json({previousStatus:product.status,status}),iso()]);
         await event(tx,`product.${status}`,productId,product.brandId,{productId,sku:product.sku,status});
         return result;
-      });
+      };
+      return providedTransaction?review(providedTransaction):db.transaction(review);
     },
     async listBags(input = {}) {
       const query=filter(input,[['status','status']]);
@@ -279,8 +442,18 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
       return Promise.all(result.map(bag=>bagView(db,bag)));
     },
     async getBag(bagId,brandId) { return bagView(db,await owned(db,'bags',bagId,brandId)); },
-    async createSandboxOrder(input = {}) {
+    async quoteSandboxOrder(input = {}) {
       return db.transaction(async tx => {
+        const shipTo=address(input.shipTo);
+        const {subtotal,shipping,tax}=await planSandboxOrder(tx,input,shipTo);
+        return {subtotalCents:subtotal,shippingCents:shipping,taxCents:tax,totalCents:subtotal+shipping+tax,currency:'USD'};
+      });
+    },
+    async createSandboxOrder(input = {}, { beforeCreate } = {}) {
+      return db.transaction(async tx => {
+        // Server-only lifecycle guard, serialized with cancellation/erasure. It
+        // must never contain a provider request; payment already ran outside tx.
+        if (beforeCreate) await beforeCreate(tx);
         if (input.currency && input.currency!=='USD') fail('Only USD sandbox orders are supported.');
         if (!Array.isArray(input.items) || !input.items.length || input.items.length>100) fail('Provide 1–100 catalog items.');
         const shipTo=address(input.shipTo);
@@ -299,44 +472,16 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
             return {...previous,bags:await Promise.all(previousBags.map(bag=>bagView(tx,bag)))};
           }
         }
-        const grouped=new Map();
-        for (const line of input.items) {
-          const qty=integer(line.qty ?? line.quantity ?? 1,'qty',1,1000);
-          const brand=await brandRow(tx,line.brandId);
-          if (brand.status==='disconnected' || brand.status==='paused') fail('This brand is unavailable for new sandbox orders.',409,'BRAND_UNAVAILABLE');
-          const product=await first(tx,"SELECT * FROM products WHERE brand_id=$1 AND sku=$2 AND status='approved'",[brand.id,line.sku]);
-          if (!product) fail(`Approved product ${line.sku} not found for this brand.`,409,'PRODUCT_UNAVAILABLE');
-          let price=product.priceCents, inventory=product.inventoryQty;
-          let variantIndex=-1;
-          if (line.variantSku) {
-            variantIndex=product.variants.findIndex(variant=>variant.sku===line.variantSku);
-            if (variantIndex<0) fail('Variant SKU is not part of this brand product.');
-            price=product.variants[variantIndex].price.amount; inventory=product.variants[variantIndex].inventory.qty;
-          }
-          if (inventory<qty) fail(`Insufficient inventory for ${line.variantSku||line.sku}.`,409,'INSUFFICIENT_STOCK');
-          integer(price*qty,'Line total');
-          if (variantIndex<0) await tx.query('UPDATE products SET inventory_qty=inventory_qty-$2,updated_at=$3 WHERE id=$1',[product.id,qty,iso()]);
-          else {
-            const variants=structuredClone(product.variants); variants[variantIndex].inventory.qty-=qty;
-            await tx.query('UPDATE products SET variants=$2,updated_at=$3 WHERE id=$1',[product.id,json(variants),iso()]);
-          }
-          if (!grouped.has(brand.id)) grouped.set(brand.id,{brand,items:[],subtotal:0});
-          const group=grouped.get(brand.id);
-          group.items.push({sku:product.sku,...(line.variantSku?{variantSku:line.variantSku}:{}),title:product.title,qty,unitPriceCents:price});
-          group.subtotal+=price*qty;
-          await event(tx,'inventory.changed',product.id,brand.id,{sku:product.sku,quantityChange:-qty});
+        const {groups,allocations,subtotal,shipping,tax}=await planSandboxOrder(tx,input,shipTo);
+        for (const product of allocations.values()) {
+          await tx.query('UPDATE products SET inventory_qty=$2,variants=$3,updated_at=$4 WHERE id=$1',[product.id,product.inventoryQty,json(product.variants),iso()]);
+        }
+        for (const group of groups) for (const line of group.items) {
+          const product=[...allocations.values()].find(p=>p.brandId===group.brand.id && p.sku===line.sku);
+          await event(tx,'inventory.changed',product.id,group.brand.id,{sku:product.sku,quantityChange:-line.qty});
         }
         const orderId=id('ord'); const orderRef=input.externalId?`SANDBOX-${text(input.externalId,100)}`:`SANDBOX-${randomUUID().slice(0,8).toUpperCase()}`;
         const storedShipTo=await protectAddress(shipTo);
-        const groups=[...grouped.values()];
-        for (const group of groups) {
-          group.shipping=group.brand.shippingTable.find(rate=>rate.country===shipTo.country)?.priceCents ?? 0;
-          // Explicitly fixed sandbox fixture, not a live tax engine or tax advice.
-          group.tax=Math.round(group.subtotal*825/10000);
-          group.commission=Math.round(group.subtotal*group.brand.commissionBps/10000);
-        }
-        const subtotal=groups.reduce((sum,g)=>sum+g.subtotal,0), shipping=groups.reduce((sum,g)=>sum+g.shipping,0), tax=groups.reduce((sum,g)=>sum+g.tax,0);
-        integer(subtotal+shipping+tax,'Order total',1);
         const order=await first(tx,`INSERT INTO orders(id,order_ref,subtotal_cents,shipping_cents,tax_cents,total_cents,created_at)
           VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[orderId,orderRef,subtotal,shipping,tax,subtotal+shipping+tax,iso()]);
         const created=[];
@@ -346,8 +491,11 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14) RETURNING *`,
             [id('bag'),orderId,group.brand.id,json(group.items),json(storedShipTo),group.subtotal,group.shipping,group.tax,group.commission,
             group.subtotal-group.commission+group.shipping,group.subtotal+group.shipping+group.tax,new Date(now().getTime()+3*DAY).toISOString(),group.brand.returnWindowDays,iso()]);
-          await tx.query("INSERT INTO transfers(id,bag_id,brand_id,amount_cents,status,created_at) VALUES($1,$2,$3,$4,'scheduled',$5)",
-            [id('tr'),bag.id,bag.brandId,bag.transferCents,iso()]);
+          const payoutHeld=twoStep(group.brand) && !(await payoutReady(group.brand,tx));
+          await tx.query("INSERT INTO transfers(id,bag_id,brand_id,amount_cents,status,created_at) VALUES($1,$2,$3,$4,$5,$6)",
+            [id('tr'),bag.id,bag.brandId,bag.transferCents,payoutHeld?'held':'scheduled',iso()]);
+          if (payoutHeld) await tx.query("INSERT INTO jobs(id,kind,bag_id,status,due_at,last_error,created_at) VALUES($1,'sandbox_payout',$2,'held',$3,'Payout onboarding required; delivery still required',$4)",
+            [id('job'),bag.id,new Date(now().getTime()+releaseDays(bag,group.brand)*DAY).toISOString(),iso()]);
           const creditAmount=Math.round(bag.subtotalCents*500/10000);
           await tx.query("INSERT INTO credits(id,bag_id,brand_id,amount_cents,status,created_at) VALUES($1,$2,$3,$4,'pending',$5)",
             [id('credit'),bag.id,bag.brandId,creditAmount,iso()]);
@@ -419,11 +567,12 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
           bag.payoutDueAt?new Date(bag.payoutDueAt).getTime():0)).toISOString();
         const result=await first(tx,"UPDATE bags SET status='delivered',delivered_at=$2,payout_due_at=$3,updated_at=$4 WHERE id=$1 RETURNING *",[bagId,deliveredAt.toISOString(),dueAt,iso()]);
         const pending=await first(tx,"SELECT COUNT(*)::integer AS count FROM refunds WHERE bag_id=$1 AND status='proposed'",[bagId]);
-        await tx.query('UPDATE transfers SET due_at=$2,status=$3 WHERE bag_id=$1',[bagId,dueAt,pending.count?'held':'scheduled']);
+        const held=Boolean(pending.count) || !(await payoutReady(brand,tx));
+        await tx.query('UPDATE transfers SET due_at=$2,status=$3 WHERE bag_id=$1',[bagId,dueAt,held?'held':'scheduled']);
         await tx.query(`INSERT INTO jobs(id,kind,bag_id,status,due_at,created_at) VALUES($1,'sandbox_payout',$2,$3,$4,$5)
-          ON CONFLICT(kind,bag_id) DO NOTHING`,[id('job'),bagId,pending.count?'held':'scheduled',dueAt,iso()]);
+          ON CONFLICT(kind,bag_id) DO UPDATE SET due_at=GREATEST(jobs.due_at,EXCLUDED.due_at),status=EXCLUDED.status`,[id('job'),bagId,held?'held':'scheduled',dueAt,iso()]);
         await event(tx,'bag.delivered',bagId,bag.brandId,{bagId,deliveredAt:deliveredAt.toISOString()});
-        await event(tx,'payout.scheduled',bagId,bag.brandId,{bagId,dueAt,amountCents:bag.transferCents,held:Boolean(pending.count),returnWindowDays:releaseDays(bag,brand)});
+        await event(tx,'payout.scheduled',bagId,bag.brandId,{bagId,dueAt,amountCents:bag.transferCents,held,returnWindowDays:releaseDays(bag,brand)});
         return bagView(tx,result);
       });
     },
@@ -463,7 +612,14 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
           await tx.query("UPDATE transfers SET status='reversed',reversed_cents=amount_cents WHERE id=$1",[transfer.id]);
           await event(tx,'transfer.reversed',transfer.id,bag.brandId,{bagId:bag.id,amountCents:transfer.amountCents});
         } else await tx.query("UPDATE transfers SET status='cancelled' WHERE id=$1",[transfer.id]);
-        await journal(tx,`refund:${refund.id}`,'sandbox_refund',bag,[debit('brand_payable',bag.transferCents),debit('commission_revenue',bag.commissionCents),debit('tax_payable',bag.taxCents),credit('sandbox_clearing',bag.totalCents)]);
+        const waiver=await first(tx,`SELECT COALESCE(SUM(e.credit_cents-e.debit_cents),0)::int AS amount
+          FROM ledger_entries e JOIN ledger_journals j ON j.id=e.journal_id
+          WHERE j.bag_id=$1 AND e.account='sandbox_payable_writeoff_adjustment'`,[bag.id]);
+        if (waiver.amount!==0 && waiver.amount!==bag.transferCents) fail('Reconcile the prior payable waiver before refunding this Bag.',409,'LEDGER_RECONCILIATION_REQUIRED');
+        // A noncash operator payable waiver did not refund the shopper. Preserve
+        // their refund path, reversing that waiver rather than double-debiting
+        // the brand payable that was already cancelled.
+        await journal(tx,`refund:${refund.id}`,'sandbox_refund',bag,[debit(waiver.amount ? 'sandbox_payable_writeoff_adjustment' : 'brand_payable',bag.transferCents),debit('commission_revenue',bag.commissionCents),debit('tax_payable',bag.taxCents),credit('sandbox_clearing',bag.totalCents)]);
         const earned=await first(tx,'SELECT * FROM credits WHERE bag_id=$1',[bag.id]);
         if (earned.status!=='voided') {
           if (earned.amountCents) await journal(tx,`credit-void:${bag.id}`,'credit_voided',bag,[debit(earned.status==='released'?'credit_vault':'credit_pending',earned.amountCents),credit('loyalty_expense',earned.amountCents)]);
@@ -473,7 +629,7 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
         await tx.query("UPDATE jobs SET status='cancelled' WHERE bag_id=$1 AND status IN ('scheduled','held','failed')",[bag.id]);
         await tx.query("UPDATE bags SET status='refunded',refunded_cents=total_cents,updated_at=$2 WHERE id=$1",[bag.id,iso()]);
         await tx.query("UPDATE orders SET refunded_cents=refunded_cents+$2,status=CASE WHEN refunded_cents+$2=total_cents THEN 'refunded' ELSE 'partially_refunded' END WHERE id=$1",[bag.orderId,bag.totalCents]);
-        const result=await first(tx,"UPDATE refunds SET status='approved',approved_at=$2 WHERE id=$1 RETURNING *",[refund.id,iso()]);
+        const result=await first(tx,"UPDATE refunds SET status='approved',approved_at=$2,subtotal_cents=$3,shipping_cents=$4,tax_cents=$5,commission_cents=$6 WHERE id=$1 RETURNING *",[refund.id,iso(),bag.subtotalCents,bag.shippingCents,bag.taxCents,bag.commissionCents]);
         await event(tx,'refund.issued',refund.id,bag.brandId,{refundId:refund.id,bagId:bag.id,amountCents:refund.amountCents,taxCents:bag.taxCents,commissionCents:bag.commissionCents,transferCents:bag.transferCents});
         return result;
       });
@@ -488,7 +644,14 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
             await tx.query("UPDATE jobs SET status='held',last_error='Provider-backed settlement required' WHERE id=$1",[job.id]);
             continue;
           }
-          bag=await extendScheduledWindow(tx,bag,await brandRow(tx,bag.brandId));
+          const brand=await brandRow(tx,bag.brandId);
+          bag=await extendScheduledWindow(tx,bag,brand);
+          if (!(await payoutReady(brand,tx))) {
+            await tx.query("UPDATE jobs SET status='held',last_error='Payout onboarding required' WHERE id=$1",[job.id]);
+            await tx.query("UPDATE transfers SET status='held' WHERE bag_id=$1 AND status='scheduled'",[bag.id]);
+            await event(tx,'payout.held',bag.id,bag.brandId,{bagId:bag.id,reason:'payout_onboarding_required'});
+            continue;
+          }
           if (bag.payoutDueAt && new Date(bag.payoutDueAt)>now()) continue;
           const transfer=await first(tx,'SELECT * FROM transfers WHERE bag_id=$1',[bag.id]);
           const proposal=await first(tx,"SELECT COUNT(*)::integer AS count FROM refunds WHERE bag_id=$1 AND status='proposed'",[bag.id]);

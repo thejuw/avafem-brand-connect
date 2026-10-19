@@ -1,0 +1,151 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { platformFixture } from './helpers/platform-fixture.mjs';
+
+const linked = async f => {
+  const s = await f.platform.crm.upsertShopper({ email: 'bank@example.com', firstName: 'Bea', consent: { email: true } });
+  const orderId = await f.seedOrder(); await f.platform.crm.linkOrder(s.id, orderId);
+  return { s, orderId };
+};
+
+test('Beauty Bank: LAB earns mature to VAULT after delivery + return window, redeem idempotently, expire, balanced liability', { timeout: 60_000 }, async t => {
+  const f = await platformFixture(t);
+  const { s, orderId } = await linked(f);
+  const lots = await f.ok(f.owner({ method: 'POST', url: `/api/bank/shoppers/${s.id}/earn`, payload: { orderId } }));
+  assert.equal(lots.length, 3);
+  const bags = (await f.db.query('SELECT * FROM bags WHERE order_id=$1', [orderId])).rows;
+  assert.equal(lots.reduce((a, l) => a + l.amountCents, 0), bags.reduce((a, b) => a + Math.floor(b.subtotal_cents * 0.03), 0));
+  assert.equal((await f.ok(f.owner({ method: 'POST', url: `/api/bank/shoppers/${s.id}/earn`, payload: { orderId } }))).length, 0, 'earning is idempotent per Bag');
+  let acct = await f.ok(f.owner({ method: 'GET', url: `/api/bank/shoppers/${s.id}` }));
+  assert.equal(acct.balance.vaultCents, 0); assert.ok(acct.balance.labCents > 0);
+  await f.ok(f.owner({ method: 'POST', url: '/api/bank/run' }));
+  assert.equal((await f.platform.bank.balance(s.id)).vaultCents, 0, 'return window still open');
+  f.advance(31);
+  const run = await f.ok(f.owner({ method: 'POST', url: '/api/bank/run' }));
+  assert.equal(run.matured, 1, 'only the delivered Bag matures');
+  const hearthLot = (await f.platform.bank.lots(s.id)).find(l => l.state === 'VAULT');
+  const vault = (await f.platform.bank.balance(s.id)).vaultCents;
+  assert.equal(vault, hearthLot.amountCents);
+  const redeem = p => f.owner({ method: 'POST', url: `/api/bank/shoppers/${s.id}/redeem`, headers: { 'idempotency-key': 'k1' }, payload: p });
+  const first = await f.ok(redeem({ amountCents: 1 }));
+  const replay = await f.ok(redeem({ amountCents: 1 }));
+  assert.equal(replay.id, first.id); assert.equal(replay.replayed, true);
+  assert.equal((await redeem({ amountCents: 2 })).statusCode, 422);
+  assert.equal((await f.owner({ method: 'POST', url: `/api/bank/shoppers/${s.id}/redeem`, headers: { 'idempotency-key': 'k2' }, payload: { amountCents: 1_000_000 } })).statusCode, 409);
+  assert.equal((await f.platform.bank.balance(s.id)).vaultCents, vault - 1);
+  f.advance(366);
+  assert.equal((await f.platform.bank.run()).expired, 1);
+  assert.equal((await f.platform.bank.balance(s.id)).vaultCents, 0);
+  const report = await f.ok(f.owner({ method: 'GET', url: '/api/bank/liability' }));
+  assert.equal(report.balanced, true); assert.equal(report.redeemedCents, 1); assert.equal(report.expiredBreakageCents, vault - 1);
+  assert.equal(report.liabilityCents, 0);
+  const profile = await f.ok(f.owner({ method: 'GET', url: `/api/crm/shoppers/${s.id}` }));
+  assert.equal(profile.beautyBank.labCents, report.pendingLabCents);
+});
+
+test('refunds auto-reverse Beauty Bank credit; ticket credit grants VAULT goodwill once', { timeout: 60_000 }, async t => {
+  const f = await platformFixture(t);
+  const { s, orderId } = await linked(f);
+  await f.platform.bank.earnForOrder(s.id, orderId);
+  const bloom = await f.bagFor(orderId, 'brand_bloom');
+  const ticket = await f.platform.crm.openTicket({ shopperId: s.id, bagId: bloom.id, subject: 'Damaged' });
+  await f.ok(f.owner({ method: 'POST', url: `/api/crm/tickets/${ticket.id}/actions`, payload: { action: 'refund', reason: 'Arrived damaged' } }));
+  const lots = await f.platform.bank.lots(s.id);
+  assert.equal(lots.find(l => l.bagId === bloom.id).state, 'REVERSED');
+  // A refund approved through the core route is caught by the job scan.
+  const lunelle = await f.bagFor(orderId, 'brand_lunelle');
+  const refund = await f.domain.requestRefund(lunelle.id, { reason: 'Changed mind' });
+  await f.domain.approveSandboxRefund(refund.id);
+  assert.equal((await f.platform.jobs()).bank.reversed, 1);
+  assert.equal((await f.platform.bank.lots(s.id)).find(l => l.bagId === lunelle.id).state, 'REVERSED');
+  const t2 = await f.platform.crm.openTicket({ shopperId: s.id, subject: 'Late' });
+  const credit = await f.ok(f.owner({ method: 'POST', url: `/api/crm/tickets/${t2.id}/actions`, payload: { action: 'credit', amountCents: 500 } }));
+  assert.equal(credit.result.state, 'VAULT');
+  const again = await f.platform.bank.grantGoodwill(s.id, { amountCents: 500, ticketId: t2.id });
+  assert.equal(again.replayed, true);
+  assert.equal((await f.platform.bank.balance(s.id)).vaultCents, 500);
+  assert.equal((await f.platform.bank.liabilityReport()).balanced, true);
+});
+
+test('admin console: disputes hold payouts, holds/stuck transfers/alerts, tenant-scoped dispute reads', { timeout: 60_000 }, async t => {
+  const f = await platformFixture(t);
+  const orderId = await f.seedOrder();
+  const bloom = await f.bagFor(orderId, 'brand_bloom');
+  const before = (await f.db.query('SELECT status FROM transfers WHERE bag_id=$1', [bloom.id])).rows[0].status;
+  const d = await f.ok(f.owner({ method: 'POST', url: '/api/admin/disputes', payload: { externalId: 'dp_test_1', bagId: bloom.id, reason: 'fraudulent' } }));
+  assert.equal(d.status, 'needs_response');
+  assert.equal((await f.ok(f.owner({ method: 'POST', url: '/api/admin/disputes', payload: { externalId: 'dp_test_1', bagId: bloom.id } }))).replayed, true);
+  const transfer = (await f.db.query('SELECT * FROM transfers WHERE bag_id=$1', [bloom.id])).rows[0];
+  assert.equal(before, 'scheduled'); assert.equal(transfer.status, 'held');
+  const bloomKey = await f.credential('brand_bloom', ['payouts:read']);
+  const lunelleKey = await f.credential('brand_lunelle', ['payouts:read']);
+  assert.equal((await f.ok(f.bearer(bloomKey, { method: 'GET', url: '/v1/disputes' }))).length, 1);
+  assert.equal((await f.ok(f.bearer(lunelleKey, { method: 'GET', url: '/v1/disputes' }))).length, 0);
+  assert.equal((await f.tool(bloomKey, 'list_disputes')).length, 1);
+  assert.equal((await f.owner({ method: 'POST', url: `/api/admin/holds/${transfer.id}/release` })).statusCode, 409, 'open dispute blocks release');
+  const holds = await f.ok(f.owner({ method: 'GET', url: '/api/admin/holds' }));
+  assert.equal(holds.find(h => h.transferId === transfer.id).openDisputes, 1);
+  const ev = await f.ok(f.owner({ method: 'POST', url: `/api/admin/disputes/${d.id}/evidence`, payload: { note: 'Signed for' } }));
+  assert.equal(ev.status, 'under_review'); assert.equal(ev.evidence.simulated, true);
+  assert.equal((await f.ok(f.owner({ method: 'POST', url: `/api/admin/disputes/${d.id}/resolve`, payload: { outcome: 'won' } }))).status, 'won');
+  assert.equal((await f.db.query('SELECT status FROM transfers WHERE bag_id=$1', [bloom.id])).rows[0].status, before, 'won dispute restores the payout');
+  const lost = await f.platform.console.openDispute({ externalId: 'dp_test_2', bagId: bloom.id });
+  await f.platform.console.resolveDispute(lost.id, 'lost');
+  const alerts = await f.ok(f.owner({ method: 'GET', url: '/api/admin/alerts' }));
+  assert.ok(alerts.some(a => a.kind === 'dispute_lost'));
+  // Overdue scheduled transfers surface as stuck and raise an alert.
+  f.advance(45);
+  const stuck = await f.ok(f.owner({ method: 'GET', url: '/api/admin/stuck-transfers' }));
+  assert.ok(stuck.length >= 1);
+  const scanned = await f.ok(f.owner({ method: 'POST', url: '/api/admin/alerts/scan' }));
+  const stuckAlert = scanned.find(a => a.kind === 'stuck_transfer');
+  assert.ok(stuckAlert);
+  await f.ok(f.owner({ method: 'POST', url: `/api/admin/alerts/${stuckAlert.id}/ack` }));
+  assert.ok(!(await f.ok(f.owner({ method: 'GET', url: '/api/admin/alerts' }))).some(a => a.id === stuckAlert.id));
+  const consoleView = await f.ok(f.owner({ method: 'GET', url: '/api/admin/console' }));
+  assert.equal(consoleView.ledgerBalanced, true);
+  const brandSession = await f.bearer(bloomKey, { method: 'GET', url: '/api/admin/console' });
+  assert.equal(brandSession.statusCode, 403);
+});
+
+test('risk scoring for checkout and pre-payout brand checks with optional enforcement', { timeout: 60_000 }, async t => {
+  const f = await platformFixture(t);
+  const high = await f.ok(f.owner({ method: 'POST', url: '/api/risk/checkout', payload: { amountCents: 60_000, billingCountry: 'NG', shipCountry: 'US', ipCountry: 'RU', attemptsLastHour: 4, email: 'x@mailinator.com' } }));
+  assert.equal(high.decision, 'block'); assert.ok(high.signals.some(s => s.code === 'CARD_VELOCITY'));
+  const mid = await f.platform.risk.scoreCheckout({ amountCents: 30_000, billingCountry: 'CA', shipCountry: 'US', accountAgeDays: 0 });
+  assert.equal(mid.decision, 'review');
+  const low = await f.platform.risk.scoreCheckout({ amountCents: 3_000, shipCountry: 'US', billingCountry: 'US' });
+  assert.equal(low.decision, 'allow');
+  await f.domain.updateBrand('brand_lunelle', { status: 'paused' });
+  const scheduledBefore = (await f.db.query("SELECT id FROM transfers WHERE brand_id='brand_lunelle' AND status='scheduled'")).rows.length;
+  const checks = await f.ok(f.owner({ method: 'POST', url: '/api/admin/payout-checks', payload: { enforce: true } }));
+  const lunelle = checks.find(c => c.brandId === 'brand_lunelle');
+  assert.equal(lunelle.pass, false); assert.ok(lunelle.reasons.includes('BRAND_UNAVAILABLE'));
+  assert.ok(scheduledBefore > 0); assert.equal(lunelle.heldTransfers.length, scheduledBefore);
+  const key = await f.credential('brand_bloom', ['payouts:read']);
+  assert.equal((await f.bearer(key, { method: 'GET', url: '/api/brands/brand_bloom/payout-check' })).statusCode, 403, 'browser routes refuse bearer keys');
+  assert.ok((await f.ok(f.owner({ method: 'GET', url: '/api/risk/assessments' }))).length >= 4);
+});
+
+test('state sales-tax report and 1099-K style brand annual payout export (JSON + CSV, tenant-scoped)', { timeout: 60_000 }, async t => {
+  const f = await platformFixture(t);
+  const tax = await f.ok(f.owner({ method: 'GET', url: '/api/reports/sales-tax' }));
+  const tx = tax.states.find(s => s.state === 'TX');
+  const bags = (await f.db.query('SELECT * FROM bags')).rows;
+  assert.equal(tx.bags, bags.length);
+  assert.equal(tx.taxCollectedCents, bags.reduce((a, b) => a + b.tax_cents, 0));
+  const csv = await f.owner({ method: 'GET', url: '/api/reports/sales-tax?format=csv' });
+  assert.match(csv.headers['content-type'], /text\/csv/); assert.match(csv.body, /^state,bags,/); assert.match(csv.body, /\nTX,/);
+  const year = new Date().getUTCFullYear();
+  const payouts = await f.ok(f.owner({ method: 'GET', url: `/api/reports/brand-payouts?year=${year}` }));
+  assert.equal(payouts.brands.length, 3);
+  const bloom = payouts.brands.find(b => b.brandId === 'brand_bloom');
+  assert.equal(bloom.transactionCount, 1); assert.equal(bloom.monthlyGrossCents.reduce((a, b) => a + b, 0), bloom.grossPaymentVolumeCents);
+  const key = await f.credential('brand_hearth', ['payouts:read']);
+  const own = await f.ok(f.bearer(key, { method: 'GET', url: `/v1/reports/payouts?year=${year}` }));
+  assert.deepEqual(own.brands.map(b => b.brandId), ['brand_hearth']);
+  const ownCsv = await f.bearer(key, { method: 'GET', url: `/v1/reports/payouts?year=${year}&format=csv` });
+  assert.equal(ownCsv.body.trim().split('\n').length, 2);
+  assert.equal((await f.tool(key, 'get_annual_payout_report', { year })).brandId, 'brand_hearth');
+  assert.equal((await f.bearer(await f.credential('brand_hearth', ['orders:read']), { method: 'GET', url: '/v1/reports/payouts' })).statusCode, 403);
+});
