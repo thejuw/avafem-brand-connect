@@ -2,6 +2,25 @@
  * /api paths are operator (admin session + CSRF) or brand-session routes. */
 export const PLATFORM_PATHS = [];
 export function addPaths(list) { PLATFORM_PATHS.push(...list); }
+const recoveryProperties={operationId:{type:'string',pattern:'^[A-Za-z0-9_-]{8,100}$'},reason:{type:'string',minLength:10,maxLength:1000,description:'Operator reason. Do not include credentials, shopper details or health information.'}};
+const recoveryBody=(properties={},required=[])=>({type:'object',required:['operationId','reason',...required],properties:{...recoveryProperties,...properties}});
+addPaths([
+  ['get','/api/admin/recovery','adminRecoveryQueues','admin'],
+  ['get','/api/admin/recovery/connectors','adminConnectorRecoveryCases','admin'],
+  ['post','/api/admin/recovery/connectors/{bagId}/resolve','adminResolveConnectorOrder','admin',recoveryBody({action:{enum:['confirm','void']},externalId:{type:'string',pattern:'^[1-9][0-9]{0,29}$'}},['action','externalId'])],
+  ['post','/api/admin/recovery/connectors/{bagId}/retry','adminUseVerifiedConnectorRetry','admin',recoveryBody()],
+  ['get','/api/admin/recovery/subscriptions','adminSubscriptionReviews','admin'],
+  ['post','/api/admin/recovery/subscriptions/{id}/reconcile','adminReconcileSimulatedRenewal','admin',recoveryBody({attemptId:{type:'string',minLength:1,maxLength:100},resolution:{enum:['paid','declined','voided']},proof:{type:'object',description:'Exact server-issued mock proof requirements; never proof of a real provider payment.'}},['attemptId','resolution'])],
+  ['post','/api/admin/recovery/subscriptions/{id}/continue','adminContinueSavedRenewalReview','admin',{type:'object',required:['operationId'],properties:{operationId:recoveryProperties.operationId},description:'Continue the saved operation with its original encrypted evidence and actor. Does not call the charger.'}],
+  ...['resume','cancel'].map(action=>['post',`/api/admin/recovery/subscriptions/{id}/${action}`,`admin${action==='resume'?'Resume':'Cancel'}ReviewedRenewal`,'admin',recoveryBody()]),
+  ['get','/api/admin/recovery/credits','adminPendingCreditReviews','admin'],
+  ['get','/api/admin/recovery/history','adminFinancialRecoveryHistory','admin'],
+  ['post','/api/admin/recovery/disputes/{id}/resolve','adminResolveLostDisputeHold','admin',recoveryBody({resolution:{enum:['operator_verified_recovery','writeoff']},recoveryReference:{type:'string',maxLength:120}},['resolution'])],
+  ['post','/api/admin/recovery/holds/{id}/release','adminReleaseReviewedPayoutHold','admin',recoveryBody()],
+  ['post','/api/admin/recovery/credits/{id}/resolve','adminResolvePendingCredit','admin',recoveryBody({action:{enum:['release','writeoff']}},['action'])],
+  ['get','/api/admin/recovery/health-outbox','adminHealthOutboxMigrationStatus','admin'],
+  ['post','/api/admin/recovery/health-outbox/migrate','adminMigrateHealthOutboxBatch','admin',{type:'object',properties:{batchSize:{type:'integer',minimum:1,maximum:500}},description:'Protect one bounded batch with the original encryption key. Stop legacy workers first.'}],
+]);
 addPaths([
   ['get', '/v1/reviews', 'listBrandReviews', 'orders:read'],
   ['get', '/v1/tickets', 'listBrandTickets', 'orders:read'],
@@ -42,7 +61,7 @@ addPaths([
   ['post', '/api/admin/disputes/{id}/evidence', 'adminDisputeEvidence', 'admin', { type: 'object' }],
   ['post', '/api/admin/disputes/{id}/resolve', 'adminResolveDispute', 'admin', { type: 'object', required: ['outcome'] }],
   ['get', '/api/admin/holds', 'adminHolds', 'admin'],
-  ['post', '/api/admin/holds/{id}/release', 'adminReleaseHold', 'admin'],
+  ['post', '/api/admin/holds/{id}/release', 'adminReleaseHold', 'admin', {type:'object',required:['reason','idempotencyKey'],properties:{reason:recoveryProperties.reason,idempotencyKey:recoveryProperties.operationId}}],
   ['get', '/api/admin/stuck-transfers', 'adminStuckTransfers', 'admin'],
   ['post', '/api/admin/stuck-transfers/{id}/retry', 'adminRetryStuck', 'admin'],
   ['get', '/api/admin/alerts', 'adminAlerts', 'admin'],
@@ -113,6 +132,15 @@ export function mergePlatformPaths(doc, operation) {
     const op = operation(operationId, scope === 'admin' ? 'admin' : scope, body || null, params);
     if (scope === 'public') { op.security = []; op.tags = ['public']; }
     else if (scope === 'admin' || path.startsWith('/api/')) { op.security = [{ sessionCookie: [] }]; op.tags = [scope === 'admin' ? 'operator' : 'brand-session']; }
+    if(path.startsWith('/api/admin/recovery')) {
+      op.description='Owner operations workspace only; brand credentials are forbidden. Mutations require x-csrf-token. Decisions retain immutable evidence and gates; no Stripe charge or bank payout is created. Only a separately verified connector retry may create one remote order.';
+      op.responses={...op.responses,'409':{description:'Recovery blocked: incomplete evidence, active worker, eligibility gate or conflicting decision. Do not reset or blindly retry.'},'503':{description:'Original health-message encryption key is unavailable. Preserve the data and restore the correct key; never replace it with a new key.'}};
+    }
+    if(path==='/api/crm/outbox') op.parameters.push(
+      {name:'shopperId',in:'query',schema:{type:'string'}},
+      {name:'limit',in:'query',schema:{type:'integer',minimum:1,maximum:500,default:100}},
+      {name:'offset',in:'query',schema:{type:'integer',minimum:0,maximum:100000,default:0}},
+    );
     doc.paths[path] = { ...(doc.paths[path] || {}), [method]: op };
   }
   doc.components.securitySchemes = { ...(doc.components.securitySchemes || {}), sessionCookie: { type: 'apiKey', in: 'cookie', name: 'avf_session', description: 'Browser session; mutations also need x-csrf-token.' } };

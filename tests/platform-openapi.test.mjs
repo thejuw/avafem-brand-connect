@@ -10,4 +10,13 @@ test('every documented platform path is a registered route and appears in /opena
     assert.ok(f.app.hasRoute({ method: method.toUpperCase(), url: path.replace(/\{(\w+)\}/g, ':$1') }), `${method} ${path} registered`);
     assert.ok(doc.paths[path]?.[method], `${method} ${path} documented`);
   }
+  for(const [path,methods] of Object.entries(doc.paths).filter(([path])=>path.startsWith('/api/admin/recovery'))) {
+    for(const operation of Object.values(methods)) {
+      assert.deepEqual(operation.security,[{sessionCookie:[]}],path);
+      assert.match(operation.description,/x-csrf-token/);
+      assert.ok(operation.responses['409'],path);
+    }
+  }
+  assert.deepEqual(doc.paths['/api/admin/recovery/subscriptions/{id}/continue'].post.requestBody.content['application/json'].schema.required,['operationId']);
+  assert.equal(doc.paths['/api/crm/outbox'].get.parameters.find(p=>p.name==='limit').schema.maximum,500);
 });

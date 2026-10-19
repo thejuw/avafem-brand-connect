@@ -1,5 +1,6 @@
 import { createHmac } from 'node:crypto';
-import { keyring, first, rows, fail, text, DAY } from './util.mjs';
+import { keyring, first, rows, fail, text, int, DAY } from './util.mjs';
+import {campaignNeedsHealth} from './health-classification.mjs';
 
 /** Health vault: intake answers and cycle data live in their own table, encrypted
  * with a purpose-bound key, and every read/write is recorded in health_access_log.
@@ -34,34 +35,64 @@ export async function createHealthVault(db, { secret, clock }) {
     const s = await first(db, 'SELECT consent,deleted_at FROM shoppers WHERE id=$1', [shopperId]);
     return Boolean(s && !s.deletedAt && (options.bypassConsent || s.consent?.health));
   }
-  // Existing campaign bodies predate the encrypted health-message column. Protect them
-  // before any outbox read; templates/segment rules are classified conservatively.
-  async function protectOutbox() {
-    await db.transaction(async tx => {
-      const legacy = await rows(tx, `SELECT m.id,m.shopper_id,m.subject,m.body,m.body_enc,m.campaign_id,m.dedupe_key FROM message_outbox m
-        LEFT JOIN campaigns c ON c.id=m.campaign_id LEFT JOIN segments s ON s.id=c.segment_id
-        WHERE m.recipient_enc<>'erased' AND ((m.body_enc IS NULL
-        AND (m.contains_health OR (m.campaign_id IS NOT NULL AND (c.id IS NULL
-          OR c.kind='restock_reminder' OR c.template LIKE '%{{nextPeriodStart}}%' OR c.template LIKE '%{{cyclePhase}}%'
-          OR s.rules ? 'cyclePhase' OR s.rules ? 'concern'))))
-          OR (m.contains_health AND (m.campaign_id IS NOT NULL OR LEFT(m.dedupe_key,10)<>'health_v1_')))
-        FOR UPDATE OF m`);
+  const migrationId='health-outbox-v2',verifier='avafem:health-outbox-v2:original-key';
+  const recipientKey=keyring(secret,'shopper-pii');
+  // Run once at boot, then in bounded background/admin batches if needed. Never
+  // scan or rewrite the outbox on a message read. Version-0 rows are withheld
+  // until migrated, including rows written by an older worker after completion.
+  async function migrateOutbox({force=false,batchSize=500}={}) {
+    int(batchSize,'batchSize',1,500);
+    return db.transaction(async tx => {
+      await tx.query('INSERT INTO health_outbox_migrations(id,key_verifier_enc) VALUES($1,$2) ON CONFLICT DO NOTHING',[migrationId,messages.encrypt(verifier)]);
+      const state=await first(tx,'SELECT * FROM health_outbox_migrations WHERE id=$1 FOR UPDATE',[migrationId]);
+      try { if (messages.decrypt(state.keyVerifierEnc)!==verifier) throw new Error('wrong key'); }
+      catch { fail('The original encryption key is required for health-message migration.',503,'HEALTH_MESSAGE_KEY_REQUIRED'); }
+      if (state.completedAt && !force) {
+        const late=await first(tx,'SELECT EXISTS(SELECT 1 FROM message_outbox WHERE protection_version<2) AS pending');
+        if (!late.pending) return {processed:0,processedTotal:state.processedCount,complete:true,completedAt:state.completedAt};
+      }
+      const legacy = await rows(tx, `SELECT m.*,c.kind,c.template,c.health AS campaign_health,s.rules,s.health AS segment_health
+        FROM message_outbox m LEFT JOIN campaigns c ON c.id=m.campaign_id LEFT JOIN segments s ON s.id=c.segment_id
+        WHERE m.protection_version<2 ORDER BY m.id LIMIT $1 FOR UPDATE OF m`,[batchSize]);
       for (const m of legacy) {
+        if (m.recipientEnc==='erased') {
+          await tx.query("UPDATE message_outbox SET subject='[erased]',body='[erased]',body_enc=NULL,protection_version=2 WHERE id=$1",[m.id]);
+          continue;
+        }
+        // Even plaintext legacy bodies still have encrypted recipients. Validate
+        // that the original key is present before re-encrypting any content.
+        try { if (typeof recipientKey.decrypt(m.recipientEnc)!=='string') throw new Error('invalid recipient'); }
+        catch { fail('The original encryption key is required for health-message migration.',503,'HEALTH_MESSAGE_KEY_REQUIRED'); }
+        let sensitive=m.containsHealth;
+        if (m.campaignId) {
+          try { sensitive ||= !m.kind || campaignNeedsHealth({kind:m.kind,template:m.template,health:m.campaignHealth},{rules:m.rules || {},health:m.segmentHealth}); }
+          catch { sensitive=true; } // Unclassified legacy data is protected, never exposed.
+        }
+        if (!sensitive) { await tx.query('UPDATE message_outbox SET protection_version=2 WHERE id=$1',[m.id]); continue; }
         let content = { shopperId: m.shopperId, subject: m.subject, body: m.body };
         if (m.bodyEnc) {
           try { content = messages.decrypt(m.bodyEnc); } catch { fail('Health message migration requires its original encryption key.', 409, 'HEALTH_MESSAGE_UNAVAILABLE'); }
           if (content?.shopperId !== m.shopperId) fail('Health message migration identity mismatch.', 409, 'HEALTH_MESSAGE_UNAVAILABLE');
         }
-        await tx.query("UPDATE message_outbox SET contains_health=TRUE,body_enc=$2,campaign_id=NULL,dedupe_key=$3,subject='[health message]',body='[health message]' WHERE id=$1",
-          [m.id, messages.encrypt({ ...content, campaignId: content.campaignId ?? m.campaignId }), m.dedupeKey.startsWith('health_v1_') ? m.dedupeKey : messageDedupe(m.dedupeKey)]);
+        await tx.query("UPDATE message_outbox SET contains_health=TRUE,body_enc=$2,campaign_id=NULL,dedupe_key=$3,subject='[health message]',body='[health message]',protection_version=2 WHERE id=$1",
+          [m.id, messages.encrypt({ ...content, campaignId: content.campaignId ?? m.campaignId }), /^health_v1_[a-f0-9]{64}$/.test(m.dedupeKey) ? m.dedupeKey : messageDedupe(m.dedupeKey)]);
         await log(tx, m.shopperId, 'outbox-migration', 'campaign', 'outbox_encrypt');
       }
+      const pending=(await first(tx,'SELECT EXISTS(SELECT 1 FROM message_outbox WHERE protection_version<2) AS pending')).pending;
+      const updated=await first(tx,'UPDATE health_outbox_migrations SET processed_count=processed_count+$2,completed_at=$3 WHERE id=$1 RETURNING *',[migrationId,legacy.length,pending ? null : now()]);
+      return {processed:legacy.length,processedTotal:updated.processedCount,complete:!pending,completedAt:updated.completedAt};
     });
   }
-  await protectOutbox();
+  await migrateOutbox();
   return {
     vault,
-    protectOutbox,
+    protectOutbox:migrateOutbox,
+    migrateOutbox,
+    async migrationStatus() {
+      const state=await first(db,'SELECT processed_count,completed_at FROM health_outbox_migrations WHERE id=$1',[migrationId]);
+      const pending=await first(db,'SELECT COUNT(*)::int AS count FROM message_outbox WHERE protection_version<2');
+      return {version:2,processedTotal:state?.processedCount || 0,pendingRows:pending.count,complete:Boolean(state?.completedAt) && pending.count===0,completedAt:state?.completedAt || null,originalKeyRequired:true};
+    },
     messageDedupe,
     async encryptMessage(shopperId, { subject, body, campaignId = null }, { actor = 'system', purpose } = {}) {
       if (!await messageAllowed(shopperId, { purpose })) return null;

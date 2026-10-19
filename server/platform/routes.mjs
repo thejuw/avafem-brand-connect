@@ -31,7 +31,69 @@ export function registerPlatformRoutes(app, h) {
   app.get('/api/crm/campaigns', async r => { await admin(r); return data(await crm.listCampaigns()); });
   app.post('/api/crm/campaigns', async r => { await admin(r); return data(await crm.createCampaign(r.body)); });
   app.post('/api/crm/campaigns/:id/run', async r => { await admin(r); return data(await crm.runCampaign(r.params.id)); });
-  app.get('/api/crm/outbox', async r => { const ctx = await admin(r); return data(await crm.outbox({ shopperId: r.query.shopperId, actor: actor(ctx), purpose: 'campaign' })); });
+  app.get('/api/crm/outbox', async r => { const ctx = await admin(r); return data(await crm.outbox({ shopperId: r.query.shopperId, actor: actor(ctx), purpose: 'campaign',limit:r.query.limit===undefined ? 100 : Number(r.query.limit),offset:r.query.offset===undefined ? 0 : Number(r.query.offset) })); });
+  app.get('/api/admin/recovery/health-outbox',async r=>{await admin(r);return data(await platform.health.migrationStatus());});
+  app.post('/api/admin/recovery/health-outbox/migrate',async r=>{const ctx=await admin(r);const input=z.object({batchSize:z.number().int().min(1).max(500).optional()}).parse(r.body || {});const result=await platform.health.migrateOutbox({...input,force:true});await platform.auth.audit(ctx,'health_outbox.migration_batch','health-outbox-v2');return data(result);});
+  const recoveryInput=z.object({operationId:z.string().regex(/^[A-Za-z0-9_-]{8,100}$/),reason:z.string().trim().min(10).max(1000)});
+  app.get('/api/admin/recovery',async r=>{
+    await admin(r);
+    const [connectors,subscriptions,holds,disputes,credits,history,healthMigration]=await Promise.all([
+      platform.brands.listRecovery(),platform.subscriptions.listReviews(),platform.console.holds(),platform.console.listDisputes(),
+      platform.console.pendingCredits(),platform.console.resolutionHistory(),platform.health.migrationStatus(),
+    ]);
+    return data({connectors,subscriptions,holds,disputes:disputes.filter(d=>d.status==='lost').map(d=>({...d,recoveryResolution:history.find(h=>h.kind==='lost_dispute' && h.disputeId===d.id)?.action || null})),credits,history,healthMigration});
+  });
+  app.get('/api/admin/recovery/connectors',async r=>{await admin(r);return data(await platform.brands.listRecovery({bagId:r.query.bagId}));});
+  app.post('/api/admin/recovery/connectors/:bagId/resolve',async r=>{
+    const ctx=await admin(r),input=recoveryInput.extend({action:z.enum(['confirm','void']),externalId:z.string().regex(/^[1-9][0-9]{0,29}$/)}).parse(r.body);
+    const result=await platform.brands.resolveRecovery({...input,bagId:r.params.bagId,actor:actor(ctx)});
+    await platform.auth.audit(ctx,`admin_recovery.connector.${input.action}`,r.params.bagId);return data(result);
+  });
+  app.post('/api/admin/recovery/connectors/:bagId/retry',async (r,reply)=>{
+    const ctx=await admin(r),input=recoveryInput.parse(r.body);
+    const outcome=await platform.auth.idempotent(`admin:${actor(ctx)}`,`POST /api/admin/recovery/connectors/${r.params.bagId}/retry`,input.operationId,{...input,bagId:r.params.bagId},async()=>{
+      const cases=await platform.brands.listRecovery({bagId:r.params.bagId});
+      if (!cases.some(c=>c.bagId===r.params.bagId && c.state==='connector_retry_authorized'))
+        throw Object.assign(new Error('A verified void resolution must authorize this retry first.'),{statusCode:409,code:'RECOVERY_RETRY_NOT_AUTHORIZED'});
+      return platform.brands.pushOrder(r.params.bagId);
+    });
+    await platform.auth.audit(ctx,'connector.retry_requested',r.params.bagId);reply.code(outcome.statusCode);
+    if(outcome.replayed) reply.header('Idempotent-Replayed','true');
+    return outcome.error ? {error:outcome.error} : data(outcome.data);
+  });
+  app.get('/api/admin/recovery/subscriptions',async r=>{await admin(r);return data(await platform.subscriptions.listReviews({subscriptionId:r.query.subscriptionId}));});
+  app.post('/api/admin/recovery/subscriptions/:id/reconcile',async r=>{
+    const ctx=await admin(r),input=recoveryInput.extend({attemptId:z.string().min(1).max(100),resolution:z.enum(['paid','declined','voided']),proof:z.record(z.string(),z.unknown()).optional()}).parse(r.body);
+    const result=await platform.subscriptions.reconcileReview({...input,subscriptionId:r.params.id,actor:actor(ctx)});
+    await platform.auth.audit(ctx,`admin_recovery.subscription.${input.resolution}`,r.params.id);return data(result);
+  });
+  app.post('/api/admin/recovery/subscriptions/:id/continue',async r=>{
+    const ctx=await admin(r),input=z.object({operationId:z.string().regex(/^[A-Za-z0-9_-]{8,100}$/)}).parse(r.body);
+    await platform.auth.audit(ctx,'admin_recovery.subscription.continue_requested',r.params.id);
+    return data(await platform.subscriptions.continueReview({...input,subscriptionId:r.params.id,actor:actor(ctx)}));
+  });
+  for (const action of ['resume','cancel']) app.post(`/api/admin/recovery/subscriptions/:id/${action}`,async r=>{
+    const ctx=await admin(r),input=recoveryInput.parse(r.body);
+    const result=await platform.subscriptions[action==='resume'?'resumeReview':'cancelReview']({...input,subscriptionId:r.params.id,actor:actor(ctx)});
+    await platform.auth.audit(ctx,`admin_recovery.subscription.${action}`,r.params.id);return data(result);
+  });
+  app.get('/api/admin/recovery/credits',async r=>{await admin(r);return data(await platform.console.pendingCredits());});
+  app.get('/api/admin/recovery/history',async r=>{await admin(r);return data(await platform.console.resolutionHistory({bagId:r.query.bagId}));});
+  app.post('/api/admin/recovery/disputes/:id/resolve',async r=>{
+    const ctx=await admin(r),input=recoveryInput.extend({resolution:z.enum(['operator_verified_recovery','writeoff']),recoveryReference:z.string().max(120).optional()}).parse(r.body);
+    const result=await platform.console.resolveLostDispute(r.params.id,{...input,idempotencyKey:input.operationId},actor(ctx));
+    await platform.auth.audit(ctx,`admin_recovery.dispute.${input.resolution}`,r.params.id);return data(result);
+  });
+  app.post('/api/admin/recovery/holds/:id/release',async r=>{
+    const ctx=await admin(r),input=recoveryInput.parse(r.body);
+    const result=await platform.console.releaseHold(r.params.id,{...input,idempotencyKey:input.operationId},actor(ctx));
+    await platform.auth.audit(ctx,'admin_recovery.hold.release',r.params.id);return data(result);
+  });
+  app.post('/api/admin/recovery/credits/:id/resolve',async r=>{
+    const ctx=await admin(r),input=recoveryInput.extend({action:z.enum(['release','writeoff'])}).parse(r.body);
+    const result=await platform.console.resolvePendingCredit(r.params.id,{...input,idempotencyKey:input.operationId},actor(ctx));
+    await platform.auth.audit(ctx,`admin_recovery.credit.${input.action}`,r.params.id);return data(result);
+  });
   app.post('/api/crm/tickets', async r => { await admin(r); return data(await crm.openTicket(r.body)); });
   app.get('/api/crm/tickets', async r => { const ctx = await browserRoute(r, 'orders:read'); return data(await crm.listTickets({ brandId: brandScope(ctx, r.query.brandId), status: r.query.status })); });
   app.get('/api/crm/tickets/:id', async r => { const ctx = await browserRoute(r, 'orders:read'); return data(await crm.getTicket(r.params.id, ctx.brandId)); });
@@ -63,7 +125,7 @@ function registerCommerceRoutes(app, h, admin, actor) {
   // ---- Phase 4: subscriptions ----
   app.get('/api/subscriptions', async r => { await admin(r); return data(await subs.list(r.query.shopperId)); });
   app.post('/api/crm/shoppers/:id/subscriptions', async r => { const ctx = await admin(r); const s = await subs.create(r.params.id, r.body || {}); await platform.auth.audit(ctx, 'subscription.created', s.id); return data(s); });
-  app.post('/api/subscriptions/:id/status', async r => { await admin(r); return data(await subs.setStatus(r.params.id, r.body?.status)); });
+  app.post('/api/subscriptions/:id/status', async r => { const ctx=await admin(r); const out=await subs.setStatus(r.params.id, r.body?.status); await platform.auth.audit(ctx,'subscription.status_changed',r.params.id); return data(out); });
   app.get('/api/subscriptions/:id/runs', async r => { await admin(r); return data(await subs.runs(r.params.id)); });
   app.post('/api/subscriptions/run', async r => { await admin(r); return data(await subs.runDue()); });
   // ---- Shipping rules ----
@@ -144,7 +206,7 @@ function registerMoneyRoutes(app, h, admin) {
   app.post('/api/admin/disputes/:id/evidence', async r => { await admin(r); return data(await con.submitEvidence(r.params.id, r.body || {})); });
   app.post('/api/admin/disputes/:id/resolve', async r => { const ctx = await admin(r); const d = await con.resolveDispute(r.params.id, r.body?.outcome); await platform.auth.audit(ctx, `dispute.${d.status}`, d.id); return data(d); });
   app.get('/api/admin/holds', async r => { await admin(r); return data(await con.holds()); });
-  app.post('/api/admin/holds/:id/release', async r => { const ctx = await admin(r); const out = await con.releaseHold(r.params.id); await platform.auth.audit(ctx, 'transfer.hold_released', r.params.id); return data(out); });
+  app.post('/api/admin/holds/:id/release', async r => { const ctx = await admin(r); const input=r.body?.reason || r.body?.idempotencyKey || r.headers['idempotency-key'] ? {reason:r.body?.reason,idempotencyKey:r.body?.idempotencyKey || r.headers['idempotency-key']} : undefined; const out = await con.releaseHold(r.params.id,input,ctx.credentialId || (ctx.owner ? 'owner' : ctx.role)); await platform.auth.audit(ctx, 'transfer.hold_released', r.params.id); return data(out); });
   app.get('/api/admin/stuck-transfers', async r => { await admin(r); return data(await con.stuckTransfers()); });
   app.post('/api/admin/stuck-transfers/:id/retry', async r => { await admin(r); return data(await con.retryStuck(r.params.id)); });
   app.get('/api/admin/alerts', async r => { await admin(r); return data(await con.alerts({ all: r.query.all === 'true' })); });

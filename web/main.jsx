@@ -3331,7 +3331,7 @@ function App() {
               {page === "finance" && Finance()}
               {page === "connections" && Connections()}
               {page === "events" && Events()}
-              {page === "platform" && <PlatformPanel request={request} owner={owner} />}
+              {page === "platform" && <PlatformPanel key={`${session?.brandId || 'owner'}:${session?.role || ''}`} request={request} owner={owner} />}
             </WorkspaceErrorBoundary>
           )}
           <footer className="main-footer">

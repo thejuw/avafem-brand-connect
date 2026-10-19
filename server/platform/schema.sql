@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS campaigns (
   segment_id TEXT REFERENCES segments(id), channel TEXT NOT NULL CHECK (channel IN ('email','sms')),
   template TEXT NOT NULL, config JSONB NOT NULL DEFAULT '{}', active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL
 );
+ALTER TABLE segments ADD COLUMN IF NOT EXISTS health BOOLEAN;
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS health BOOLEAN;
 CREATE TABLE IF NOT EXISTS message_outbox (
   id TEXT PRIMARY KEY, campaign_id TEXT, shopper_id TEXT NOT NULL, channel TEXT NOT NULL, recipient_enc TEXT NOT NULL,
   recipient_hint TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '', body TEXT NOT NULL, dedupe_key TEXT NOT NULL UNIQUE,
@@ -23,6 +25,13 @@ CREATE TABLE IF NOT EXISTS message_outbox (
 );
 ALTER TABLE message_outbox ADD COLUMN IF NOT EXISTS contains_health BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE message_outbox ADD COLUMN IF NOT EXISTS body_enc TEXT;
+ALTER TABLE message_outbox ADD COLUMN IF NOT EXISTS protection_version INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS message_outbox_legacy_protection ON message_outbox(id) WHERE protection_version<2;
+CREATE INDEX IF NOT EXISTS message_outbox_shopper_created ON message_outbox(shopper_id,created_at,id);
+CREATE INDEX IF NOT EXISTS message_outbox_created ON message_outbox(created_at,id);
+CREATE TABLE IF NOT EXISTS health_outbox_migrations (
+  id TEXT PRIMARY KEY,key_verifier_enc TEXT NOT NULL,processed_count INTEGER NOT NULL DEFAULT 0,completed_at TIMESTAMPTZ
+);
 CREATE TABLE IF NOT EXISTS support_tickets (
   id TEXT PRIMARY KEY, shopper_id TEXT REFERENCES shoppers(id), order_id TEXT, bag_id TEXT, brand_id TEXT, shipment_id TEXT,
   subject TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','pending_brand','resolved')),
@@ -63,6 +72,17 @@ CREATE TABLE IF NOT EXISTS brand_connectors (
   created_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (brand_id, platform)
 );
 CREATE TABLE IF NOT EXISTS connector_orders (bag_id TEXT PRIMARY KEY, brand_id TEXT NOT NULL, platform TEXT NOT NULL, external_id TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL);
+CREATE TABLE IF NOT EXISTS connector_dispatch_attempts (
+  id TEXT PRIMARY KEY,bag_id TEXT NOT NULL REFERENCES bags(id),brand_id TEXT NOT NULL,platform TEXT NOT NULL,target_ref TEXT NOT NULL,
+  state TEXT NOT NULL,snapshot_enc TEXT NOT NULL,snapshot_hash TEXT NOT NULL,external_id TEXT,created_at TIMESTAMPTZ NOT NULL,updated_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS connector_dispatch_attempts_bag ON connector_dispatch_attempts(bag_id,created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS connector_dispatch_attempts_live_bag ON connector_dispatch_attempts(bag_id) WHERE state IN ('pending','uncertain','created','confirmed');
+CREATE TABLE IF NOT EXISTS connector_order_recoveries (
+  operation_id TEXT PRIMARY KEY,bag_id TEXT NOT NULL REFERENCES bags(id),attempt_id TEXT NOT NULL REFERENCES connector_dispatch_attempts(id),
+  action TEXT NOT NULL,external_id TEXT NOT NULL,request_hash TEXT NOT NULL,reason_enc TEXT NOT NULL,actor TEXT NOT NULL,status TEXT NOT NULL,
+  proof_enc TEXT,result JSONB,lease_token TEXT,lease_expires_at TIMESTAMPTZ,retry_consumed_by TEXT,created_at TIMESTAMPTZ NOT NULL,updated_at TIMESTAMPTZ NOT NULL
+);
 CREATE TABLE IF NOT EXISTS placements (
   id TEXT PRIMARY KEY, brand_id TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('featured_spot','sponsored_swipe','sampling_box')),
   product_id TEXT NOT NULL, starts_at TIMESTAMPTZ NOT NULL, ends_at TIMESTAMPTZ NOT NULL, units INTEGER NOT NULL DEFAULT 0,
@@ -87,6 +107,20 @@ CREATE TABLE IF NOT EXISTS subscription_attempts (
   created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
   UNIQUE(subscription_id,cycle,attempt)
 );
+ALTER TABLE subscription_attempts ADD COLUMN IF NOT EXISTS request_fingerprint TEXT;
+ALTER TABLE subscription_attempts ADD COLUMN IF NOT EXISTS charge_evidence_enc TEXT;
+CREATE TABLE IF NOT EXISTS subscription_review_actions (
+  operation_id TEXT PRIMARY KEY,subscription_id TEXT NOT NULL REFERENCES subscriptions(id),attempt_id TEXT REFERENCES subscription_attempts(id),
+  action TEXT NOT NULL,state TEXT NOT NULL,request_hash TEXT NOT NULL,actor TEXT NOT NULL,reason_enc TEXT NOT NULL,proof_enc TEXT,response JSONB,
+  created_at TIMESTAMPTZ NOT NULL,updated_at TIMESTAMPTZ NOT NULL,completed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS subscription_review_actions_subscription ON subscription_review_actions(subscription_id,created_at);
+CREATE TABLE IF NOT EXISTS financial_resolutions (
+  id TEXT PRIMARY KEY,idempotency_key TEXT NOT NULL UNIQUE,payload_hash TEXT NOT NULL,kind TEXT NOT NULL,action TEXT NOT NULL,
+  bag_id TEXT NOT NULL REFERENCES bags(id),transfer_id TEXT,dispute_id TEXT,credit_id TEXT,actor TEXT NOT NULL,reason_enc TEXT NOT NULL,
+  recovery_reference TEXT,result JSONB NOT NULL,created_at TIMESTAMPTZ NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS financial_resolutions_dispute ON financial_resolutions(dispute_id) WHERE kind='lost_dispute';
 CREATE TABLE IF NOT EXISTS shipping_rules (id TEXT PRIMARY KEY, free_threshold_cents INTEGER NOT NULL CHECK (free_threshold_cents>=0), enabled BOOLEAN NOT NULL DEFAULT TRUE, updated_at TIMESTAMPTZ NOT NULL);
 CREATE TABLE IF NOT EXISTS shipping_subsidies (bag_id TEXT PRIMARY KEY, order_id TEXT NOT NULL, brand_id TEXT NOT NULL, shipping_cents INTEGER NOT NULL, funded_from_commission_cents INTEGER NOT NULL, absorbed_cents INTEGER NOT NULL, created_at TIMESTAMPTZ NOT NULL);
 CREATE TABLE IF NOT EXISTS privacy_requests (id TEXT PRIMARY KEY, shopper_id TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('export','delete')), status TEXT NOT NULL, result JSONB, requested_by TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ);

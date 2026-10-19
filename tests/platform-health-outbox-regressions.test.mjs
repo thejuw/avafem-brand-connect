@@ -62,7 +62,7 @@ test('health consent revocation withholds queued content; only explicit DSAR exp
   assert.ok((await health.accessLog(shopper.id)).some(e => e.action === 'outbox_read' && e.purpose === 'dsar_export' && e.actor === 'dsar-reviewer'));
 });
 
-test('legacy plaintext health campaign rows are encrypted before any outbox read', { timeout: 60_000 }, async t => {
+test('legacy health campaign rows are withheld until an explicit migration batch protects them', { timeout: 60_000 }, async t => {
   const f = await platformFixture(t);
   const { crm, health } = f.platform;
   const { shopper, campaign } = await healthCampaign(f, 'legacy-outbox@example.test');
@@ -71,6 +71,8 @@ test('legacy plaintext health campaign rows are encrypted before any outbox read
     VALUES('msg_legacy_review',$1,$2,'email',$3,'s***@example.test','LEGACY_HEALTH_SUBJECT','LEGACY_HEALTH_BODY',$4,$5)`,
     [campaign.id, shopper.id, crm.pii.encrypt('legacy-outbox@example.test'), legacyKey, f.clock()]);
   await crm.setConsent(shopper.id, { health: false });
+  assert.equal((await crm.outbox({shopperId:shopper.id}))[0].migrationPending,true);
+  await health.migrateOutbox({force:true});
   const outbox = await crm.outbox({ shopperId: shopper.id, actor: 'reviewer', purpose: 'campaign' });
   assert.equal(outbox[0].body, '[health content withheld]');
   const raw = (await f.db.query("SELECT subject,body,body_enc,contains_health,campaign_id,dedupe_key FROM message_outbox WHERE id='msg_legacy_review'")).rows[0];

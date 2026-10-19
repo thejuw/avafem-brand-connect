@@ -12,7 +12,8 @@ export async function platformFixture(t, extra = {}) {
   let offset = 0;
   const clock = () => new Date(Date.now() + offset);
   const app = await createApp({ worker: false, seed: true, connectionString: null,
-    config: { port: 4317, host: '127.0.0.1', allowLocalBootstrap: true, sessionSecret: randomBytes(32).toString('hex'), encryptionKey: randomBytes(32).toString('hex') },
+    ...(extra.db ? {db:extra.db} : {}),
+    config: { port: 4317, host: '127.0.0.1', allowLocalBootstrap: true, sessionSecret: randomBytes(32).toString('hex'), encryptionKey: randomBytes(32).toString('hex'),...(extra.config || {}) },
     platform: { clock, ...(extra.platform || {}) },
     integrations: {
       shopify: { status: async () => ({ available: false, configured: false, shop: 'platform-fixture.myshopify.com' }), preflight: forbidden('shopify.preflight'), listProducts: forbidden('shopify.listProducts'), createOrder: forbidden('shopify.createOrder'), verifyWebhook: forbidden('shopify.verifyWebhook') },

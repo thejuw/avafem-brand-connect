@@ -19,7 +19,7 @@ export async function createPlatform(db, options) {
   platform.crm = createCrm(db, { secret, clock, health, domain, get bank() { return platform.bank; } });
   platform.bank = createBeautyBank(db, { clock, ...(options.bank || {}) });
   platform.risk = createRisk(db, { clock });
-  platform.console = createConsole(db, { clock, domain, risk: platform.risk });
+  platform.console = createConsole(db, { clock, domain, risk: platform.risk, secret,creditExpiryDays:options.bank?.expiryDays ?? 365 });
   platform.reports = createReports(db, { domain });
   platform.brands = createBrandSide(db, { clock, domain, auth, secret, shopifyConnections: options.shopifyConnections, ...(options.fetch ? { fetch: options.fetch } : {}),
     compliance: { check: (...a) => platform.compliance?.check(...a) ?? null, scanBrand: (...a) => platform.compliance?.scanBrand(...a) ?? null } });
@@ -34,7 +34,7 @@ export async function createPlatform(db, options) {
     if (platform.afterRefund) await platform.afterRefund(bagId);
     return approved;
   };
-  platform.jobs = async () => ({ subscriptions: await platform.subscriptions.runDue(), bank: await platform.bank.run(), campaigns: await platform.crm.runActiveCampaigns(),
+  platform.jobs = async () => ({ healthMigration: await health.migrateOutbox(),subscriptions: await platform.subscriptions.runDue(), bank: await platform.bank.run(), campaigns: await platform.crm.runActiveCampaigns(),
     alerts: (await platform.console.scan()).length });
   return platform;
 }

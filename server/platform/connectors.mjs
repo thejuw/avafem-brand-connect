@@ -73,6 +73,7 @@ function createCall({ fetch, getFetch, resolve = lookup, getResolve, request = h
           if (checked.addresses.some(({ address }) => /^3ffe:/i.test(address))) throw new Error('Reserved address.');
         }
         catch { fail('The store must resolve only to public HTTPS addresses.', 422, 'CONNECTOR_DESTINATION_DENIED'); }
+        controller.signal.throwIfAborted();
         const injected = getFetch ? getFetch() : fetch;
         // Native fetch cannot pin a checked DNS result. Use native HTTPS for the
         // production default; only explicitly injected test transports use fetch.
@@ -98,6 +99,24 @@ const orderId = value => {
     fail('The store did not return a valid order identity.', 502, 'CONNECTOR_RESPONSE_INVALID');
   return String(value);
 };
+const proofInvalid = () => fail('The store order proof is incomplete or invalid.', 502, 'CONNECTOR_RESPONSE_INVALID');
+const money = value => {
+  const match = /^(\d+)(?:\.(\d{1,4}))?$/.exec(String(value ?? ''));
+  if (!match) return proofInvalid();
+  const fraction = (match[2] || '').padEnd(4, '0');
+  const valueCents = Number(match[1]) * 100 + Number(fraction.slice(0, 2));
+  if (fraction.slice(2) !== '00' || !Number.isSafeInteger(valueCents)) return proofInvalid();
+  return valueCents;
+};
+const collection = (value, max = 249) => { if (!Array.isArray(value) || value.length > max) return proofInvalid(); return value; };
+const quantity = value => { if (!Number.isSafeInteger(value) || value < 1 || value > 100_000) return proofInvalid(); return value; };
+const markerValues = (list, key) => collection(list, 1000).filter(v => v?.key === key).map(v => v.value);
+const address = (value, woo) => {
+  if (!value || typeof value !== 'object') return proofInvalid();
+  return { name: [value.first_name, value.last_name].filter(Boolean).join(' ').trim(),
+    line1: value[woo ? 'address_1' : 'street_1'] || '', line2: value[woo ? 'address_2' : 'street_2'] || '',
+    city: value.city || '', region: value.state || '', postal: value[woo ? 'postcode' : 'zip'] || '', country: value[woo ? 'country' : 'country_iso2'] || '' };
+};
 
 export function woocommerceAdapter(options = {}) {
   const call = createCall(options);
@@ -117,12 +136,34 @@ export function woocommerceAdapter(options = {}) {
       }
       return out;
     },
-    async createOrder(c, bag) {
+    async createOrder(c, bag, { dispatchId } = {}) {
       const body = { status: 'processing', set_paid: true, customer_note: `Avafem ${bag.orderRef}`,
         shipping: { first_name: bag.shipTo.name, address_1: bag.shipTo.line1, address_2: bag.shipTo.line2 || '', city: bag.shipTo.city, state: bag.shipTo.region, postcode: bag.shipTo.postal, country: bag.shipTo.country },
-        line_items: bag.items.map(i => ({ sku: i.sku, quantity: i.qty, total: ((i.unitPriceCents * i.qty) / 100).toFixed(2) })), meta_data: [{ key: 'avafem_bag_id', value: bag.id }] };
+        line_items: bag.items.map(i => ({ sku: i.sku, quantity: i.qty, total: ((i.unitPriceCents * i.qty) / 100).toFixed(2) })), meta_data: [{ key: 'avafem_bag_id', value: bag.id }, ...(dispatchId ? [{ key: 'avafem_dispatch_id', value: dispatchId }] : [])] };
       const o = await call(`${base(c)}/orders`, { method: 'POST', headers: { ...auth(c), 'content-type': 'application/json' }, body: JSON.stringify(body) });
       return { externalId: orderId(o?.id) };
+    },
+    /** Authoritative read-only recovery evidence; never infer absence from a 404. */
+    async getOrder(c, externalId) {
+      const expectedId = orderId(externalId);
+      const o = await call(`${base(c)}/orders/${expectedId}`, { headers: auth(c) });
+      if (orderId(o?.id) !== expectedId) return proofInvalid();
+      const lines = collection(o.line_items, 100), refunds = collection(o.refunds, 100);
+      let fulfillments = null;
+      // This optional Woo feature is required to prove an unfulfilled void.
+      // Disabled/unavailable fulfillment APIs block retry, never imply zero.
+      try { fulfillments = collection(await call(`${base(c)}/orders/${expectedId}/fulfillments?per_page=100&page=1`, { headers: auth(c) }), 99); } catch { /* Unknown history remains explicit below. */ }
+      if (fulfillments?.some(f => String(f.entity_id) !== expectedId || f.entity_type !== 'WC_Order')) return proofInvalid();
+      return { externalId: expectedId, platform: 'woocommerce', complete: true,
+        bagMarkers: markerValues(o.meta_data, 'avafem_bag_id'), dispatchMarkers: markerValues(o.meta_data, 'avafem_dispatch_id'),
+        status: o.status, currency: o.currency, totalCents: money(o.total), subtotalCents: lines.reduce((sum, l) => sum + money(l.total), 0),
+        shippingCents: money(o.shipping_total), taxCents: money(o.total_tax), discountCents: money(o.discount_total),
+        extraCharges: collection(o.fee_lines, 100).length > 0 || collection(o.coupon_lines, 100).length > 0,
+        items: lines.map(l => ({ sku: l.sku, qty: quantity(l.quantity), totalCents: money(l.total) })), shipping: address(o.shipping, true),
+        hasRefunds: refunds.length > 0, paid: typeof o.date_paid === 'string' && Number.isFinite(Date.parse(o.date_paid)),
+        canConfirm: ['processing', 'completed'].includes(o.status),
+        voidVerified: o.status === 'cancelled' && o.date_completed === null && fulfillments !== null && fulfillments.length === 0,
+        fulfillmentProofComplete: fulfillments !== null };
     },
   };
 }
@@ -144,12 +185,34 @@ export function bigcommerceAdapter(options = {}) {
       }
       return out;
     },
-    async createOrder(c, bag) {
+    async createOrder(c, bag, { dispatchId } = {}) {
       const body = { status_id: 11, customer_id: 0, billing_address: { first_name: bag.shipTo.name, street_1: bag.shipTo.line1, city: bag.shipTo.city, state: bag.shipTo.region, zip: bag.shipTo.postal, country_iso2: bag.shipTo.country, email: 'orders@avafem.invalid' },
         shipping_addresses: [{ first_name: bag.shipTo.name, street_1: bag.shipTo.line1, city: bag.shipTo.city, state: bag.shipTo.region, zip: bag.shipTo.postal, country_iso2: bag.shipTo.country }],
-        products: bag.items.map(i => ({ name: i.title || i.sku, sku: i.sku, quantity: i.qty, price_inc_tax: i.unitPriceCents / 100, price_ex_tax: i.unitPriceCents / 100 })), staff_notes: `Avafem ${bag.orderRef} / ${bag.id}` };
+        products: bag.items.map(i => ({ name: i.title || i.sku, sku: i.sku, quantity: i.qty, price_inc_tax: i.unitPriceCents / 100, price_ex_tax: i.unitPriceCents / 100 })), staff_notes: `Avafem ${bag.orderRef} / ${bag.id}${dispatchId ? ` / dispatch ${dispatchId}` : ''}` };
       const o = await call(`${base(c)}/v2/orders`, { method: 'POST', headers: headers(c), body: JSON.stringify(body) });
       return { externalId: orderId(o?.id) };
+    },
+    async getOrder(c, externalId) {
+      const expectedId = orderId(externalId), path = `${base(c)}/v2/orders/${expectedId}`;
+      const o = await call(path, { headers: headers(c) });
+      if (orderId(o?.id) !== expectedId || o.is_deleted !== false) return proofInvalid();
+      // Fixed paths only: never fetch resource URLs supplied by the provider.
+      const [products, shipping, shipments] = await Promise.all(['products', 'shipping_addresses', 'shipments'].map(async resource =>
+        collection(await call(`${path}/${resource}?limit=250&page=1`, { headers: headers(c) }))));
+      if (shipping.length !== 1 || o.shipping_address_count !== 1 || [...products, ...shipping, ...shipments].some(v => String(v.order_id) !== expectedId)) return proofInvalid();
+      const total = money(o.total_inc_tax), exclusive = money(o.total_ex_tax);
+      if (exclusive > total || products.reduce((sum, p) => sum + quantity(p.quantity), 0) !== o.items_total) return proofInvalid();
+      return { externalId: expectedId, platform: 'bigcommerce', complete: true, staffNotes: o.staff_notes,
+        status: o.status_id, currency: o.currency_code, transactionalCurrency: o.default_currency_code,
+        exchangeRate: o.currency_exchange_rate, totalCents: total, subtotalCents: money(o.subtotal_ex_tax),
+        shippingCents: money(o.shipping_cost_ex_tax), taxCents: total - exclusive,
+        discountCents: money(o.discount_amount) + money(o.coupon_discount),
+        extraCharges: money(o.handling_cost_ex_tax) !== 0 || money(o.wrapping_cost_ex_tax) !== 0,
+        items: products.map(p => ({ sku: p.sku, qty: quantity(p.quantity), totalCents: money(p.total_ex_tax) })), shipping: address(shipping[0], false),
+        hasRefunds: money(o.refunded_amount) > 0, paid: ['captured', 'paid'].includes(o.payment_status),
+        canConfirm: [2, 3, 8, 9, 10, 11].includes(o.status_id),
+        voidVerified: o.status_id === 5 && o.items_shipped === 0 && !o.date_shipped && shipments.length === 0,
+        fulfillmentProofComplete: true };
     },
   };
 }

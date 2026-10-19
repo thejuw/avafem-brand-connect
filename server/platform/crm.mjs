@@ -1,5 +1,6 @@
 import { id, sha, first, rows, fail, text, int, normEmail, maskEmail, maskPhone, keyring, DAY } from './util.mjs';
 import { cyclePhase, PHASES } from './health.mjs';
+import {rulesNeedHealth,campaignNeedsHealth,renderMessage,templateFields} from './health-classification.mjs';
 
 const CONSENT_KEYS = ['email', 'sms', 'marketing', 'health'];
 const CHANNEL_CONSENT = { email: 'email', sms: 'sms' };
@@ -91,6 +92,9 @@ export function createCrm(db, deps) {
     // ---------- segments ----------
     async createSegment(input = {}) {
       const r = input.rules || {};
+      const classified=rulesNeedHealth(r);
+      if (input.health!==undefined && typeof input.health!=='boolean') fail('health must be a boolean.');
+      if (classified && input.health===false) fail('Health-derived segment rules cannot be declared non-health.',422,'HEALTH_CLASSIFICATION_REQUIRED');
       const rules = {};
       if (r.cyclePhase != null) { if (!PHASES.includes(r.cyclePhase)) fail(`cyclePhase must be one of ${PHASES.join(', ')}.`); rules.cyclePhase = r.cyclePhase; }
       if (r.concern != null) rules.concern = text(r.concern, 80).toLowerCase();
@@ -99,13 +103,13 @@ export function createCrm(db, deps) {
       if (r.lapsedDays != null) rules.lapsedDays = int(r.lapsedDays, 'lapsedDays', 1, 3650);
       if (!Object.keys(rules).length) fail('A segment needs at least one rule.');
       const name = text(input.name, 120) || 'Segment';
-      const seg = await first(db, 'INSERT INTO segments(id,name,rules,created_at) VALUES($1,$2,$3,$4) RETURNING *', [id('seg'), name, JSON.stringify(rules), now()]);
+      const seg = await first(db, 'INSERT INTO segments(id,name,rules,created_at,health) VALUES($1,$2,$3,$4,$5) RETURNING *', [id('seg'), name, JSON.stringify(rules), now(),classified || input.health===true]);
       return seg;
     },
     async listSegments() { return rows(db, 'SELECT * FROM segments ORDER BY created_at,id'); },
-    async evaluate(rules, { purpose = 'segmentation' } = {}) {
+    async evaluate(rules, { purpose = 'segmentation',declaredHealth=false } = {}) {
       const members = [];
-      const needsHealth = rules.cyclePhase || rules.concern;
+      const needsHealth = rulesNeedHealth(rules) || declaredHealth;
       for (const { id: shopperId } of await rows(db, 'SELECT id FROM shoppers WHERE deleted_at IS NULL ORDER BY created_at,id')) {
         const orders = await crm.orders(shopperId);
         const spend = orders.reduce((s, o) => s + o.totalCents - o.refundedCents, 0);
@@ -129,7 +133,7 @@ export function createCrm(db, deps) {
     },
     async segmentMembers(segmentId) {
       const seg = await first(db, 'SELECT * FROM segments WHERE id=$1', [segmentId]); if (!seg) fail('Segment not found.', 404, 'NOT_FOUND');
-      return (await crm.evaluate(seg.rules)).map(m => ({ shopperId: m.shopperId, spendCents: m.spendCents, cyclePhase: m.cycle?.phase || null }));
+      return (await crm.evaluate(seg.rules,{declaredHealth:seg.health===true})).map(m => ({ shopperId: m.shopperId, spendCents: m.spendCents, cyclePhase: m.cycle?.phase || null }));
     },
     // ---------- campaigns / simulated outbox ----------
     async createCampaign(input = {}) {
@@ -138,19 +142,25 @@ export function createCrm(db, deps) {
       if (kind === 'broadcast' && !input.segmentId) fail('A broadcast needs a segmentId.');
       if (input.segmentId && !await first(db, 'SELECT id FROM segments WHERE id=$1', [input.segmentId])) fail('Segment not found.', 404, 'NOT_FOUND');
       const template = text(input.template, 2000) || (kind === 'restock_reminder' ? 'Hi {{firstName}}, your next cycle starts around {{nextPeriodStart}}. Time to restock?' : 'Hi {{firstName}}!');
+      templateFields(template);
+      if (input.health!==undefined && typeof input.health!=='boolean') fail('health must be a boolean.');
+      const segment=input.segmentId ? await first(db,'SELECT rules,health FROM segments WHERE id=$1',[input.segmentId]) : null;
+      const classified=campaignNeedsHealth({kind,template,health:input.health},segment);
+      if (classified && input.health===false) fail('Health-derived campaign content cannot be declared non-health.',422,'HEALTH_CLASSIFICATION_REQUIRED');
       const config = { leadDays: Number.isInteger(input.config?.leadDays) ? Math.min(Math.max(input.config.leadDays, 1), 10) : 3,
         minDaysSinceOrder: Number.isInteger(input.config?.minDaysSinceOrder) ? Math.max(input.config.minDaysSinceOrder, 0) : 14 };
-      return first(db, 'INSERT INTO campaigns(id,name,kind,segment_id,channel,template,config,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
-        [id('camp'), text(input.name, 120) || kind, kind, input.segmentId || null, channel, template, JSON.stringify(config), now()]);
+      return first(db, 'INSERT INTO campaigns(id,name,kind,segment_id,channel,template,config,created_at,health) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
+        [id('camp'), text(input.name, 120) || kind, kind, input.segmentId || null, channel, template, JSON.stringify(config), now(),classified]);
     },
     async listCampaigns() { return rows(db, 'SELECT * FROM campaigns ORDER BY created_at,id'); },
     async runCampaign(campaignId) {
       const c = await first(db, 'SELECT * FROM campaigns WHERE id=$1', [campaignId]); if (!c) fail('Campaign not found.', 404, 'NOT_FOUND');
       if (!c.active) return { campaignId, queued: 0, skipped: [], inactive: true };
-      const seg = c.segmentId ? await first(db, 'SELECT rules FROM segments WHERE id=$1', [c.segmentId]) : null;
+      const seg = c.segmentId ? await first(db, 'SELECT rules,health FROM segments WHERE id=$1', [c.segmentId]) : null;
+      const containsHealth=campaignNeedsHealth(c,seg);
       let candidates;
       if (c.kind === 'restock_reminder') {
-        const base = await crm.evaluate({ ...(seg?.rules || {}), ...(seg?.rules?.cyclePhase ? {} : {}) }, { purpose: 'campaign' });
+        const base = await crm.evaluate(seg?.rules || {}, { purpose: 'campaign',declaredHealth:seg?.health===true });
         // Needs cycle data (health consent) and a delivered order long enough ago.
         candidates = [];
         for (const m of base) {
@@ -162,7 +172,7 @@ export function createCrm(db, deps) {
           if (now().getTime() - Date.parse(delivered.at(-1).deliveredAt) < c.config.minDaysSinceOrder * DAY) continue;
           candidates.push({ ...m, cycle, dedupe: `${c.id}:${m.shopperId}:${cycle.nextPeriodStart}` });
         }
-      } else candidates = (await crm.evaluate(seg.rules, { purpose: 'campaign' })).map(m => ({ ...m, dedupe: `${c.id}:${m.shopperId}` }));
+      } else candidates = (await crm.evaluate(seg.rules, { purpose: 'campaign',declaredHealth:seg.health===true })).map(m => ({ ...m, dedupe: `${c.id}:${m.shopperId}` }));
       let queued = 0; const skipped = [];
       for (const m of candidates) {
         const s = await first(db, 'SELECT * FROM shoppers WHERE id=$1', [m.shopperId]);
@@ -170,9 +180,8 @@ export function createCrm(db, deps) {
         const p = pii.decrypt(s.profileEnc) || {};
         const to = c.channel === 'email' ? pii.decrypt(s.emailEnc) : p.phone;
         if (!to) { skipped.push({ shopperId: m.shopperId, reason: 'NO_RECIPIENT' }); continue; }
-        const body = c.template.replaceAll('{{firstName}}', p.firstName || 'there').replaceAll('{{nextPeriodStart}}', m.cycle?.nextPeriodStart || '')
-          .replaceAll('{{cyclePhase}}', m.cycle?.phase || '');
-        const containsHealth = Boolean(m.cycle || seg?.rules?.cyclePhase || seg?.rules?.concern || c.kind === 'restock_reminder' || /{{(?:nextPeriodStart|cyclePhase)}}/.test(c.template));
+        if (containsHealth && !m.cycle) { const h=await health.read(m.shopperId,{actor:`campaign:${c.id}`,purpose:'campaign'}); m.cycle=h ? cyclePhase(h.cycle,now()) : null; }
+        const body = renderMessage(c.template,{profile:p,cycle:m.cycle});
         const bodyEnc = containsHealth ? await health.encryptMessage(m.shopperId, { subject: c.name, body, campaignId: c.id }, { actor: `campaign:${c.id}`, purpose: 'campaign' }) : null;
         if (containsHealth && !bodyEnc) { skipped.push({ shopperId: m.shopperId, reason: 'NO_HEALTH_CONSENT' }); continue; }
         // Serialize the final consent check/insert with DSAR transactions. An erasure
@@ -180,8 +189,8 @@ export function createCrm(db, deps) {
         const r = await db.transaction(async tx => {
           const current = await first(tx, 'SELECT consent,deleted_at FROM shoppers WHERE id=$1 FOR UPDATE', [m.shopperId]);
           if (!current || current.deletedAt || !current.consent?.marketing || !current.consent?.[CHANNEL_CONSENT[c.channel]] || (containsHealth && !current.consent?.health)) return null;
-          return tx.query(`INSERT INTO message_outbox(id,campaign_id,shopper_id,channel,recipient_enc,recipient_hint,subject,body,dedupe_key,created_at,contains_health,body_enc)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(dedupe_key) DO NOTHING RETURNING id`,
+          return tx.query(`INSERT INTO message_outbox(id,campaign_id,shopper_id,channel,recipient_enc,recipient_hint,subject,body,dedupe_key,created_at,contains_health,body_enc,protection_version)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,2) ON CONFLICT(dedupe_key) DO NOTHING RETURNING id`,
             [id('msg'), containsHealth ? null : c.id, m.shopperId, c.channel, pii.encrypt(to), c.channel === 'email' ? maskEmail(to) : maskPhone(to), containsHealth ? '[health message]' : c.name, containsHealth ? '[health message]' : body, containsHealth ? health.messageDedupe(m.dedupe) : m.dedupe, now(), containsHealth, bodyEnc]);
         });
         if (!r) { skipped.push({ shopperId: m.shopperId, reason: 'NO_CONSENT' }); continue; }
@@ -194,11 +203,16 @@ export function createCrm(db, deps) {
       for (const c of await rows(db, "SELECT id FROM campaigns WHERE active AND kind='restock_reminder' ORDER BY created_at")) out.push(await crm.runCampaign(c.id));
       return out;
     },
-    async outbox({ shopperId, actor = 'admin', purpose = 'campaign', bypassConsent = false } = {}) {
-      await health.protectOutbox();
-      const list = await rows(db, `SELECT id,campaign_id,shopper_id,channel,recipient_hint,subject,body,status,created_at,contains_health,body_enc FROM message_outbox
-        ${shopperId ? 'WHERE shopper_id=$1' : ''} ORDER BY created_at,id`, shopperId ? [shopperId] : []);
-      return Promise.all(list.map(async ({ bodyEnc, containsHealth, ...m }) => {
+    async outbox({ shopperId, actor = 'admin', purpose = 'campaign', bypassConsent = false,limit=100,offset=0 } = {}) {
+      const exporting=limit===null && purpose==='dsar_export' && bypassConsent && shopperId;
+      if (!exporting) int(limit,'limit',1,500);
+      int(offset,'offset',0,100_000);
+      const params=exporting ? [shopperId] : shopperId ? [shopperId,limit,offset] : [limit,offset];
+      const list = await rows(db, `SELECT id,campaign_id,shopper_id,channel,recipient_hint,subject,body,status,created_at,contains_health,body_enc,protection_version FROM message_outbox
+        ${shopperId ? 'WHERE shopper_id=$1' : ''} ORDER BY created_at,id ${exporting ? '' : `LIMIT $${params.length-1} OFFSET $${params.length}`}`, params);
+      if (exporting && list.some(m=>m.protectionVersion<2)) fail('Complete this shopper’s legacy message migration before exporting their data.',409,'HEALTH_MESSAGE_MIGRATION_REQUIRED');
+      return Promise.all(list.map(async ({ bodyEnc, containsHealth,protectionVersion, ...m }) => {
+        if (protectionVersion<2) return {...m,campaignId:null,subject:'[legacy message migration pending]',body:'[legacy message migration pending]',healthWithheld:true,migrationPending:true};
         if (!containsHealth) return m;
         const decrypted = await health.readMessage(m.shopperId, bodyEnc, { actor, purpose, bypassConsent });
         return { ...m, campaignId: decrypted?.campaignId ?? null, subject: decrypted?.subject ?? '[health content withheld]', body: decrypted?.body ?? '[health content withheld]', healthWithheld: !decrypted };
@@ -213,8 +227,8 @@ export function createCrm(db, deps) {
         if (!s.consent?.[CHANNEL_CONSENT[channel]] && channel !== 'email') return null;
         const to = channel === 'email' ? pii.decrypt(s.emailEnc) : (pii.decrypt(s.profileEnc) || {}).phone;
         if (!to) return null;
-        const r = await tx.query(`INSERT INTO message_outbox(id,campaign_id,shopper_id,channel,recipient_enc,recipient_hint,subject,body,dedupe_key,created_at)
-          VALUES($1,NULL,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(dedupe_key) DO NOTHING RETURNING id`,
+        const r = await tx.query(`INSERT INTO message_outbox(id,campaign_id,shopper_id,channel,recipient_enc,recipient_hint,subject,body,dedupe_key,created_at,protection_version)
+          VALUES($1,NULL,$2,$3,$4,$5,$6,$7,$8,$9,2) ON CONFLICT(dedupe_key) DO NOTHING RETURNING id`,
           [id('msg'), shopperId, channel, pii.encrypt(to), channel === 'email' ? maskEmail(to) : maskPhone(to), text(subject, 200), text(body, 4000), dedupeKey || id('tx'), now()]);
         return r.rows[0]?.id || null;
       });

@@ -490,7 +490,14 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
           await tx.query("UPDATE transfers SET status='reversed',reversed_cents=amount_cents WHERE id=$1",[transfer.id]);
           await event(tx,'transfer.reversed',transfer.id,bag.brandId,{bagId:bag.id,amountCents:transfer.amountCents});
         } else await tx.query("UPDATE transfers SET status='cancelled' WHERE id=$1",[transfer.id]);
-        await journal(tx,`refund:${refund.id}`,'sandbox_refund',bag,[debit('brand_payable',bag.transferCents),debit('commission_revenue',bag.commissionCents),debit('tax_payable',bag.taxCents),credit('sandbox_clearing',bag.totalCents)]);
+        const waiver=await first(tx,`SELECT COALESCE(SUM(e.credit_cents-e.debit_cents),0)::int AS amount
+          FROM ledger_entries e JOIN ledger_journals j ON j.id=e.journal_id
+          WHERE j.bag_id=$1 AND e.account='sandbox_payable_writeoff_adjustment'`,[bag.id]);
+        if (waiver.amount!==0 && waiver.amount!==bag.transferCents) fail('Reconcile the prior payable waiver before refunding this Bag.',409,'LEDGER_RECONCILIATION_REQUIRED');
+        // A noncash operator payable waiver did not refund the shopper. Preserve
+        // their refund path, reversing that waiver rather than double-debiting
+        // the brand payable that was already cancelled.
+        await journal(tx,`refund:${refund.id}`,'sandbox_refund',bag,[debit(waiver.amount ? 'sandbox_payable_writeoff_adjustment' : 'brand_payable',bag.transferCents),debit('commission_revenue',bag.commissionCents),debit('tax_payable',bag.taxCents),credit('sandbox_clearing',bag.totalCents)]);
         const earned=await first(tx,'SELECT * FROM credits WHERE bag_id=$1',[bag.id]);
         if (earned.status!=='voided') {
           if (earned.amountCents) await journal(tx,`credit-void:${bag.id}`,'credit_voided',bag,[debit(earned.status==='released'?'credit_vault':'credit_pending',earned.amountCents),credit('loyalty_expense',earned.amountCents)]);
