@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { requireScope } from '../auth.mjs';
+import { registerPortalRoutes, portalMcpTools } from './portal-routes.mjs';
 
 /** REST surface for the platform modules. Admin routes require the operations
  * workspace; brand routes are tenant-scoped to the session/bearer brand. */
@@ -147,6 +148,7 @@ export function registerPlatformRoutes(app, h) {
   registerMoneyRoutes(app, h, admin);
   registerBrandRoutes(app, h, admin);
   registerCommerceRoutes(app, h, admin, actor);
+  registerPortalRoutes(app, h);
   for (const extra of h.extra || []) extra(app, h);
 }
 
@@ -271,6 +273,7 @@ export function platformMcpTools(platform) {
     write('upload_catalog_csv', 'Import catalog rows from CSV (Avafem columns or a Shopify product export). Products enter human review.', { csv: zz.string().min(1).max(3_000_000) }, 'mcp:upload_catalog_csv', input => { need('catalog:write'); return platform.brands.importCsv(ctx.brandId, input.csv); });
     read('check_product_compliance', 'Screen draft listing text for disease/drug claims, missing supplement disclaimers and restricted ingredients before submitting.', { title: zz.string().max(500), description: zz.string().max(20000).optional(), category: zz.string().max(200).optional(), claims: zz.array(zz.string().max(3000)).max(100).optional(), ingredients: zz.array(zz.string().max(300)).max(300).optional() }, input => { need('catalog:read'); return platform.compliance.check({ title: input.title, description: input.description || '', category: input.category || '', evidence: { claims: (input.claims || []).map(text => ({ text, type: 'structure' })), ingredients_inci: input.ingredients || [] } }); });
     read('get_compliance_report', 'List your products that are blocked or flagged by the listing compliance check.', {}, () => { need('catalog:read'); return platform.compliance.scanBrand(ctx.brandId); });
+    portalMcpTools(platform)({ read, write, ctx, z: zz });
     for (const extra of platform.mcpExtras || []) extra({ read, write, ctx, z: zz, need });
   };
 }

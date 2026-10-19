@@ -586,7 +586,7 @@ export async function createApp(options = {}) {
   }
   app.post('/api/sandbox/orders', async request => { requireAdmin(await browserRoute(request)); return data(await sandboxOrder(request.body)); });
   app.post('/api/brands/:id/credentials', async request => { requireAdmin(await browserRoute(request)); await domain.getBrand(request.params.id); return data(await auth.createCredential(request.params.id, request.body)); });
-  app.get('/api/brands/:id/credentials', async request => { const ctx = await browserRoute(request); brandScope(ctx, request.params.id); return data(await auth.listCredentials(request.params.id)); });
+  app.get('/api/brands/:id/credentials', async request => { const ctx = await browserRoute(request, 'credentials:manage'); brandScope(ctx, request.params.id); return data(await auth.listCredentials(request.params.id)); });
   app.delete('/api/brands/:id/credentials/:credentialId', async request => { requireAdmin(await browserRoute(request)); return data(await auth.revokeCredential(request.params.id, request.params.credentialId)); });
   app.post('/api/brands/:id/invite', async(request,reply)=>{
     const ctx=await browserRoute(request);requireAdmin(ctx);await domain.getBrand(request.params.id);
@@ -725,7 +725,8 @@ export async function createApp(options = {}) {
   app.get('/openapi.json', async () => openApiDocument(config.publicBaseUrl || `http://127.0.0.1:${config.port}`));
   app.get('/.well-known/oauth-authorization-server', async () => ({ issuer: config.publicBaseUrl || `http://127.0.0.1:${config.port}`, token_endpoint: `${config.publicBaseUrl || `http://127.0.0.1:${config.port}`}/oauth/token`, grant_types_supported: ['client_credentials'], token_endpoint_auth_methods_supported: ['client_secret_basic','client_secret_post'], scopes_supported: BRAND_SCOPES }));
   app.get('/.well-known/oauth-protected-resource', async () => ({ resource: `${config.publicBaseUrl || `http://127.0.0.1:${config.port}`}/mcp`, authorization_servers: [config.publicBaseUrl || `http://127.0.0.1:${config.port}`], scopes_supported: BRAND_SCOPES, bearer_methods_supported: ['header'] }));
-  registerPlatformRoutes(app, { platform, browserRoute, context, brandScope, requireAdmin, data, apiMutation });
+  registerPlatformRoutes(app, { platform, browserRoute, context, brandScope, requireAdmin, data, apiMutation, setSessionCookie,
+    clearSessionCookie: reply => reply.clearCookie('avf_session', { path: '/', httpOnly: true, sameSite: 'strict', secure: Boolean(config.publicBaseUrl?.startsWith('https:')) }) });
   await registerMcp(app, { auth, context, actions, extraTools: platformMcpTools(platform) });
   const dist = resolve(ROOT, 'dist');
   if (existsSync(dist)) await app.register(staticFiles, { root: dist, prefix: '/' });

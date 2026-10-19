@@ -8,6 +8,7 @@ import { createSubscriptions, createShipping, createPrivacy } from './commerce.m
 import { createBeautyBank, createRisk, createConsole, createReports } from './money.mjs';
 import {createCuration} from './curation.mjs';
 import {createOnboarding} from './onboarding.mjs';
+import {createBrandPortal} from './brand-portal.mjs';
 import {createInviteDelivery,createResendInviteAdapter} from './invite-delivery.mjs';
 
 /** Avafem platform modules layered on the canonical sandbox core. Email/SMS and
@@ -33,6 +34,7 @@ export async function createPlatform(db, options) {
   const email=options.inviteDelivery || {};
   platform.inviteDelivery=createInviteDelivery(db,{auth,domain,clock,secret,publicBaseUrl:email.publicBaseUrl || options.publicBaseUrl,
     adapter:email.adapter || (email.enableExternal===true ? createResendInviteAdapter({apiKey:email.apiKey,from:email.from}) : null),allowExternal:email.enableExternal===true});
+  platform.portal=createBrandPortal(db,{auth,domain,brands:platform.brands,reports:platform.reports,secret,clock,publicBaseUrl:options.publicBaseUrl});
   platform.subscriptions = createSubscriptions(db, { clock, domain, crm: platform.crm, health, bank: platform.bank, secret, charge: options.subscriptionCharge });
   platform.shipping = createShipping(db, { clock });
   platform.privacy = createPrivacy(db, { clock, crm: platform.crm, health, bank: platform.bank, secret });
