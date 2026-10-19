@@ -1,6 +1,14 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual, createCipheriv, createDecipheriv } from 'node:crypto';
 
 export const BRAND_SCOPES = ['catalog:read', 'catalog:write', 'orders:read', 'orders:fulfill', 'payouts:read', 'refunds:write'];
+// Session-only brand portal scopes. API/OAuth credentials keep BRAND_SCOPES.
+export const PORTAL_SCOPES = ['reports:read', 'members:manage', 'credentials:manage'];
+export const MEMBER_ROLES = ['owner', 'staff', 'finance'];
+export const ROLE_SCOPES = Object.freeze({
+  owner: Object.freeze([...BRAND_SCOPES, ...PORTAL_SCOPES]),
+  staff: Object.freeze(['catalog:read', 'catalog:write', 'orders:read', 'orders:fulfill', 'refunds:write']),
+  finance: Object.freeze(['payouts:read', 'reports:read']),
+});
 export const hash = value => createHash('sha256').update(String(value)).digest('hex');
 const random = (size = 32) => randomBytes(size).toString('base64url');
 const fail = (statusCode, code, message) => Object.assign(new Error(message), { statusCode, code });
@@ -12,6 +20,18 @@ export async function createAuth(db, { sessionSecret, encryptionKey, issuer = 'a
   const schema = `CREATE TABLE IF NOT EXISTS auth_sessions (
     token_hash TEXT PRIMARY KEY, owner BOOLEAN NOT NULL DEFAULT false, brand_id TEXT,
     csrf_token TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  ); CREATE TABLE IF NOT EXISTS brand_members (
+    id TEXT PRIMARY KEY, brand_id TEXT NOT NULL, email_key TEXT NOT NULL, email_enc TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('owner','staff','finance')), status TEXT NOT NULL CHECK (status IN ('invited','active','removed')),
+    password_hash TEXT, failed_logins INT NOT NULL DEFAULT 0, locked_until TIMESTAMPTZ, invited_by TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), last_login_at TIMESTAMPTZ, removed_at TIMESTAMPTZ,
+    UNIQUE(brand_id,email_key)
+  ); CREATE TABLE IF NOT EXISTS brand_login_tokens (
+    token_hash TEXT PRIMARY KEY, member_id TEXT NOT NULL, brand_id TEXT NOT NULL, purpose TEXT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL, consumed_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  ); CREATE TABLE IF NOT EXISTS brand_auth_outbox (
+    id TEXT PRIMARY KEY, member_id TEXT NOT NULL, brand_id TEXT NOT NULL, purpose TEXT NOT NULL,
+    to_enc TEXT NOT NULL, body_enc TEXT NOT NULL, simulated BOOLEAN NOT NULL DEFAULT true, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
   ); CREATE TABLE IF NOT EXISTS api_credentials (
     id TEXT PRIMARY KEY, brand_id TEXT NOT NULL, kind TEXT NOT NULL, secret_hash TEXT NOT NULL UNIQUE,
     scopes JSONB NOT NULL, label TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT true,
@@ -31,6 +51,9 @@ export async function createAuth(db, { sessionSecret, encryptionKey, issuer = 'a
     resource_id TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
   )`;
   for (const statement of schema.split(';').filter(part => part.trim())) await db.query(statement);
+  await db.query('ALTER TABLE auth_sessions ADD COLUMN IF NOT EXISTS member_id TEXT');
+  await db.query('CREATE INDEX IF NOT EXISTS auth_sessions_member ON auth_sessions(member_id)');
+  await db.query('CREATE INDEX IF NOT EXISTS brand_login_tokens_member ON brand_login_tokens(member_id,created_at)');
   // Preserve older opaque invitation rows. Domain-separated opaque IDs permit
   // revocation/history without exposing either bearer tokens or their hashes.
   await db.transaction(async tx => {
@@ -61,17 +84,31 @@ export async function createAuth(db, { sessionSecret, encryptionKey, issuer = 'a
     const decipher = createDecipheriv('aes-256-gcm', encryption, iv); decipher.setAuthTag(tag);
     return JSON.parse(Buffer.concat([decipher.update(data), decipher.final()]).toString());
   }
-  async function createSession({ owner = false, brandId = null } = {}) {
+  async function createSession({ owner = false, brandId = null, memberId = null } = {}) {
+    if (memberId && (owner || !brandId)) throw fail(500, 'SESSION_INVALID', 'Member sessions are brand-only.');
     const token = random(); const csrfToken = random(); const expiresAt = new Date(now() + 12 * 3600_000);
-    await db.query('INSERT INTO auth_sessions(token_hash,owner,brand_id,csrf_token,expires_at) VALUES($1,$2,$3,$4,$5)', [hash(token), owner, brandId, csrfToken, expiresAt]);
-    return { token, csrfToken, owner, brandId, role: brandId ? 'brand' : owner ? 'admin' : 'brand', expiresAt };
+    await db.query('INSERT INTO auth_sessions(token_hash,owner,brand_id,csrf_token,expires_at,member_id) VALUES($1,$2,$3,$4,$5,$6)', [hash(token), owner, brandId, csrfToken, expiresAt, memberId]);
+    return { token, csrfToken, owner, brandId, memberId, role: brandId ? 'brand' : owner ? 'admin' : 'brand', expiresAt };
   }
+  // Member role and status are read live on every request, so demotion or
+  // removal takes effect immediately. Invite-link and owner-workspace brand
+  // sessions (no member row) keep the original full brand owner authority.
   async function resolveSession(token) {
-    if (!token) return null;
-    const { rows } = await db.query('SELECT * FROM auth_sessions WHERE token_hash=$1 AND expires_at>$2', [hash(token), new Date(now())]);
+    if (!token || typeof token !== 'string' || token.length > 200) return null;
+    const { rows } = await db.query(`SELECT s.*,m.role AS member_role,m.status AS member_status,m.brand_id AS member_brand FROM auth_sessions s
+      LEFT JOIN brand_members m ON m.id=s.member_id WHERE s.token_hash=$1 AND s.expires_at>$2`, [hash(token), new Date(now())]);
     const row = rows[0];
-    return row ? { tokenHash: row.token_hash, csrfToken: row.csrf_token, owner: row.owner, brandId: row.brand_id,
-      role: row.brand_id ? 'brand' : row.owner ? 'admin' : 'brand', scopes: BRAND_SCOPES, expiresAt: row.expires_at } : null;
+    if (!row) return null;
+    if (row.member_id && (row.member_status !== 'active' || row.member_brand !== row.brand_id || !ROLE_SCOPES[row.member_role])) {
+      await db.query('DELETE FROM auth_sessions WHERE token_hash=$1', [row.token_hash]); return null;
+    }
+    const memberRole = row.brand_id ? (row.member_id ? row.member_role : 'owner') : null;
+    return { tokenHash: row.token_hash, csrfToken: row.csrf_token, owner: row.owner, brandId: row.brand_id, memberId: row.member_id || null, memberRole,
+      role: row.brand_id ? 'brand' : row.owner ? 'admin' : 'brand', scopes: row.brand_id ? [...ROLE_SCOPES[memberRole]] : BRAND_SCOPES, expiresAt: row.expires_at };
+  }
+  async function deleteSession(tokenHash) { await db.query('DELETE FROM auth_sessions WHERE token_hash=$1', [tokenHash]); }
+  async function deleteMemberSessions(memberId, exceptTokenHash = null) {
+    await db.query('DELETE FROM auth_sessions WHERE member_id=$1 AND token_hash IS DISTINCT FROM $2', [memberId, exceptTokenHash]);
   }
   async function switchBrand(session, brandId) {
     if (!session?.owner) throw fail(403, 'OWNER_REQUIRED', 'Only the workspace owner can change the preview workspace.');
@@ -248,7 +285,7 @@ export async function createAuth(db, { sessionSecret, encryptionKey, issuer = 'a
     return outcome;
   }
   async function audit(context, action, resourceId = null) {
-    await db.query('INSERT INTO audit_log(actor,brand_id,action,resource_id) VALUES($1,$2,$3,$4)', [context?.credentialId || context?.role || 'system', context?.brandId || null, action, resourceId]);
+    await db.query('INSERT INTO audit_log(actor,brand_id,action,resource_id) VALUES($1,$2,$3,$4)', [context?.credentialId || (context?.memberId ? `member:${context.memberId}` : null) || context?.role || 'system', context?.brandId || null, action, resourceId]);
   }
   // Protect earlier cached responses before serving a persisted workspace again.
   while (true) {
@@ -259,7 +296,7 @@ export async function createAuth(db, { sessionSecret, encryptionKey, issuer = 'a
     });
     if (!changed) break;
   }
-  return { createSession, resolveSession, switchBrand, createCredential, listCredentials, revokeCredential,
+  return { deleteSession, deleteMemberSessions, createSession, resolveSession, switchBrand, createCredential, listCredentials, revokeCredential,
     issueToken, resolveBearer, createInvite, lookupInvite, consumeInvite, listInvites, revokeInvite, replaceInvite, rateLimit, idempotent, audit, encrypt, decrypt };
 }
 
