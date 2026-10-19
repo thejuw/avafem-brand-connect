@@ -52,7 +52,47 @@ export function registerPlatformRoutes(app, h) {
   app.post('/v1/tickets/:id/replies', (r, reply) => apiMutation(r, reply, (ctx, input) => crm.replyTicket(input.id, input.body, ctx.brandId), { id: r.params.id, body: r.body || {} }, 'orders:read'));
 
   registerMoneyRoutes(app, h, admin);
+  registerBrandRoutes(app, h, admin);
   for (const extra of h.extra || []) extra(app, h);
+}
+
+function registerBrandRoutes(app, h, admin) {
+  const { platform, browserRoute, context, brandScope, data, apiMutation } = h;
+  const side = platform.brands;
+  const brandRoute = async (r, scope) => { const ctx = await browserRoute(r, scope); const brandId = brandScope(ctx, r.params.brandId || r.params.id || r.body?.brandId || r.query.brandId); if (!brandId) throw Object.assign(new Error('brandId is required.'), { statusCode: 422, code: 'VALIDATION_ERROR' }); return { ctx, brandId }; };
+  // ---- Phase 3: self-serve portal ----
+  app.post('/api/portal/signup', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } }, async r => {
+    const i = z.object({ brandName: z.string().min(1).max(160), email: z.string().max(320), website: z.string().max(500).optional(), category: z.string().max(100).optional(), contactName: z.string().max(120).optional() }).parse(r.body);
+    const out = await side.signup(i); await platform.auth.audit({ role: 'public' }, 'portal.signup', out.brandId); return data(out); });
+  app.get('/api/portal/review-queue', async r => { await admin(r); return data(await side.reviewQueue()); });
+  app.get('/api/portal/:brandId/status', async r => { const { brandId } = await brandRoute(r, 'catalog:read'); return data(await side.status(brandId)); });
+  app.patch('/api/portal/:brandId/profile', async r => { const { brandId } = await brandRoute(r, 'catalog:write'); return data(await side.updateProfile(brandId, r.body || {})); });
+  app.post('/api/portal/:brandId/stripe/link', async r => { const { brandId } = await brandRoute(r, 'payouts:read'); return data(await side.stripeLink(brandId)); });
+  app.post('/api/portal/:brandId/stripe/return', async r => { const { ctx, brandId } = await brandRoute(r, 'payouts:read'); const out = await side.stripeReturn(brandId); await platform.auth.audit(ctx, 'portal.stripe_onboarded', brandId); return data(out); });
+  app.post('/api/portal/:brandId/connect', async r => { const { ctx, brandId } = await brandRoute(r, 'catalog:write'); const i = z.object({ platform: z.enum(['shopify', 'woocommerce', 'bigcommerce', 'csv']), credentials: z.record(z.string(), z.string().max(500)).optional() }).parse(r.body); const out = await side.connect(brandId, i.platform, i.credentials); await platform.auth.audit(ctx, `connector.${i.platform}.connected`, brandId); return data(out); });
+  app.get('/api/portal/:brandId/connectors', async r => { const { brandId } = await brandRoute(r, 'catalog:read'); return data(await side.connectors(brandId)); });
+  app.post('/api/portal/:brandId/connectors/:platform/sync', async r => { const { brandId } = await brandRoute(r, 'catalog:write'); return data(await side.sync(brandId, r.params.platform)); });
+  app.delete('/api/portal/:brandId/connectors/:platform', async r => { const { brandId } = await brandRoute(r, 'catalog:write'); return data(await side.disconnect(brandId, r.params.platform)); });
+  app.post('/api/portal/:brandId/catalog/csv', async r => { const { brandId } = await brandRoute(r, 'catalog:write'); return data(await side.importCsv(brandId, r.body?.csv)); });
+  app.post('/api/portal/:brandId/activate', async r => { const ctx = await admin(r); const out = await side.activate(r.params.brandId); await platform.auth.audit(ctx, 'brand.activated', r.params.brandId); return data(out); });
+  app.post('/api/connectors/orders/:bagId/push', async r => { await admin(r); return data(await side.pushOrder(r.params.bagId)); });
+  // ---- Analytics ----
+  app.get('/api/brands/:id/analytics', async r => { const { brandId } = await brandRoute(r, 'orders:read'); return data(await side.analytics(brandId, r.query)); });
+  app.get('/v1/analytics', async r => { const ctx = await context(r, { scope: 'orders:read' }); return data(await side.analytics(ctx.brandId, r.query)); });
+  // ---- Paid placements ----
+  const placementBody = z.object({ kind: z.enum(['featured_spot', 'sponsored_swipe', 'sampling_box']), productId: z.string().min(1), startsAt: z.string().datetime().optional(), endsAt: z.string().datetime().optional(), units: z.number().int().optional(), brandId: z.string().optional() });
+  app.post('/api/placements', async r => { const { brandId } = await brandRoute(r, 'catalog:write'); return data(await side.requestPlacement(brandId, placementBody.parse(r.body))); });
+  app.get('/api/placements', async r => { const ctx = await browserRoute(r, 'catalog:read'); return data(await side.listPlacements(brandScope(ctx, r.query.brandId))); });
+  app.post('/api/placements/:id/decision', async r => { const ctx = await admin(r); const out = await side.decidePlacement(r.params.id, r.body?.decision, { method: r.body?.method }); await platform.auth.audit(ctx, `placement.${r.body?.decision}`, r.params.id); return data(out); });
+  app.post('/api/placements/:id/cancel', async r => { const ctx = await browserRoute(r, 'catalog:write'); const brandId = ctx.brandId || r.body?.brandId; return data(await side.cancelPlacement(brandId, r.params.id)); });
+  app.get('/api/billing', async r => { const ctx = await browserRoute(r, 'payouts:read'); return data(await side.billing(brandScope(ctx, r.query.brandId))); });
+  app.post('/api/billing/:id/paid', async r => { await admin(r); return data(await side.markBillingPaid(r.params.id)); });
+  app.get('/api/placements/feed/:kind', async r => { await admin(r); return data(await side.feed(r.params.kind, { limit: Number(r.query.limit) || 10 })); });
+  app.post('/api/placements/:id/click', async r => { await admin(r); return data(await side.click(r.params.id)); });
+  app.get('/v1/placements', async r => { const ctx = await context(r, { scope: 'catalog:read' }); return data(await side.listPlacements(ctx.brandId)); });
+  app.post('/v1/placements', (r, reply) => apiMutation(r, reply, (ctx, input) => side.requestPlacement(ctx.brandId, placementBody.parse(input)), r.body, 'catalog:write'));
+  app.get('/v1/billing', async r => { const ctx = await context(r, { scope: 'payouts:read' }); return data(await side.billing(ctx.brandId)); });
+  app.post('/v1/catalog/csv', (r, reply) => apiMutation(r, reply, (ctx, input) => side.importCsv(ctx.brandId, input?.csv), r.body, 'catalog:write'));
 }
 
 function registerMoneyRoutes(app, h, admin) {
@@ -100,6 +140,11 @@ export function platformMcpTools(platform) {
     write('reply_support_ticket', 'Reply to a support ticket linked to one of your Bags. The shopper is notified via the simulated outbox.', { id: zz.string(), body: zz.string().min(1).max(4000) }, 'mcp:reply_support_ticket', input => { need('orders:read'); return platform.crm.replyTicket(input.id, { body: input.body }, ctx.brandId); });
     read('list_disputes', 'List chargeback disputes on your Bags (simulated Stripe disputes).', {}, () => { need('payouts:read'); return platform.console.listDisputes(ctx.brandId); });
     read('get_annual_payout_report', 'Read your 1099-K style annual gross volume and net transfer data.', { year: zz.number().int().min(2000).max(2100) }, async input => { need('payouts:read'); const r = await platform.reports.brandAnnualPayouts(input.year, ctx.brandId); return r.brands[0]; });
+    read('get_brand_analytics', 'Read your sales, conversion, returns and top products.', { from: zz.string().optional(), to: zz.string().optional() }, input => { need('orders:read'); return platform.brands.analytics(ctx.brandId, input); });
+    read('get_onboarding_status', 'Read your self-serve onboarding checklist and next step.', {}, () => { need('catalog:read'); return platform.brands.status(ctx.brandId); });
+    read('list_placements', 'List your paid placements, sponsored swipe cards and sampling boxes.', {}, () => { need('catalog:read'); return platform.brands.listPlacements(ctx.brandId); });
+    write('request_placement', 'Request a paid placement for an approved product. Avafem approves it and issues a billing record.', { kind: zz.enum(['featured_spot', 'sponsored_swipe', 'sampling_box']), productId: zz.string(), units: zz.number().int().optional(), startsAt: zz.string().optional(), endsAt: zz.string().optional() }, 'mcp:request_placement', input => { need('catalog:write'); return platform.brands.requestPlacement(ctx.brandId, input); });
+    write('upload_catalog_csv', 'Import catalog rows from CSV (Avafem columns or a Shopify product export). Products enter human review.', { csv: zz.string().min(1).max(3_000_000) }, 'mcp:upload_catalog_csv', input => { need('catalog:write'); return platform.brands.importCsv(ctx.brandId, input.csv); });
     for (const extra of platform.mcpExtras || []) extra({ read, write, ctx, z: zz, need });
   };
 }

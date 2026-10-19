@@ -51,3 +51,23 @@ CREATE TABLE IF NOT EXISTS disputes (
 );
 CREATE TABLE IF NOT EXISTS platform_alerts (id TEXT PRIMARY KEY, kind TEXT NOT NULL, severity TEXT NOT NULL, resource_id TEXT, message TEXT NOT NULL, dedupe_key TEXT NOT NULL UNIQUE, acknowledged_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL);
 CREATE TABLE IF NOT EXISTS risk_assessments (id TEXT PRIMARY KEY, subject_type TEXT NOT NULL, subject_id TEXT, score INTEGER NOT NULL, decision TEXT NOT NULL, signals JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL);
+CREATE TABLE IF NOT EXISTS brand_applications (
+  brand_id TEXT PRIMARY KEY, contact_enc TEXT NOT NULL, website TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT '',
+  steps JSONB NOT NULL DEFAULT '{}', created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS brand_connectors (
+  brand_id TEXT NOT NULL, platform TEXT NOT NULL CHECK (platform IN ('shopify','woocommerce','bigcommerce','csv')),
+  credentials_enc TEXT, store_ref TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'connected', last_sync_at TIMESTAMPTZ, last_result JSONB,
+  created_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (brand_id, platform)
+);
+CREATE TABLE IF NOT EXISTS connector_orders (bag_id TEXT PRIMARY KEY, brand_id TEXT NOT NULL, platform TEXT NOT NULL, external_id TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL);
+CREATE TABLE IF NOT EXISTS placements (
+  id TEXT PRIMARY KEY, brand_id TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('featured_spot','sponsored_swipe','sampling_box')),
+  product_id TEXT NOT NULL, starts_at TIMESTAMPTZ NOT NULL, ends_at TIMESTAMPTZ NOT NULL, units INTEGER NOT NULL DEFAULT 0,
+  price_cents INTEGER NOT NULL CHECK (price_cents>=0), status TEXT NOT NULL CHECK (status IN ('requested','approved','rejected','cancelled')),
+  impressions INTEGER NOT NULL DEFAULT 0, clicks INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS billing_records (
+  id TEXT PRIMARY KEY, brand_id TEXT NOT NULL, placement_id TEXT NOT NULL UNIQUE REFERENCES placements(id), amount_cents INTEGER NOT NULL CHECK (amount_cents>=0),
+  status TEXT NOT NULL CHECK (status IN ('invoiced','paid','void')), method TEXT NOT NULL DEFAULT 'invoice', created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL
+);

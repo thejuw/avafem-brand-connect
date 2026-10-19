@@ -57,11 +57,41 @@ addPaths([
   ['get', '/v1/disputes', 'listBrandDisputes', 'payouts:read'],
   ['get', '/v1/reports/payouts', 'brandAnnualPayoutReport', 'payouts:read'],
 ]);
+addPaths([
+  ['post', '/api/portal/signup', 'portalSignup', 'public', { type: 'object', required: ['brandName', 'email'] }],
+  ['get', '/api/portal/review-queue', 'adminCatalogReviewQueue', 'admin'],
+  ['get', '/api/portal/{brandId}/status', 'portalStatus', 'catalog:read'],
+  ['patch', '/api/portal/{brandId}/profile', 'portalProfile', 'catalog:write', { type: 'object' }],
+  ['post', '/api/portal/{brandId}/stripe/link', 'portalStripeLink', 'payouts:read'],
+  ['post', '/api/portal/{brandId}/stripe/return', 'portalStripeReturn', 'payouts:read'],
+  ['post', '/api/portal/{brandId}/connect', 'portalConnect', 'catalog:write', { type: 'object', required: ['platform'] }],
+  ['get', '/api/portal/{brandId}/connectors', 'portalConnectors', 'catalog:read'],
+  ['post', '/api/portal/{brandId}/connectors/{platform}/sync', 'portalConnectorSync', 'catalog:write'],
+  ['delete', '/api/portal/{brandId}/connectors/{platform}', 'portalConnectorDisconnect', 'catalog:write'],
+  ['post', '/api/portal/{brandId}/catalog/csv', 'portalCsvImport', 'catalog:write', { type: 'object', required: ['csv'] }],
+  ['post', '/api/portal/{brandId}/activate', 'adminActivateBrand', 'admin'],
+  ['post', '/api/connectors/orders/{bagId}/push', 'adminPushConnectorOrder', 'admin'],
+  ['get', '/api/brands/{id}/analytics', 'brandAnalytics', 'orders:read'],
+  ['get', '/v1/analytics', 'brandAnalyticsApi', 'orders:read'],
+  ['post', '/api/placements', 'requestPlacement', 'catalog:write', { type: 'object', required: ['kind', 'productId'] }],
+  ['get', '/api/placements', 'listPlacements', 'catalog:read'],
+  ['post', '/api/placements/{id}/decision', 'adminDecidePlacement', 'admin', { type: 'object', required: ['decision'] }],
+  ['post', '/api/placements/{id}/cancel', 'cancelPlacement', 'catalog:write'],
+  ['get', '/api/billing', 'listBilling', 'payouts:read'],
+  ['post', '/api/billing/{id}/paid', 'adminMarkBillingPaid', 'admin'],
+  ['get', '/api/placements/feed/{kind}', 'adminPlacementFeed', 'admin'],
+  ['post', '/api/placements/{id}/click', 'adminPlacementClick', 'admin'],
+  ['get', '/v1/placements', 'listPlacementsApi', 'catalog:read'],
+  ['post', '/v1/placements', 'requestPlacementApi', 'catalog:write', { type: 'object', required: ['kind', 'productId'] }],
+  ['get', '/v1/billing', 'listBillingApi', 'payouts:read'],
+  ['post', '/v1/catalog/csv', 'importCatalogCsvApi', 'catalog:write', { type: 'object', required: ['csv'] }],
+]);
 export function mergePlatformPaths(doc, operation) {
   for (const [method, path, operationId, scope, body] of PLATFORM_PATHS) {
     const params = [...path.matchAll(/\{(\w+)\}/g)].map(m => ({ name: m[1], in: 'path', required: true, schema: { type: 'string' } }));
     const op = operation(operationId, scope === 'admin' ? 'admin' : scope, body || null, params);
-    if (scope === 'admin' || path.startsWith('/api/')) { op.security = [{ sessionCookie: [] }]; op.tags = [scope === 'admin' ? 'operator' : 'brand-session']; }
+    if (scope === 'public') { op.security = []; op.tags = ['public']; }
+    else if (scope === 'admin' || path.startsWith('/api/')) { op.security = [{ sessionCookie: [] }]; op.tags = [scope === 'admin' ? 'operator' : 'brand-session']; }
     doc.paths[path] = { ...(doc.paths[path] || {}), [method]: op };
   }
   doc.components.securitySchemes = { ...(doc.components.securitySchemes || {}), sessionCookie: { type: 'apiKey', in: 'cookie', name: 'avf_session', description: 'Browser session; mutations also need x-csrf-token.' } };

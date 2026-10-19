@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { exec } from './util.mjs';
 import { createHealthVault } from './health.mjs';
 import { createCrm } from './crm.mjs';
+import { createBrandSide } from './brands.mjs';
 import { createBeautyBank, createRisk, createConsole, createReports } from './money.mjs';
 
 /** Avafem backend + CRM platform modules layered on the canonical sandbox core.
@@ -16,6 +17,8 @@ export async function createPlatform(db, options) {
   platform.risk = createRisk(db, { clock });
   platform.console = createConsole(db, { clock, domain, risk: platform.risk });
   platform.reports = createReports(db, { domain });
+  platform.brands = createBrandSide(db, { clock, domain, auth, secret, shopifyConnections: options.shopifyConnections, ...(options.fetch ? { fetch: options.fetch } : {}),
+    compliance: { check: (...a) => platform.compliance?.check(...a) ?? null, scanBrand: (...a) => platform.compliance?.scanBrand(...a) ?? null } });
   platform.afterRefund = bagId => platform.bank.reverseRefunded(bagId);
   platform.refundBag = async (bagId, reason) => {
     const refund = await domain.requestRefund(bagId, { reason });
