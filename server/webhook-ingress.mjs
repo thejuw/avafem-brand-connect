@@ -7,7 +7,7 @@ export function createWebhookIngress({ backendPort = 4317, request: forward = ht
   if (!Number.isSafeInteger(backendPort) || backendPort < 1024 || backendPort > 65535) throw new Error('Invalid loopback backend port.');
   const allowed = new Set(['/webhooks/shopify', '/webhooks/stripe']);
   const headers = ['content-type', 'x-shopify-hmac-sha256', 'x-shopify-shop-domain', 'x-shopify-topic',
-    'x-shopify-webhook-id', 'x-shopify-triggered-at', 'stripe-signature'];
+    'x-shopify-webhook-id', 'x-shopify-event-id', 'x-shopify-triggered-at', 'stripe-signature'];
   return http.createServer((incoming, response) => {
     const reject = (status, code) => {
       response.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });

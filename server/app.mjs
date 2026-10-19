@@ -670,9 +670,12 @@ export async function createApp(options = {}) {
     if (!SHOPIFY_ALLOWED_WEBHOOK_TOPICS.includes(topic)) throw fail(400, 'WEBHOOK_TOPIC_NOT_ALLOWED', 'This Shopify topic is outside the configured subscription allowlist.');
     if (topic === 'app/uninstalled' && request.body?.myshopify_domain !== expected)
       throw fail(400, 'SHOP_MISMATCH', 'The signed uninstall payload does not match the webhook store.');
-    if (registry) await providerEvents.queue({ provider: 'shopify', deliveryId: request.headers['x-shopify-webhook-id'], topic,
+    // Shopify retries reuse X-Shopify-Webhook-Id, but the same event can arrive on several
+    // subscriptions/API versions; X-Shopify-Event-Id is the documented dedupe key when present.
+    const shopifyDeliveryId = String(request.headers['x-shopify-event-id'] || request.headers['x-shopify-webhook-id'] || '') || undefined;
+    if (registry) await providerEvents.queue({ provider: 'shopify', deliveryId: shopifyDeliveryId, topic,
       shop: expected, payload: request.body, occurredAt: request.headers['x-shopify-triggered-at'] });
-    return operations.saveInbound('shopify', request.headers['x-shopify-webhook-id'], topic, request.rawBody, expected,
+    return operations.saveInbound('shopify', shopifyDeliveryId, topic, request.rawBody, expected,
       { brandId: registry?.brandId || installed?.brandId, occurredAt: request.headers['x-shopify-triggered-at'] });
   });
   app.post('/webhooks/stripe', async request => {
