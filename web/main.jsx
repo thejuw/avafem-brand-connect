@@ -43,6 +43,7 @@ import TestCheckoutPanel from './TestCheckoutPanel.jsx';
 import UnifiedCheckoutPanel from './UnifiedCheckoutPanel.jsx';
 import PlatformPanel from './PlatformPanel.jsx';
 import BrandOnboarding from './BrandOnboarding.jsx';
+import BrandPortal from './BrandPortal.jsx';
 import {createScopeFence} from './lib/scope-fence.mjs';
 import { resolveUnifiedCheckoutReturn } from './lib/unified-checkout.mjs';
 
@@ -3784,9 +3785,11 @@ function AccessPage({ kind, token }) {
 }
 
 const accessRoute = resolveAccessRoute(window.location.pathname);
+// The brand portal owns its own session; it never bootstraps the owner workspace.
+const brandPortalRoute = /^\/brand(\/|$)/.test(window.location.pathname);
 createRoot(document.getElementById("root")).render(
   <WorkspaceErrorBoundary onRecover={() => window.location.reload()}>
-    {accessRoute ? (
+    {brandPortalRoute ? <BrandPortal /> : accessRoute ? (
       accessRoute.kind==='invite' ? <BrandOnboarding token={accessRoute.token}/> : <AccessPage kind={accessRoute.kind} token={accessRoute.token} />
     ) : (
       <App />
