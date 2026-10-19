@@ -76,3 +76,39 @@ Tests: `tests/platform-money.test.mjs`.
 | Paid placements: `featured_spot` ($25/day), `sponsored_swipe` ($10 per 1,000 impressions), `sampling_box` ($1.50/unit); approved product only; operator approval creates an `invoiced` billing record (`invoice` or `payout_offset`); cancel before start voids it; shopper feed caps sponsored swipes at purchased impressions | `/api/placements…`, `/api/billing…`, `/v1/placements`, `/v1/billing`, MCP `list_placements`, `request_placement` |
 
 Tests: `tests/platform-brands.test.mjs` (WooCommerce/BigCommerce HTTP fully mocked).
+
+## Phase 4 — Commerce + compliance
+
+| Capability | Where |
+|---|---|
+| Cross-brand subscriptions / auto-replenish: one subscription holds items from several brands; each renewal creates one canonical sandbox order (core splits into per-brand Bags), a **mocked** Stripe charge (`pm_…` test method; ids `sub_sim_…`/`pi_sim_…`), links the order to the shopper and earns Beauty Bank credit. Declines release the renewal Bags (sandbox refund), retry daily, and after 3 failures go `past_due` with a service notice in the simulated outbox. Optional `alignToCycle` schedules the next box 3 days before the next period (health consent; access logged). Ship-to is encrypted. | `server/platform/commerce.mjs`, `POST /api/crm/shoppers/:id/subscriptions`, `GET /api/subscriptions`, `POST /api/subscriptions/:id/status`, `GET …/runs`, `POST /api/subscriptions/run`, background worker |
+| Shipping rules: free-shipping threshold on cart merchandise subtotal; the waived shipping is funded from each Bag's commission, capped at that commission (any excess is reported as `absorbedCents`). Quote API for checkout; per-order booking of subsidies (idempotent) and a subsidy report. The core order/transfer math is unchanged — brands still receive their shipping; the shopper discount is applied at charge time. | `GET/PUT /api/shipping/rules`, `POST /api/shipping/quote`, `POST /api/shipping/orders/:orderId/apply`, `GET /api/shipping/subsidies` |
+| Health data separation: intake + cycle live only in `health_records`, encrypted with a dedicated purpose-bound AES-256-GCM key (separate from shopper-PII and credential keys); every read/write needs a declared purpose and is written to `health_access_log`; reads require `health` consent (except DSAR export) | `server/platform/health.mjs`, `GET /api/privacy/shoppers/:id/health-access-log` |
+| DSAR export (profile, orders, health, access log, reviews, tickets, messages, Beauty Bank, subscriptions) and erasure (`confirm: "DELETE"`): deletes health and swipes, wipes PII/consent, redacts tickets/outbox, hides reviews and removes them from the brand feed, cancels subscriptions, forfeits open credits (journaled), keeps de-identified orders/Bags for tax and accounting | `POST /api/privacy/shoppers/:id/export`, `POST /api/privacy/shoppers/:id/delete`, `GET /api/privacy/requests` |
+| Listing compliance check: rule-based flags for disease claims (verb + condition, e.g. "treats bacterial vaginosis"), drug/regulatory claims ("antibiotic", "FDA approved"), risky claims (warn), supplements missing the DSHEA disclaimer or contraindications, banned/restricted ingredients. **Approval gate:** `POST /api/products/:id/review` with `approved` returns `409 COMPLIANCE_BLOCKED` while blocking flags remain, unless an operator records an override (reason ≥ 10 chars) that is bound to the exact listing content (any edit invalidates it) | `server/platform/compliance.mjs`, `POST /api/compliance/check`, `GET /api/products/:id/compliance`, `POST …/compliance/override`, `GET /api/compliance/brands/:id`, `GET /v1/compliance`, MCP `check_product_compliance`, `get_compliance_report` |
+
+The rule lists are a screening aid, not legal advice; keep a human reviewer and counsel in the loop.
+
+Tests: `tests/platform-commerce.test.mjs`.
+
+## Running locally
+
+```bash
+export PATH=/home/box/node-v24.22.0-linux-x64/bin:$PATH   # Node 24 required (Map.groupBy etc.)
+npm ci
+npm test && npm run check && npm run build
+npm start            # http://127.0.0.1:4317 → "Backend & CRM" in the nav
+```
+
+All platform jobs (subscription renewals, Beauty Bank maturity/expiry/reversal, restock reminders,
+alert scan) run in the existing 5 s background worker and on demand via `POST /api/crm/jobs/run`.
+
+## Needs live credentials / production work (not done here)
+
+* Stripe: real Express AccountLinks + `account.updated`, real subscription/PaymentIntent charges
+  (off-session, SCA), real dispute webhooks (`charge.dispute.*`) feeding `openDispute`, discount
+  application of free shipping on the PaymentIntent, 1099-K reconciliation with Stripe's own filings.
+* Email/SMS provider (outbox is simulated), with unsubscribe links and STOP handling.
+* WooCommerce/BigCommerce: real store credentials, webhooks for order/fulfillment sync back.
+* A shopper-facing auth layer (shopper endpoints are operator-only here).
+* Legal/tax review of the compliance rule lists, sales-tax nexus/filing, credit (Beauty Bank) escheat rules, and HIPAA/state health-privacy (e.g. WA MHMDA) obligations.

@@ -14,6 +14,10 @@ export const PLATFORM_SECTIONS = [
   { id: 'review', label: 'Catalog review queue', path: '/api/portal/review-queue', adminOnly: true, note: 'Approve or reject with the existing catalog review action; compliance flags appear per product.' },
   { id: 'placements', label: 'Placements', path: '/api/placements' },
   { id: 'billing', label: 'Placement billing', path: '/api/billing' },
+  { id: 'subscriptions', label: 'Subscriptions', path: '/api/subscriptions', adminOnly: true, actions: [{ label: 'Run due renewals', path: '/api/subscriptions/run' }] },
+  { id: 'shipping', label: 'Free-shipping rule', path: '/api/shipping/rules', adminOnly: true },
+  { id: 'subsidies', label: 'Shipping subsidies', path: '/api/shipping/subsidies', adminOnly: true },
+  { id: 'privacy', label: 'Privacy requests', path: '/api/privacy/requests', adminOnly: true, note: 'Export and erase run per shopper via the API; erasure needs confirm: "DELETE".' },
 ];
 export function platformRows(data) {
   if (Array.isArray(data)) return data;
