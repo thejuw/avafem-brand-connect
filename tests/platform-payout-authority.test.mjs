@@ -32,7 +32,7 @@ test('raw fake account flags cannot create newflow completion claims, clear hold
   const dispute=await f.platform.console.openDispute({externalId:'dp_fake_payout_proof',bagId:bag.id});await f.platform.console.resolveDispute(dispute.id,'won');
   const transfer=(await f.domain.listTransfers({brandId}))[0];assert.equal(transfer.status,'held');assert.equal((await f.domain.listJobs({brandId}))[0].status,'held');
   await assert.rejects(f.platform.console.releaseHold(transfer.id,{idempotencyKey:'fake_payout_release',reason:'Attempted release using synthetic unverified flags.'},'test_owner'),e=>e.code==='HOLD_BLOCKED');
-  await f.db.query("UPDATE transfers SET status='scheduled' WHERE bag_id=$1",[bag.id]);await f.db.query("UPDATE jobs SET status='scheduled' WHERE bag_id=$1",[bag.id]);
+  await f.db.query("UPDATE transfers SET status='scheduled' WHERE bag_id=$1",[bag.id]);await f.db.query("UPDATE jobs SET status='scheduled',due_at=NOW()-interval '1 day' WHERE bag_id=$1",[bag.id]);
   const credit=(await f.domain.listCredits({brandId}))[0];
   await assert.rejects(f.platform.console.resolvePendingCredit(credit.id,{action:'release',idempotencyKey:'fake_credit_release',reason:'Attempted credit release with unverified payout flags.'},'test_owner'),e=>e.code==='CREDIT_RELEASE_BLOCKED');
   assert.equal(await f.platform.bank.mature(),0);
