@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS message_outbox (
   recipient_hint TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '', body TEXT NOT NULL, dedupe_key TEXT NOT NULL UNIQUE,
   status TEXT NOT NULL DEFAULT 'simulated' CHECK (status IN ('simulated')), created_at TIMESTAMPTZ NOT NULL
 );
+ALTER TABLE message_outbox ADD COLUMN IF NOT EXISTS contains_health BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE message_outbox ADD COLUMN IF NOT EXISTS body_enc TEXT;
 CREATE TABLE IF NOT EXISTS support_tickets (
   id TEXT PRIMARY KEY, shopper_id TEXT REFERENCES shoppers(id), order_id TEXT, bag_id TEXT, brand_id TEXT, shipment_id TEXT,
   subject TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','pending_brand','resolved')),
@@ -78,7 +80,22 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   failures INTEGER NOT NULL DEFAULT 0, last_error TEXT, next_run_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL
 );
 CREATE TABLE IF NOT EXISTS subscription_runs (id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL, cycle INTEGER NOT NULL, status TEXT NOT NULL, order_id TEXT, charge_ref TEXT, amount_cents INTEGER, error TEXT, created_at TIMESTAMPTZ NOT NULL, UNIQUE(subscription_id,cycle,status));
+CREATE TABLE IF NOT EXISTS subscription_attempts (
+  id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL REFERENCES subscriptions(id),
+  cycle INTEGER NOT NULL CHECK (cycle>0), attempt INTEGER NOT NULL CHECK (attempt>0), status TEXT NOT NULL,
+  amount_cents INTEGER, order_id TEXT REFERENCES orders(id), charge_ref TEXT, error TEXT,
+  created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
+  UNIQUE(subscription_id,cycle,attempt)
+);
 CREATE TABLE IF NOT EXISTS shipping_rules (id TEXT PRIMARY KEY, free_threshold_cents INTEGER NOT NULL CHECK (free_threshold_cents>=0), enabled BOOLEAN NOT NULL DEFAULT TRUE, updated_at TIMESTAMPTZ NOT NULL);
 CREATE TABLE IF NOT EXISTS shipping_subsidies (bag_id TEXT PRIMARY KEY, order_id TEXT NOT NULL, brand_id TEXT NOT NULL, shipping_cents INTEGER NOT NULL, funded_from_commission_cents INTEGER NOT NULL, absorbed_cents INTEGER NOT NULL, created_at TIMESTAMPTZ NOT NULL);
 CREATE TABLE IF NOT EXISTS privacy_requests (id TEXT PRIMARY KEY, shopper_id TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('export','delete')), status TEXT NOT NULL, result JSONB, requested_by TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ);
 CREATE TABLE IF NOT EXISTS compliance_overrides (product_id TEXT PRIMARY KEY, reason TEXT NOT NULL, actor TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL);
+-- Repair copies left by the previous erasure implementation, including shoppers
+-- whose tombstones correctly prevent a second interactive erasure request.
+UPDATE subscriptions SET ship_to_enc=NULL,status='cancelled'
+  WHERE shopper_id IN (SELECT id FROM shoppers WHERE deleted_at IS NOT NULL);
+UPDATE support_tickets SET subject='[erased]',messages=(SELECT COALESCE(jsonb_agg(jsonb_set(m,'{body}','"[erased]"')),'[]'::jsonb) FROM jsonb_array_elements(messages) m)
+  WHERE shopper_id IN (SELECT id FROM shoppers WHERE deleted_at IS NOT NULL);
+UPDATE message_outbox SET subject='[erased]',body='[erased]',body_enc=NULL,recipient_enc='erased',recipient_hint='erased'
+  WHERE shopper_id IN (SELECT id FROM shoppers WHERE deleted_at IS NOT NULL);

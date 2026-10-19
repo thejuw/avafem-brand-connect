@@ -37,7 +37,7 @@ const address = value => {
 /** Sandbox business core. Amounts are integer USD cents. Optional brandId
  * arguments constrain reads and writes to that tenant; admin authorization is
  * supplied by the HTTP layer. Every mutation and its outbox event commit together. */
-export function createDomain(db, { clock = () => new Date(), protectShipping, revealShipping } = {}) {
+export function createDomain(db, { clock = () => new Date(), protectShipping, revealShipping, beforeProductApproval } = {}) {
   const now = () => new Date(typeof clock === 'function' ? clock() : clock.now());
   const iso = () => now().toISOString();
   const protectedAddress=value=>value && typeof value==='object' && Object.hasOwn(value,'encryptedShipping');
@@ -122,6 +122,49 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
     await event(tx,'payout.scheduled',bag.id,bag.brandId,{bagId:bag.id,dueAt,amountCents:transfer.amountCents,
       returnWindowDays:releaseDays(bag,brand),reason:'return_window_extended'});
     return result;
+  }
+
+  // Quotes and order creation share validation, stock accounting and the fixed
+  // sandbox pricing policy. A quote never reserves stock or emits paid orders.
+  async function planSandboxOrder(tx,input,shipTo) {
+    if (input.currency && input.currency!=='USD') fail('Only USD sandbox orders are supported.');
+    if (!Array.isArray(input.items) || !input.items.length || input.items.length>100) fail('Provide 1–100 catalog items.');
+    const grouped=new Map(), allocations=new Map();
+    for (const line of input.items) {
+      const qty=integer(line.qty ?? line.quantity ?? 1,'qty',1,1000);
+      const brand=await brandRow(tx,line.brandId);
+      if (brand.status==='disconnected' || brand.status==='paused') fail('This brand is unavailable for new sandbox orders.',409,'BRAND_UNAVAILABLE');
+      const found=await first(tx,"SELECT * FROM products WHERE brand_id=$1 AND sku=$2 AND status='approved'",[brand.id,line.sku]);
+      if (!found) fail(`Approved product ${line.sku} not found for this brand.`,409,'PRODUCT_UNAVAILABLE');
+      if (!allocations.has(found.id)) allocations.set(found.id,structuredClone(found));
+      const product=allocations.get(found.id);
+      let price=product.priceCents,inventory=product.inventoryQty,variantIndex=-1;
+      if (line.variantSku) {
+        variantIndex=product.variants.findIndex(variant=>variant.sku===line.variantSku);
+        if (variantIndex<0) fail('Variant SKU is not part of this brand product.');
+        price=product.variants[variantIndex].price.amount; inventory=product.variants[variantIndex].inventory.qty;
+      }
+      if (inventory<qty) fail(`Insufficient inventory for ${line.variantSku||line.sku}.`,409,'INSUFFICIENT_STOCK');
+      integer(price*qty,'Line total');
+      if (variantIndex<0) product.inventoryQty-=qty;
+      else product.variants[variantIndex].inventory.qty-=qty;
+      if (!grouped.has(brand.id)) grouped.set(brand.id,{brand,items:[],subtotal:0});
+      const group=grouped.get(brand.id);
+      group.items.push({sku:product.sku,...(line.variantSku?{variantSku:line.variantSku}:{}),title:product.title,qty,unitPriceCents:price});
+      group.subtotal+=price*qty;
+    }
+    const groups=[...grouped.values()];
+    for (const group of groups) {
+      group.shipping=group.brand.shippingTable.find(rate=>rate.country===shipTo.country)?.priceCents ?? 0;
+      // Explicitly fixed sandbox fixture, not a live tax engine or tax advice.
+      group.tax=Math.round(group.subtotal*825/10000);
+      group.commission=Math.round(group.subtotal*group.brand.commissionBps/10000);
+    }
+    const subtotal=groups.reduce((sum,g)=>sum+g.subtotal,0),shipping=groups.reduce((sum,g)=>sum+g.shipping,0),tax=groups.reduce((sum,g)=>sum+g.tax,0);
+    integer(subtotal+shipping+tax,'Order total',1);
+    if (input.expectedTotalCents!==undefined && integer(input.expectedTotalCents,'Expected order total',1)!==subtotal+shipping+tax)
+      fail('The sandbox quote changed; no paid order was created.',409,'QUOTE_CHANGED');
+    return {groups,allocations,subtotal,shipping,tax};
   }
 
   async function bagView(tx, bag) {
@@ -262,11 +305,13 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
     },
     async reviewProduct(productId,input = {},brandId) {
       return db.transaction(async tx => {
+        await tx.query('SELECT id FROM products WHERE id=$1 FOR UPDATE',[productId]);
         const product=await owned(tx,'products',productId,brandId);
         const status=input.status || (input.approved===true?'approved':input.approved===false?'rejected':null);
         if (!['approved','rejected'].includes(status)) fail('Review status must be approved or rejected.');
         const issues=validateProduct(product);
         if (status==='approved' && issues.length) fail('Resolve catalog validation issues before approval.',409,'CATALOG_INVALID');
+        if (status==='approved' && beforeProductApproval) await beforeProductApproval(product,tx);
         const result=await first(tx,'UPDATE products SET status=$2,review_note=$3,validation_issues=$4,updated_at=$5 WHERE id=$1 RETURNING *',
           [productId,status,text(input.note,2000),json(issues),iso()]);
         await event(tx,`product.${status}`,productId,product.brandId,{productId,sku:product.sku,status});
@@ -279,8 +324,18 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
       return Promise.all(result.map(bag=>bagView(db,bag)));
     },
     async getBag(bagId,brandId) { return bagView(db,await owned(db,'bags',bagId,brandId)); },
-    async createSandboxOrder(input = {}) {
+    async quoteSandboxOrder(input = {}) {
       return db.transaction(async tx => {
+        const shipTo=address(input.shipTo);
+        const {subtotal,shipping,tax}=await planSandboxOrder(tx,input,shipTo);
+        return {subtotalCents:subtotal,shippingCents:shipping,taxCents:tax,totalCents:subtotal+shipping+tax,currency:'USD'};
+      });
+    },
+    async createSandboxOrder(input = {}, { beforeCreate } = {}) {
+      return db.transaction(async tx => {
+        // Server-only lifecycle guard, serialized with cancellation/erasure. It
+        // must never contain a provider request; payment already ran outside tx.
+        if (beforeCreate) await beforeCreate(tx);
         if (input.currency && input.currency!=='USD') fail('Only USD sandbox orders are supported.');
         if (!Array.isArray(input.items) || !input.items.length || input.items.length>100) fail('Provide 1–100 catalog items.');
         const shipTo=address(input.shipTo);
@@ -299,44 +354,16 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
             return {...previous,bags:await Promise.all(previousBags.map(bag=>bagView(tx,bag)))};
           }
         }
-        const grouped=new Map();
-        for (const line of input.items) {
-          const qty=integer(line.qty ?? line.quantity ?? 1,'qty',1,1000);
-          const brand=await brandRow(tx,line.brandId);
-          if (brand.status==='disconnected' || brand.status==='paused') fail('This brand is unavailable for new sandbox orders.',409,'BRAND_UNAVAILABLE');
-          const product=await first(tx,"SELECT * FROM products WHERE brand_id=$1 AND sku=$2 AND status='approved'",[brand.id,line.sku]);
-          if (!product) fail(`Approved product ${line.sku} not found for this brand.`,409,'PRODUCT_UNAVAILABLE');
-          let price=product.priceCents, inventory=product.inventoryQty;
-          let variantIndex=-1;
-          if (line.variantSku) {
-            variantIndex=product.variants.findIndex(variant=>variant.sku===line.variantSku);
-            if (variantIndex<0) fail('Variant SKU is not part of this brand product.');
-            price=product.variants[variantIndex].price.amount; inventory=product.variants[variantIndex].inventory.qty;
-          }
-          if (inventory<qty) fail(`Insufficient inventory for ${line.variantSku||line.sku}.`,409,'INSUFFICIENT_STOCK');
-          integer(price*qty,'Line total');
-          if (variantIndex<0) await tx.query('UPDATE products SET inventory_qty=inventory_qty-$2,updated_at=$3 WHERE id=$1',[product.id,qty,iso()]);
-          else {
-            const variants=structuredClone(product.variants); variants[variantIndex].inventory.qty-=qty;
-            await tx.query('UPDATE products SET variants=$2,updated_at=$3 WHERE id=$1',[product.id,json(variants),iso()]);
-          }
-          if (!grouped.has(brand.id)) grouped.set(brand.id,{brand,items:[],subtotal:0});
-          const group=grouped.get(brand.id);
-          group.items.push({sku:product.sku,...(line.variantSku?{variantSku:line.variantSku}:{}),title:product.title,qty,unitPriceCents:price});
-          group.subtotal+=price*qty;
-          await event(tx,'inventory.changed',product.id,brand.id,{sku:product.sku,quantityChange:-qty});
+        const {groups,allocations,subtotal,shipping,tax}=await planSandboxOrder(tx,input,shipTo);
+        for (const product of allocations.values()) {
+          await tx.query('UPDATE products SET inventory_qty=$2,variants=$3,updated_at=$4 WHERE id=$1',[product.id,product.inventoryQty,json(product.variants),iso()]);
+        }
+        for (const group of groups) for (const line of group.items) {
+          const product=[...allocations.values()].find(p=>p.brandId===group.brand.id && p.sku===line.sku);
+          await event(tx,'inventory.changed',product.id,group.brand.id,{sku:product.sku,quantityChange:-line.qty});
         }
         const orderId=id('ord'); const orderRef=input.externalId?`SANDBOX-${text(input.externalId,100)}`:`SANDBOX-${randomUUID().slice(0,8).toUpperCase()}`;
         const storedShipTo=await protectAddress(shipTo);
-        const groups=[...grouped.values()];
-        for (const group of groups) {
-          group.shipping=group.brand.shippingTable.find(rate=>rate.country===shipTo.country)?.priceCents ?? 0;
-          // Explicitly fixed sandbox fixture, not a live tax engine or tax advice.
-          group.tax=Math.round(group.subtotal*825/10000);
-          group.commission=Math.round(group.subtotal*group.brand.commissionBps/10000);
-        }
-        const subtotal=groups.reduce((sum,g)=>sum+g.subtotal,0), shipping=groups.reduce((sum,g)=>sum+g.shipping,0), tax=groups.reduce((sum,g)=>sum+g.tax,0);
-        integer(subtotal+shipping+tax,'Order total',1);
         const order=await first(tx,`INSERT INTO orders(id,order_ref,subtotal_cents,shipping_cents,tax_cents,total_cents,created_at)
           VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[orderId,orderRef,subtotal,shipping,tax,subtotal+shipping+tax,iso()]);
         const created=[];
@@ -473,7 +500,7 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
         await tx.query("UPDATE jobs SET status='cancelled' WHERE bag_id=$1 AND status IN ('scheduled','held','failed')",[bag.id]);
         await tx.query("UPDATE bags SET status='refunded',refunded_cents=total_cents,updated_at=$2 WHERE id=$1",[bag.id,iso()]);
         await tx.query("UPDATE orders SET refunded_cents=refunded_cents+$2,status=CASE WHEN refunded_cents+$2=total_cents THEN 'refunded' ELSE 'partially_refunded' END WHERE id=$1",[bag.orderId,bag.totalCents]);
-        const result=await first(tx,"UPDATE refunds SET status='approved',approved_at=$2 WHERE id=$1 RETURNING *",[refund.id,iso()]);
+        const result=await first(tx,"UPDATE refunds SET status='approved',approved_at=$2,subtotal_cents=$3,shipping_cents=$4,tax_cents=$5,commission_cents=$6 WHERE id=$1 RETURNING *",[refund.id,iso(),bag.subtotalCents,bag.shippingCents,bag.taxCents,bag.commissionCents]);
         await event(tx,'refund.issued',refund.id,bag.brandId,{refundId:refund.id,bagId:bag.id,amountCents:refund.amountCents,taxCents:bag.taxCents,commissionCents:bag.commissionCents,transferCents:bag.transferCents});
         return result;
       });

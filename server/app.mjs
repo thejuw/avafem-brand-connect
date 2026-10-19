@@ -3,7 +3,7 @@ import cookie from '@fastify/cookie';
 import rateLimit from '@fastify/rate-limit';
 import staticFiles from '@fastify/static';
 import { existsSync } from 'node:fs';
-import { randomUUID, randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomUUID, randomBytes, timingSafeEqual, createHash } from 'node:crypto';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
@@ -63,7 +63,15 @@ export async function createApp(options = {}) {
   const db = options.db || await createDatabase({ dataDir: options.dataDir, connectionString: options.connectionString });
   await db.migrate();
   const auth = await createAuth(db, { sessionSecret: config.sessionSecret, encryptionKey: config.encryptionKey, issuer: config.publicBaseUrl || 'avafem-local' });
-  const domain = createDomain(db, { ...options.domainOptions, protectShipping: auth.encrypt, revealShipping: auth.decrypt });
+  let platform;
+  const domain = createDomain(db, { ...options.domainOptions, protectShipping: auth.encrypt, revealShipping: auth.decrypt,
+    beforeProductApproval: async (product, tx) => {
+      const productId = product.id;
+      if (options.domainOptions?.beforeProductApproval) await options.domainOptions.beforeProductApproval(product, tx);
+      if (!platform?.compliance) throw fail(503, 'COMPLIANCE_UNAVAILABLE', 'Listing compliance is not initialized.');
+      const result = await platform.compliance.check(productId, tx);
+      if (!result?.canGoLive) throw fail(409, 'COMPLIANCE_BLOCKED', 'Resolve blocking compliance findings or approve an exact-content override.');
+    } });
   await domain.encryptExistingShipping();
   const shopifyConnections = await createShopifyConnections(db, auth, { publicBaseUrl: config.publicBaseUrl, ...(options.shopifyOAuth || {}) });
   let testStores, unifiedCheckout, providerEvents;
@@ -95,7 +103,7 @@ export async function createApp(options = {}) {
   providerEvents = await createProviderEvents(db, auth, { unifiedCheckout, stores: testStores, providerMoney, providerFulfillment, providerCatalog });
   const providerJobs = createProviderJobs(db, { unifiedCheckout, providerEvents, providerMoney, providerFulfillment,
     catalog: providerCatalog, reconciliation: providerReconciliation, taxReconciliation: providerTaxReconciliation, automation: providerAutomation });
-  const platform = await createPlatform(db, { domain, auth, shopifyConnections, secret: config.encryptionKey, ...(options.domainOptions?.clock ? { clock: options.domainOptions.clock } : {}), ...(options.platform || {}) });
+  platform = await createPlatform(db, { domain, auth, shopifyConnections, secret: config.encryptionKey, ...(options.domainOptions?.clock ? { clock: options.domainOptions.clock } : {}), ...(options.platform || {}) });
   if (options.seed !== false) await seedDatabase(db, domain);
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 3 * 1024 * 1024, trustProxy: false });
   await app.register(cookie);
@@ -673,9 +681,15 @@ export async function createApp(options = {}) {
     if (!SHOPIFY_ALLOWED_WEBHOOK_TOPICS.includes(topic)) throw fail(400, 'WEBHOOK_TOPIC_NOT_ALLOWED', 'This Shopify topic is outside the configured subscription allowlist.');
     if (topic === 'app/uninstalled' && request.body?.myshopify_domain !== expected)
       throw fail(400, 'SHOP_MISMATCH', 'The signed uninstall payload does not match the webhook store.');
-    // Shopify retries reuse X-Shopify-Webhook-Id, but the same event can arrive on several
-    // subscriptions/API versions; X-Shopify-Event-Id is the documented dedupe key when present.
-    const shopifyDeliveryId = String(request.headers['x-shopify-event-id'] || request.headers['x-shopify-webhook-id'] || '') || undefined;
+    // Event-Id spans subscriptions/topics/API serializations. The durable queue
+    // binds an exact envelope, so use the delivery ID, not that broader identity.
+    // Legacy Event-Id-only senders get a scoped envelope key; normal retries of
+    // the same signed body still dedupe, while valid variants remain independent.
+    const webhookId = String(request.headers['x-shopify-webhook-id'] || '');
+    const eventId = String(request.headers['x-shopify-event-id'] || '');
+    const shopifyDeliveryId = webhookId || (eventId ? `shopify-event:${createHash('sha256').update(JSON.stringify([
+      expected,topic,eventId,String(request.headers['x-shopify-api-version'] || ''),String(request.headers['x-shopify-triggered-at'] || ''),request.body,
+    ])).digest('hex')}` : undefined);
     if (registry) await providerEvents.queue({ provider: 'shopify', deliveryId: shopifyDeliveryId, topic,
       shop: expected, payload: request.body, occurredAt: request.headers['x-shopify-triggered-at'] });
     return operations.saveInbound('shopify', shopifyDeliveryId, topic, request.rawBody, expected,

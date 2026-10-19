@@ -7,8 +7,10 @@ import { createCompliance } from './compliance.mjs';
 import { createSubscriptions, createShipping, createPrivacy } from './commerce.mjs';
 import { createBeautyBank, createRisk, createConsole, createReports } from './money.mjs';
 
-/** Avafem backend + CRM platform modules layered on the canonical sandbox core.
- * All external delivery (email/SMS, Stripe, Shopify, Woo, BigCommerce) is simulated. */
+/** Avafem platform modules layered on the canonical sandbox core. Email/SMS and
+ * subscription charges are simulated. Explicitly connected Woo/BigCommerce
+ * adapters use bounded real HTTPS unless a test transport is injected. These
+ * features do not replace or certify the provider-backed unified checkout. */
 export async function createPlatform(db, options) {
   const { domain, auth, secret, clock = () => new Date() } = options;
   await exec(db, await readFile(new URL('./schema.sql', import.meta.url), 'utf8'));

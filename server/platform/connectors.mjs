@@ -1,31 +1,115 @@
 import { fail, text } from './util.mjs';
+import { lookup } from 'node:dns/promises';
+import https from 'node:https';
+import { isIP } from 'node:net';
+import { validatePublicHttpsUrl } from '../integrations/webhooks.mjs';
 
 /** Store-platform adapters behind one interface:
  *   verify(credentials) -> { storeRef }
  *   listProducts(credentials) -> normalized product rows ({ sku, title, description, priceCents, inventoryQty, images, category })
  *   createOrder(credentials, bag) -> { externalId }
- * All network access goes through the injected `fetch`, so tests run fully mocked. */
+ * The default transport pins a checked public DNS address in HTTPS and never redirects.
+ * Tests may inject both `fetch` and `resolve`; neither requires a real network call. */
 const cents = value => { const n = Number(String(value ?? '').replace(/[^0-9.]/g, '')); return Number.isFinite(n) ? Math.round(n * 100) : 0; };
 const strip = html => String(html || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-const httpsUrl = (value, name) => { let u; try { u = new URL(value); } catch { fail(`${name} must be a URL.`); } if (u.protocol !== 'https:') fail(`${name} must use https.`); return u.origin; };
-async function call(fetch, url, init) {
-  const r = await fetch(url, init);
-  if (r.status === 401 || r.status === 403) fail('The store rejected these credentials.', 401, 'CONNECTOR_UNAUTHORIZED');
-  if (r.status === 429) fail('The store is rate limiting requests; retry later.', 429, 'CONNECTOR_RATE_LIMITED');
-  if (!r.ok) fail(`Store request failed (${r.status}).`, 502, 'CONNECTOR_ERROR');
-  return r.json();
+const httpsUrl = (value, name) => {
+  let u; try { u = new URL(value); } catch { fail(`${name} must be a URL.`); }
+  if (u.protocol !== 'https:' || u.username || u.password || u.hash) fail(`${name} must use https without credentials or fragments.`, 422, 'CONNECTOR_DESTINATION_DENIED');
+  return u.origin;
+};
+
+function pinnedRequest(checked, init, { request, signal, maxResponseBytes }) {
+  const pinned = checked.addresses[0];
+  return new Promise((resolve, reject) => {
+    const req = request(checked.url, {
+      method: init?.method || 'GET', headers: init?.headers, agent: false, signal,
+      lookup: (_hostname, options, callback) => {
+        const address = { address: pinned.address, family: isIP(pinned.address) };
+        if (options?.all) callback(null, [address]);
+        else callback(null, address.address, address.family);
+      },
+    }, res => {
+      const status = res.statusCode;
+      if (status < 200 || status >= 300) {
+        res.destroy();
+        resolve({ status, ok: false, redirected: false, url: checked.url.href });
+        return;
+      }
+      let size = 0; const chunks = [];
+      res.on('data', chunk => {
+        size += chunk.length;
+        if (size > maxResponseBytes) {
+          reject(Object.assign(new Error('Store response exceeded the size limit.'), { statusCode: 502, code: 'CONNECTOR_RESPONSE_INVALID' }));
+          res.destroy(); req.destroy();
+        } else chunks.push(Buffer.from(chunk));
+      });
+      res.once('error', reject);
+      res.once('aborted', () => reject(new Error('Store response aborted.')));
+      res.once('end', () => resolve({ status, ok: true, redirected: false, url: checked.url.href,
+        json: async () => JSON.parse(Buffer.concat(chunks).toString('utf8')) }));
+    });
+    req.once('error', reject);
+    req.end(init?.body);
+  });
 }
 
-export function woocommerceAdapter({ fetch }) {
+/** One bounded request, including DNS and body parsing. No automatic retry or redirect. */
+function createCall({ fetch, getFetch, resolve = lookup, getResolve, request = https.request, timeoutMs = 10_000, maxResponseBytes = 2_000_000 } = {}) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) fail('Invalid connector timeout.');
+  if (!Number.isSafeInteger(maxResponseBytes) || maxResponseBytes < 1 || maxResponseBytes > 5_000_000) fail('Invalid connector response limit.');
+  return async (url, init = {}) => {
+    const controller = new AbortController();
+    let timer;
+    const deadline = new Promise((_, reject) => { timer = setTimeout(() => {
+      reject(Object.assign(new Error('The store request timed out; its outcome is not verified.'), { statusCode: 504, code: 'CONNECTOR_TIMEOUT' }));
+      controller.abort();
+    }, timeoutMs); });
+    try {
+      return await Promise.race([deadline, (async () => {
+        let checked;
+        try {
+          checked = await validatePublicHttpsUrl(url, { resolve: getResolve ? getResolve() : resolve });
+          // The retired 6bone allocation is not a public destination either.
+          if (checked.addresses.some(({ address }) => /^3ffe:/i.test(address))) throw new Error('Reserved address.');
+        }
+        catch { fail('The store must resolve only to public HTTPS addresses.', 422, 'CONNECTOR_DESTINATION_DENIED'); }
+        const injected = getFetch ? getFetch() : fetch;
+        // Native fetch cannot pin a checked DNS result. Use native HTTPS for the
+        // production default; only explicitly injected test transports use fetch.
+        const r = injected && injected !== globalThis.fetch
+          ? await injected(checked.url.href, { ...init, redirect: 'manual', signal: controller.signal })
+          : await pinnedRequest(checked, init, { request, signal: controller.signal, maxResponseBytes });
+        if (r?.redirected || (r?.url && r.url !== checked.url.href) || (r?.status >= 300 && r.status < 400))
+          fail('Store redirects are not allowed.', 502, 'CONNECTOR_REDIRECT_DENIED');
+        if (r?.status === 401 || r?.status === 403) fail('The store rejected these credentials.', 401, 'CONNECTOR_UNAUTHORIZED');
+        if (r?.status === 429) fail('The store is rate limiting requests; retry later.', 429, 'CONNECTOR_RATE_LIMITED');
+        if (!Number.isInteger(r?.status) || r.status < 200 || r.status >= 300 || r.ok !== true) fail('The store request failed.', 502, 'CONNECTOR_ERROR');
+        return await r.json();
+      })()]);
+    } catch (error) {
+      if (['CONNECTOR_DESTINATION_DENIED', 'CONNECTOR_REDIRECT_DENIED', 'CONNECTOR_UNAUTHORIZED', 'CONNECTOR_RATE_LIMITED', 'CONNECTOR_TIMEOUT', 'CONNECTOR_RESPONSE_INVALID', 'CONNECTOR_ERROR'].includes(error?.code)) throw error;
+      fail('The store request could not be verified.', 502, 'CONNECTOR_ERROR');
+    } finally { clearTimeout(timer); controller.abort(); }
+  };
+}
+
+const orderId = value => {
+  if ((typeof value !== 'number' && typeof value !== 'string') || !/^[1-9]\d{0,29}$/.test(String(value)) || (typeof value === 'number' && !Number.isSafeInteger(value)))
+    fail('The store did not return a valid order identity.', 502, 'CONNECTOR_RESPONSE_INVALID');
+  return String(value);
+};
+
+export function woocommerceAdapter(options = {}) {
+  const call = createCall(options);
   const auth = c => ({ authorization: `Basic ${Buffer.from(`${c.consumerKey}:${c.consumerSecret}`).toString('base64')}`, accept: 'application/json' });
   const base = c => { if (!c?.consumerKey?.startsWith('ck_') || !c?.consumerSecret?.startsWith('cs_')) fail('WooCommerce needs a ck_ consumer key and cs_ consumer secret.'); return `${httpsUrl(c.storeUrl, 'storeUrl')}/wp-json/wc/v3`; };
   return {
     platform: 'woocommerce',
-    async verify(c) { const info = await call(fetch, `${base(c)}/system_status`, { headers: auth(c) }); return { storeRef: text(info?.environment?.site_url || c.storeUrl, 300) }; },
+    async verify(c) { await call(`${base(c)}/system_status`, { headers: auth(c) }); return { storeRef: httpsUrl(c.storeUrl, 'storeUrl') }; },
     async listProducts(c) {
       const out = [];
       for (let page = 1; page <= 50; page++) {
-        const list = await call(fetch, `${base(c)}/products?per_page=100&page=${page}&status=publish`, { headers: auth(c) });
+        const list = await call(`${base(c)}/products?per_page=100&page=${page}&status=publish`, { headers: auth(c) });
         for (const p of list) out.push({ sku: text(p.sku, 120) || `WC-${p.id}`, title: text(p.name, 500), description: strip(p.description || p.short_description),
           priceCents: cents(p.price || p.regular_price), inventoryQty: Number.isInteger(p.stock_quantity) ? Math.max(0, p.stock_quantity) : 0,
           images: (p.images || []).map(i => i.src).filter(s => /^https:/.test(s)).slice(0, 20), category: text(p.categories?.[0]?.slug || '', 200), externalId: String(p.id) });
@@ -37,22 +121,23 @@ export function woocommerceAdapter({ fetch }) {
       const body = { status: 'processing', set_paid: true, customer_note: `Avafem ${bag.orderRef}`,
         shipping: { first_name: bag.shipTo.name, address_1: bag.shipTo.line1, address_2: bag.shipTo.line2 || '', city: bag.shipTo.city, state: bag.shipTo.region, postcode: bag.shipTo.postal, country: bag.shipTo.country },
         line_items: bag.items.map(i => ({ sku: i.sku, quantity: i.qty, total: ((i.unitPriceCents * i.qty) / 100).toFixed(2) })), meta_data: [{ key: 'avafem_bag_id', value: bag.id }] };
-      const o = await call(fetch, `${base(c)}/orders`, { method: 'POST', headers: { ...auth(c), 'content-type': 'application/json' }, body: JSON.stringify(body) });
-      return { externalId: String(o.id) };
+      const o = await call(`${base(c)}/orders`, { method: 'POST', headers: { ...auth(c), 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      return { externalId: orderId(o?.id) };
     },
   };
 }
 
-export function bigcommerceAdapter({ fetch }) {
+export function bigcommerceAdapter(options = {}) {
+  const call = createCall(options);
   const headers = c => ({ 'x-auth-token': c.accessToken, accept: 'application/json', 'content-type': 'application/json' });
   const base = c => { if (!/^[a-z0-9]{5,20}$/i.test(c?.storeHash || '') || !c?.accessToken) fail('BigCommerce needs a storeHash and accessToken.'); return `https://api.bigcommerce.com/stores/${c.storeHash}`; };
   return {
     platform: 'bigcommerce',
-    async verify(c) { const s = await call(fetch, `${base(c)}/v2/store`, { headers: headers(c) }); return { storeRef: text(s?.domain || c.storeHash, 300) }; },
+    async verify(c) { const s = await call(`${base(c)}/v2/store`, { headers: headers(c) }); return { storeRef: text(s?.domain || c.storeHash, 300) }; },
     async listProducts(c) {
       const out = [];
       for (let page = 1; page <= 50; page++) {
-        const r = await call(fetch, `${base(c)}/v3/catalog/products?include=images&limit=250&page=${page}&is_visible=true`, { headers: headers(c) });
+        const r = await call(`${base(c)}/v3/catalog/products?include=images&limit=250&page=${page}&is_visible=true`, { headers: headers(c) });
         for (const p of r.data || []) out.push({ sku: text(p.sku, 120) || `BC-${p.id}`, title: text(p.name, 500), description: strip(p.description),
           priceCents: cents(p.price), inventoryQty: Math.max(0, p.inventory_level || 0), images: (p.images || []).map(i => i.url_standard).filter(s => /^https:/.test(s)).slice(0, 20), category: '', externalId: String(p.id) });
         if (!r.meta?.pagination || page >= r.meta.pagination.total_pages) break;
@@ -63,8 +148,8 @@ export function bigcommerceAdapter({ fetch }) {
       const body = { status_id: 11, customer_id: 0, billing_address: { first_name: bag.shipTo.name, street_1: bag.shipTo.line1, city: bag.shipTo.city, state: bag.shipTo.region, zip: bag.shipTo.postal, country_iso2: bag.shipTo.country, email: 'orders@avafem.invalid' },
         shipping_addresses: [{ first_name: bag.shipTo.name, street_1: bag.shipTo.line1, city: bag.shipTo.city, state: bag.shipTo.region, zip: bag.shipTo.postal, country_iso2: bag.shipTo.country }],
         products: bag.items.map(i => ({ name: i.title || i.sku, sku: i.sku, quantity: i.qty, price_inc_tax: i.unitPriceCents / 100, price_ex_tax: i.unitPriceCents / 100 })), staff_notes: `Avafem ${bag.orderRef} / ${bag.id}` };
-      const o = await call(fetch, `${base(c)}/v2/orders`, { method: 'POST', headers: headers(c), body: JSON.stringify(body) });
-      return { externalId: String(o.id) };
+      const o = await call(`${base(c)}/v2/orders`, { method: 'POST', headers: headers(c), body: JSON.stringify(body) });
+      return { externalId: orderId(o?.id) };
     },
   };
 }

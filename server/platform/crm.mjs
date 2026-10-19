@@ -172,9 +172,19 @@ export function createCrm(db, deps) {
         if (!to) { skipped.push({ shopperId: m.shopperId, reason: 'NO_RECIPIENT' }); continue; }
         const body = c.template.replaceAll('{{firstName}}', p.firstName || 'there').replaceAll('{{nextPeriodStart}}', m.cycle?.nextPeriodStart || '')
           .replaceAll('{{cyclePhase}}', m.cycle?.phase || '');
-        const r = await db.query(`INSERT INTO message_outbox(id,campaign_id,shopper_id,channel,recipient_enc,recipient_hint,subject,body,dedupe_key,created_at)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(dedupe_key) DO NOTHING RETURNING id`,
-          [id('msg'), c.id, m.shopperId, c.channel, pii.encrypt(to), c.channel === 'email' ? maskEmail(to) : maskPhone(to), c.name, body, m.dedupe, now()]);
+        const containsHealth = Boolean(m.cycle || seg?.rules?.cyclePhase || seg?.rules?.concern || c.kind === 'restock_reminder' || /{{(?:nextPeriodStart|cyclePhase)}}/.test(c.template));
+        const bodyEnc = containsHealth ? await health.encryptMessage(m.shopperId, { subject: c.name, body, campaignId: c.id }, { actor: `campaign:${c.id}`, purpose: 'campaign' }) : null;
+        if (containsHealth && !bodyEnc) { skipped.push({ shopperId: m.shopperId, reason: 'NO_HEALTH_CONSENT' }); continue; }
+        // Serialize the final consent check/insert with DSAR transactions. An erasure
+        // completed after rendering must not be followed by a resurrected message.
+        const r = await db.transaction(async tx => {
+          const current = await first(tx, 'SELECT consent,deleted_at FROM shoppers WHERE id=$1 FOR UPDATE', [m.shopperId]);
+          if (!current || current.deletedAt || !current.consent?.marketing || !current.consent?.[CHANNEL_CONSENT[c.channel]] || (containsHealth && !current.consent?.health)) return null;
+          return tx.query(`INSERT INTO message_outbox(id,campaign_id,shopper_id,channel,recipient_enc,recipient_hint,subject,body,dedupe_key,created_at,contains_health,body_enc)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(dedupe_key) DO NOTHING RETURNING id`,
+            [id('msg'), containsHealth ? null : c.id, m.shopperId, c.channel, pii.encrypt(to), c.channel === 'email' ? maskEmail(to) : maskPhone(to), containsHealth ? '[health message]' : c.name, containsHealth ? '[health message]' : body, containsHealth ? health.messageDedupe(m.dedupe) : m.dedupe, now(), containsHealth, bodyEnc]);
+        });
+        if (!r) { skipped.push({ shopperId: m.shopperId, reason: 'NO_CONSENT' }); continue; }
         if (r.rows.length) queued += 1; else skipped.push({ shopperId: m.shopperId, reason: 'ALREADY_SENT' });
       }
       return { campaignId: c.id, queued, skipped };
@@ -184,20 +194,30 @@ export function createCrm(db, deps) {
       for (const c of await rows(db, "SELECT id FROM campaigns WHERE active AND kind='restock_reminder' ORDER BY created_at")) out.push(await crm.runCampaign(c.id));
       return out;
     },
-    async outbox({ shopperId } = {}) {
-      return rows(db, `SELECT id,campaign_id,shopper_id,channel,recipient_hint,subject,body,status,created_at FROM message_outbox
+    async outbox({ shopperId, actor = 'admin', purpose = 'campaign', bypassConsent = false } = {}) {
+      await health.protectOutbox();
+      const list = await rows(db, `SELECT id,campaign_id,shopper_id,channel,recipient_hint,subject,body,status,created_at,contains_health,body_enc FROM message_outbox
         ${shopperId ? 'WHERE shopper_id=$1' : ''} ORDER BY created_at,id`, shopperId ? [shopperId] : []);
+      return Promise.all(list.map(async ({ bodyEnc, containsHealth, ...m }) => {
+        if (!containsHealth) return m;
+        const decrypted = await health.readMessage(m.shopperId, bodyEnc, { actor, purpose, bypassConsent });
+        return { ...m, campaignId: decrypted?.campaignId ?? null, subject: decrypted?.subject ?? '[health content withheld]', body: decrypted?.body ?? '[health content withheld]', healthWithheld: !decrypted };
+      }));
     },
     async sendTransactional(shopperId, { channel = 'email', subject, body, dedupeKey }) {
-      // Service messages (ticket replies) need channel contact consent but not marketing consent.
-      const s = await ensureShopper(shopperId);
-      if (!s.consent?.[CHANNEL_CONSENT[channel]] && channel !== 'email') return null;
-      const to = channel === 'email' ? pii.decrypt(s.emailEnc) : (pii.decrypt(s.profileEnc) || {}).phone;
-      if (!to) return null;
-      const r = await db.query(`INSERT INTO message_outbox(id,campaign_id,shopper_id,channel,recipient_enc,recipient_hint,subject,body,dedupe_key,created_at)
-        VALUES($1,NULL,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(dedupe_key) DO NOTHING RETURNING id`,
-        [id('msg'), shopperId, channel, pii.encrypt(to), channel === 'email' ? maskEmail(to) : maskPhone(to), text(subject, 200), text(body, 4000), dedupeKey || id('tx'), now()]);
-      return r.rows[0]?.id || null;
+      // Preserve service-email semantics while serializing every recipient/content
+      // read and enqueue with erasure; no cached PII can be inserted after deletion.
+      return db.transaction(async tx => {
+        const s = await first(tx, 'SELECT * FROM shoppers WHERE id=$1 FOR UPDATE', [shopperId]);
+        if (!s || s.deletedAt) fail('Shopper not found.', 404, 'NOT_FOUND');
+        if (!s.consent?.[CHANNEL_CONSENT[channel]] && channel !== 'email') return null;
+        const to = channel === 'email' ? pii.decrypt(s.emailEnc) : (pii.decrypt(s.profileEnc) || {}).phone;
+        if (!to) return null;
+        const r = await tx.query(`INSERT INTO message_outbox(id,campaign_id,shopper_id,channel,recipient_enc,recipient_hint,subject,body,dedupe_key,created_at)
+          VALUES($1,NULL,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(dedupe_key) DO NOTHING RETURNING id`,
+          [id('msg'), shopperId, channel, pii.encrypt(to), channel === 'email' ? maskEmail(to) : maskPhone(to), text(subject, 200), text(body, 4000), dedupeKey || id('tx'), now()]);
+        return r.rows[0]?.id || null;
+      });
     },
     // ---------- support inbox ----------
     async openTicket(input = {}) {

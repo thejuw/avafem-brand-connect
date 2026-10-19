@@ -31,7 +31,7 @@ export function registerPlatformRoutes(app, h) {
   app.get('/api/crm/campaigns', async r => { await admin(r); return data(await crm.listCampaigns()); });
   app.post('/api/crm/campaigns', async r => { await admin(r); return data(await crm.createCampaign(r.body)); });
   app.post('/api/crm/campaigns/:id/run', async r => { await admin(r); return data(await crm.runCampaign(r.params.id)); });
-  app.get('/api/crm/outbox', async r => { await admin(r); return data(await crm.outbox({ shopperId: r.query.shopperId })); });
+  app.get('/api/crm/outbox', async r => { const ctx = await admin(r); return data(await crm.outbox({ shopperId: r.query.shopperId, actor: actor(ctx), purpose: 'campaign' })); });
   app.post('/api/crm/tickets', async r => { await admin(r); return data(await crm.openTicket(r.body)); });
   app.get('/api/crm/tickets', async r => { const ctx = await browserRoute(r, 'orders:read'); return data(await crm.listTickets({ brandId: brandScope(ctx, r.query.brandId), status: r.query.status })); });
   app.get('/api/crm/tickets/:id', async r => { const ctx = await browserRoute(r, 'orders:read'); return data(await crm.getTicket(r.params.id, ctx.brandId)); });
@@ -83,13 +83,8 @@ function registerCommerceRoutes(app, h, admin, actor) {
   app.post('/api/products/:id/compliance/override', async r => { const ctx = await admin(r); const out = await compliance.override(r.params.id, r.body?.reason, actor(ctx)); await platform.auth.audit(ctx, 'compliance.override', r.params.id); return data(out); });
   app.get('/api/compliance/brands/:id', async r => { const ctx = await browserRoute(r, 'catalog:read'); return data(await compliance.scanBrand(brandScope(ctx, r.params.id))); });
   app.get('/v1/compliance', async r => { const ctx = await context(r, { scope: 'catalog:read' }); return data(await compliance.scanBrand(ctx.brandId)); });
-  // Gate: a listing cannot be approved (go live) while it has blocking compliance findings.
-  app.addHook('preHandler', async request => {
-    if (request.method !== 'POST' || request.routeOptions?.url !== '/api/products/:id/review' || request.body?.decision !== 'approved') return;
-    const ctx = await browserRoute(request); h.requireAdmin(ctx);
-    const result = await compliance.check(request.params.id);
-    if (result && !result.canGoLive) throw Object.assign(new Error(`Compliance review required: ${result.flags.filter(f => f.severity === 'block').map(f => f.code).join(', ')}.`), { statusCode: 409, code: 'COMPLIANCE_BLOCKED' });
-  });
+  // Approval is guarded by domain.reviewProduct in its own locked transaction,
+  // including non-HTTP callers. A preHandler check here would be stale at commit.
 }
 
 function registerBrandRoutes(app, h, admin) {

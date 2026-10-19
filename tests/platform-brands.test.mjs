@@ -5,6 +5,7 @@ import { woocommerceAdapter, bigcommerceAdapter, csvRows } from '../server/platf
 import { parse } from 'csv-parse/sync';
 
 const json = (body, status = 200) => ({ ok: status < 400, status, json: async () => body });
+const publicResolve = async () => [{ address: '93.184.216.34', family: 4 }];
 function mockStores(calls) {
   return async (url, init = {}) => {
     calls.push({ url, method: init.method || 'GET', headers: init.headers, body: init.body });
@@ -29,7 +30,7 @@ function mockStores(calls) {
 
 test('connector adapters normalize WooCommerce and BigCommerce products and reject bad credentials (mocked HTTP)', async () => {
   const calls = []; const fetch = mockStores(calls);
-  const woo = woocommerceAdapter({ fetch });
+  const woo = woocommerceAdapter({ fetch, resolve: publicResolve });
   const creds = { storeUrl: 'https://shop.example.com/any/path', consumerKey: 'ck_test', consumerSecret: 'cs_test' };
   assert.equal((await woo.verify(creds)).storeRef, 'https://shop.example.com');
   const products = await woo.listProducts(creds);
@@ -38,7 +39,7 @@ test('connector adapters normalize WooCommerce and BigCommerce products and reje
   await assert.rejects(woo.verify({ ...creds, consumerSecret: 'cs_wrong' }), e => e.code === 'CONNECTOR_UNAUTHORIZED');
   await assert.rejects(woo.verify({ ...creds, storeUrl: 'http://shop.example.com' }), /https/);
   await assert.rejects(woo.verify({ ...creds, consumerKey: 'nope' }), /ck_/);
-  const bc = bigcommerceAdapter({ fetch });
+  const bc = bigcommerceAdapter({ fetch, resolve: publicResolve });
   const bcCreds = { storeHash: 'abc123', accessToken: 'bc_token' };
   assert.equal((await bc.verify(bcCreds)).storeRef, 'bc-store.example.com');
   assert.equal((await bc.listProducts(bcCreds))[0].priceCents, 1800);
@@ -50,6 +51,7 @@ test('connector adapters normalize WooCommerce and BigCommerce products and reje
 
 test('self-serve portal: signup -> invite -> profile -> Stripe Express (mocked) -> WooCommerce connect + sync -> review queue -> live', { timeout: 90_000 }, async t => {
   const f = await platformFixture(t);
+  f.platform.brands.resolve = publicResolve;
   const calls = []; f.platform.brands.fetch = mockStores(calls);
   const signup = await f.ok(f.request({ method: 'POST', url: '/api/portal/signup', payload: { brandName: 'Fern & Flow', email: 'Founder@FernFlow.com', website: 'https://fernflow.example.com' } }));
   assert.equal(signup.status, 'invited'); assert.equal(signup.contactHint, 'f***@fernflow.com');
@@ -104,6 +106,7 @@ test('self-serve portal: signup -> invite -> profile -> Stripe Express (mocked) 
 
 test('BigCommerce connector and CSV fallback import via REST, /v1 and MCP', { timeout: 60_000 }, async t => {
   const f = await platformFixture(t);
+  f.platform.brands.resolve = publicResolve;
   f.platform.brands.fetch = mockStores([]);
   await f.ok(f.owner({ method: 'POST', url: '/api/portal/brand_bloom/connect', payload: { platform: 'bigcommerce', credentials: { storeHash: 'abc123', accessToken: 'bc_token' } } }));
   const sync = await f.ok(f.owner({ method: 'POST', url: '/api/portal/brand_bloom/connectors/bigcommerce/sync' }));

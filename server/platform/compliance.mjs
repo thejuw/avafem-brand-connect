@@ -42,29 +42,34 @@ export function checkProduct(p) {
 const fingerprint = p => sha(JSON.stringify([p.title, p.description, p.category, p.evidence]));
 
 export function createCompliance(db, { clock }) {
-  const load = async productId => first(db, 'SELECT * FROM products WHERE id=$1', [productId]);
+  const load = async (productId, query = db) => first(query, 'SELECT * FROM products WHERE id=$1', [productId]);
   const api = {
-    async check(productOrId) {
-      const p = typeof productOrId === 'string' ? await load(productOrId) : productOrId;
+    // Approval callers pass their transaction and its freshly locked product. Never
+    // route a transactional override read through the serialized outer database.
+    async check(productOrId, query = db) {
+      const p = typeof productOrId === 'string' ? await load(productOrId, query) : productOrId;
       if (!p) return null;
       const result = checkProduct(p);
-      const o = p.id ? await first(db, 'SELECT * FROM compliance_overrides WHERE product_id=$1', [p.id]) : null;
+      const o = p.id ? await first(query, 'SELECT * FROM compliance_overrides WHERE product_id=$1', [p.id]) : null;
       const full = p.evidence && p.title !== undefined && p.description !== undefined && p.category !== undefined;
       const overridden = Boolean(o && full && o.fingerprint === fingerprint(p));
       return { productId: p.id || null, ...result, overridden, override: overridden ? { reason: o.reason, actor: o.actor, at: o.createdAt } : null, canGoLive: result.status !== 'blocked' || overridden };
     },
     async scanBrand(brandId) {
       const list = await rows(db, 'SELECT * FROM products WHERE brand_id=$1 ORDER BY sku', [brandId]);
-      const out = await Promise.all(list.map(api.check));
+      const out = await Promise.all(list.map(p => api.check(p)));
       return { brandId, blocked: out.filter(r => r.status === 'blocked' && !r.overridden).map(r => r.productId), flagged: out.filter(r => r.status === 'flagged').map(r => r.productId), checked: out.length };
     },
     /** Operator override, bound to the exact listing content: any later edit invalidates it. */
     async override(productId, reason, actor) {
-      const p = await load(productId); if (!p) throw Object.assign(new Error('Product not found.'), { statusCode: 404, code: 'NOT_FOUND' });
       const why = text(reason, 1000); if (why.length < 10) throw Object.assign(new Error('Give an override reason of at least 10 characters.'), { statusCode: 422, code: 'VALIDATION_ERROR' });
-      await db.query(`INSERT INTO compliance_overrides(product_id,reason,actor,fingerprint,created_at) VALUES($1,$2,$3,$4,$5)
-        ON CONFLICT(product_id) DO UPDATE SET reason=EXCLUDED.reason,actor=EXCLUDED.actor,fingerprint=EXCLUDED.fingerprint,created_at=EXCLUDED.created_at`, [productId, why, actor, fingerprint(p), clock()]);
-      return api.check(productId);
+      return db.transaction(async tx => {
+        await tx.query('SELECT id FROM products WHERE id=$1 FOR UPDATE', [productId]);
+        const p = await load(productId, tx); if (!p) throw Object.assign(new Error('Product not found.'), { statusCode: 404, code: 'NOT_FOUND' });
+        await tx.query(`INSERT INTO compliance_overrides(product_id,reason,actor,fingerprint,created_at) VALUES($1,$2,$3,$4,$5)
+          ON CONFLICT(product_id) DO UPDATE SET reason=EXCLUDED.reason,actor=EXCLUDED.actor,fingerprint=EXCLUDED.fingerprint,created_at=EXCLUDED.created_at`, [productId, why, actor, fingerprint(p), clock()]);
+        return api.check(p, tx);
+      });
     },
   };
   return api;

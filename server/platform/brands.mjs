@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { lookup } from 'node:dns/promises';
 import { parse as csvParse } from 'csv-parse/sync';
 import { id, first, rows, fail, text, int, normEmail, maskEmail, keyring, DAY } from './util.mjs';
 import { woocommerceAdapter, bigcommerceAdapter, csvRows } from './connectors.mjs';
@@ -6,10 +7,11 @@ import { woocommerceAdapter, bigcommerceAdapter, csvRows } from './connectors.mj
 export const PLACEMENT_PRICING = { featured_spot: { perDayCents: 2500 }, sponsored_swipe: { per1000ImpressionsCents: 1000 }, sampling_box: { perUnitCents: 150 } };
 
 /** Self-serve brand portal, connectors, analytics and paid placements. */
-export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnections, fetch = globalThis.fetch, compliance }) {
+export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnections, fetch = globalThis.fetch, resolve = lookup, compliance }) {
   const now = () => clock();
   const creds = keyring(secret, 'connector-credentials');
-  const adapters = { woocommerce: woocommerceAdapter({ fetch: (...a) => side.fetch(...a) }), bigcommerce: bigcommerceAdapter({ fetch: (...a) => side.fetch(...a) }) };
+  const transport = { getFetch: () => side.fetch, getResolve: () => side.resolve };
+  const adapters = { woocommerce: woocommerceAdapter(transport), bigcommerce: bigcommerceAdapter(transport) };
   const application = brandId => first(db, 'SELECT * FROM brand_applications WHERE brand_id=$1', [brandId]);
   const setStep = async (brandId, key, value) => db.query("UPDATE brand_applications SET steps=steps||$2::jsonb,updated_at=$3 WHERE brand_id=$1", [brandId, JSON.stringify({ [key]: value }), now()]);
   async function upsertRows(brandId, list, source) {
@@ -27,7 +29,7 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
     return result;
   }
   const side = {
-    fetch,
+    fetch, resolve,
     // ---------- portal ----------
     async signup(input = {}) {
       const name = text(input.brandName, 160) || fail('brandName is required.');
@@ -69,7 +71,7 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
       return side.status(brandId);
     },
     async connect(brandId, platform, credentials = {}) {
-      await domain.getBrand(brandId);
+      const brand = await domain.getBrand(brandId);
       if (platform === 'shopify') return { platform, next: { method: 'POST', path: `/api/brands/${brandId}/shopify/authorize` }, message: 'Shopify uses the OAuth install flow.' };
       if (platform === 'csv') {
         await db.query(`INSERT INTO brand_connectors(brand_id,platform,store_ref,created_at) VALUES($1,'csv','csv-upload',$2) ON CONFLICT(brand_id,platform) DO UPDATE SET status='connected'`, [brandId, now()]);
@@ -80,12 +82,20 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
         await db.query(`INSERT INTO brand_connectors(brand_id,platform,credentials_enc,store_ref,created_at) VALUES($1,$2,$3,$4,$5)
           ON CONFLICT(brand_id,platform) DO UPDATE SET credentials_enc=EXCLUDED.credentials_enc,store_ref=EXCLUDED.store_ref,status='connected'`, [brandId, platform, creds.encrypt(safe), storeRef, now()]);
       }
-      await domain.updateBrand(brandId, { connectionTier: platform === 'csv' ? 'dashboard' : platform, connectionHealthy: true });
+      await domain.updateBrand(brandId, { connectionTier: platform === 'csv' ? 'dashboard' : platform, connectionHealthy: true,
+        ...(brand.status === 'disconnected' ? { status: 'onboarding' } : {}) });
       await setStep(brandId, 'store', now().toISOString());
       return { platform, connected: true, storeRef: platform === 'csv' ? 'csv-upload' : (await first(db, 'SELECT store_ref FROM brand_connectors WHERE brand_id=$1 AND platform=$2', [brandId, platform])).storeRef };
     },
     async connectors(brandId) { return rows(db, 'SELECT brand_id,platform,store_ref,status,last_sync_at,last_result,created_at FROM brand_connectors WHERE brand_id=$1 ORDER BY platform', [brandId]); },
     async disconnect(brandId, platform) {
+      const brand = await domain.getBrand(brandId);
+      const connector = await first(db, 'SELECT platform FROM brand_connectors WHERE brand_id=$1 AND platform=$2', [brandId, platform]);
+      if (!connector) fail('Connector not found.', 404, 'NOT_FOUND');
+      // Fail closed before erasing credentials. The core also withdraws approved
+      // listings on disconnect; another connector is not an automatic fallback.
+      if (brand.connectionTier === platform || (platform === 'csv' && brand.connectionTier === 'dashboard'))
+        await domain.updateBrand(brandId, { connectionHealthy: false, status: 'disconnected' });
       const r = await db.query("UPDATE brand_connectors SET status='disconnected',credentials_enc=NULL WHERE brand_id=$1 AND platform=$2 RETURNING platform", [brandId, platform]);
       if (!r.rows.length) fail('Connector not found.', 404, 'NOT_FOUND');
       return { platform, disconnected: true };
@@ -110,13 +120,69 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
       return result;
     },
     async pushOrder(bagId) {
-      const existing = await first(db, 'SELECT * FROM connector_orders WHERE bag_id=$1', [bagId]); if (existing) return { ...existing, replayed: true };
       const bag = await domain.getBag(bagId);
-      const c = await first(db, "SELECT * FROM brand_connectors WHERE brand_id=$1 AND platform IN ('woocommerce','bigcommerce') AND status='connected' ORDER BY platform LIMIT 1", [bag.brandId]);
-      if (!c) fail('This brand has no WooCommerce or BigCommerce connector.', 409, 'NO_CONNECTOR');
-      if (bag.status !== 'awaiting_shipment') fail('Only Bags awaiting shipment are pushed.', 409, 'INVALID_BAG_STATE');
-      const { externalId } = await adapters[c.platform].createOrder(creds.decrypt(c.credentialsEnc), bag);
-      return first(db, 'INSERT INTO connector_orders(bag_id,brand_id,platform,external_id,created_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT(bag_id) DO UPDATE SET bag_id=EXCLUDED.bag_id RETURNING *', [bagId, bag.brandId, c.platform, externalId, now()]);
+      const reservation = await db.transaction(async tx => {
+        const current = await first(tx, 'SELECT * FROM bags WHERE id=$1 FOR UPDATE', [bagId]);
+        if (!current) fail('Bag not found.', 404, 'NOT_FOUND');
+        const receipt = await first(tx, 'SELECT * FROM connector_orders WHERE bag_id=$1', [bagId]);
+        if (receipt) {
+          const external = await first(tx, 'SELECT * FROM external_orders WHERE bag_id=$1', [bagId]);
+          if (receipt.brandId !== current.brandId || !adapters[receipt.platform] || current.providerBound ||
+            (external && (external.state !== 'connector_created' || external.externalOrderId !== receipt.externalId || external.brandId !== current.brandId)))
+            fail('This connector receipt conflicts with another fulfillment workflow. Provider review is required.', 409, 'CONNECTOR_OUTCOME_UNCERTAIN');
+          // Earlier versions stored only a success receipt. Repair its shared
+          // ownership marker, without guessing a remote target or sending again.
+          if (!external) await tx.query(`INSERT INTO external_orders(bag_id,brand_id,shop,state,external_order_id)
+            VALUES($1,$2,$3,'connector_created',$4)`, [bagId, receipt.brandId, `${receipt.platform}:legacy-receipt`, receipt.externalId]);
+          await tx.query('UPDATE handoff_links SET used_at=$2 WHERE bag_id=$1 AND used_at IS NULL', [bagId, now()]);
+          await tx.query("UPDATE sandbox_inbox SET status='closed' WHERE bag_id=$1", [bagId]);
+          return { receipt };
+        }
+        if (current.providerBound) fail('Use the provider-backed fulfillment workflow for this Bag.', 409, 'PROVIDER_WORKFLOW_REQUIRED');
+        const external = await first(tx, 'SELECT * FROM external_orders WHERE bag_id=$1', [bagId]);
+        if (external) {
+          if (/^connector_/.test(external.state)) fail('An earlier connector dispatch requires provider reconciliation; it will not be sent again.', 409, 'CONNECTOR_OUTCOME_UNCERTAIN');
+          fail('This Bag is already reserved for fulfillment through another workflow.', 409, 'EXTERNAL_FULFILLMENT_RESERVED');
+        }
+        const blocked = await first(tx, `SELECT
+          EXISTS(SELECT 1 FROM refunds WHERE bag_id=$1 AND status='proposed') AS refund_pending,
+          EXISTS(SELECT 1 FROM shipments WHERE bag_id=$1) AS shipment_exists`, [bagId]);
+        if (current.status !== 'awaiting_shipment' || current.refundedCents > 0 || blocked.refundPending || blocked.shipmentExists)
+          fail('Only unshipped, unrefunded Bags without refund proposals can be pushed.', 409, 'INVALID_BAG_STATE');
+        const brand = await first(tx, 'SELECT * FROM brands WHERE id=$1', [current.brandId]);
+        if (!brand?.connectionHealthy || ['paused', 'disconnected'].includes(brand.status)) fail('The brand connection is unavailable.', 409, 'NO_CONNECTOR');
+        const c = await first(tx, `SELECT * FROM brand_connectors WHERE brand_id=$1 AND platform=$2
+          AND platform IN ('woocommerce','bigcommerce') AND status='connected' FOR UPDATE`, [current.brandId, brand.connectionTier]);
+        if (!c) fail('This brand has no selected WooCommerce or BigCommerce connector.', 409, 'NO_CONNECTOR');
+        const credentials = creds.decrypt(c.credentialsEnc);
+        const target = c.platform === 'woocommerce' ? new URL(credentials.storeUrl).origin : credentials.storeHash;
+        const marker = `${c.platform}:${target}`;
+        // The same durable reservation table is honored by Shopify dispatch,
+        // handoff links and the outbox. Never reserve only in process memory.
+        await tx.query(`INSERT INTO external_orders(bag_id,brand_id,shop,state)
+          VALUES($1,$2,$3,'connector_pending')`, [bagId, current.brandId, marker]);
+        await tx.query('UPDATE handoff_links SET used_at=$2 WHERE bag_id=$1 AND used_at IS NULL', [bagId, now()]);
+        await tx.query("UPDATE sandbox_inbox SET status='closed' WHERE bag_id=$1", [bagId]);
+        return { platform: c.platform, credentials, marker };
+      });
+      if (reservation.receipt) return { ...reservation.receipt, replayed: true };
+      try {
+        const { externalId } = await adapters[reservation.platform].createOrder(reservation.credentials, bag);
+        return await db.transaction(async tx => {
+          const current = await first(tx, 'SELECT * FROM external_orders WHERE bag_id=$1 FOR UPDATE', [bagId]);
+          if (!current || current.shop !== reservation.marker || current.state !== 'connector_pending')
+            fail('The connector dispatch reservation changed.', 409, 'CONNECTOR_OUTCOME_UNCERTAIN');
+          const receipt = await first(tx, `INSERT INTO connector_orders(bag_id,brand_id,platform,external_id,created_at)
+            VALUES($1,$2,$3,$4,$5) RETURNING *`, [bagId, bag.brandId, reservation.platform, externalId, now()]);
+          await tx.query("UPDATE external_orders SET external_order_id=$2,state='connector_created',last_error=NULL,updated_at=$3 WHERE bag_id=$1", [bagId, externalId, now()]);
+          return receipt;
+        });
+      } catch {
+        // A failure can occur after a paid provider order exists (including a
+        // local receipt-write failure). Persist uncertainty; no retry is safe.
+        try { await db.query("UPDATE external_orders SET state='connector_uncertain',last_error='CONNECTOR_CREATE_NOT_VERIFIED',updated_at=$2 WHERE bag_id=$1 AND state='connector_pending' AND shop=$3", [bagId, now(), reservation.marker]); } catch { /* A committed pending reservation still blocks every replay. */ }
+        fail('Connector order creation is not verified. Review the provider using this Bag ID; do not resend the order.', 502, 'CONNECTOR_OUTCOME_UNCERTAIN');
+      }
     },
     async status(brandId) {
       const brand = await domain.getBrand(brandId); const app = await application(brandId);
@@ -145,6 +211,7 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
     },
     async activate(brandId) {
       const status = await side.status(brandId);
+      if (!status.steps.find(step => step.key === 'store_connection')?.done) fail('Onboarding incomplete: Store connection.', 409, 'ONBOARDING_INCOMPLETE');
       if (status.onboardingRequirements.length) fail(`Onboarding incomplete: ${status.onboardingRequirements.join('; ')}.`, 409, 'ONBOARDING_INCOMPLETE');
       await domain.updateBrand(brandId, { status: 'live' });
       if (await application(brandId)) await setStep(brandId, 'live', now().toISOString());

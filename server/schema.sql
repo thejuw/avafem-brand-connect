@@ -75,6 +75,16 @@ CREATE TABLE IF NOT EXISTS refunds (
   requires_approval BOOLEAN NOT NULL DEFAULT TRUE CHECK(requires_approval), approved_at TIMESTAMPTZ,
   sandbox BOOLEAN NOT NULL DEFAULT TRUE CHECK (sandbox), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE refunds ADD COLUMN IF NOT EXISTS subtotal_cents INTEGER CHECK (subtotal_cents>=0);
+ALTER TABLE refunds ADD COLUMN IF NOT EXISTS shipping_cents INTEGER CHECK (shipping_cents>=0);
+ALTER TABLE refunds ADD COLUMN IF NOT EXISTS tax_cents INTEGER CHECK (tax_cents>=0);
+ALTER TABLE refunds ADD COLUMN IF NOT EXISTS commission_cents INTEGER CHECK (commission_cents>=0);
+-- Historical full-Bag refunds have exact canonical allocations. Do not guess
+-- allocations for legacy partial refunds: reporting marks those incomplete.
+UPDATE refunds r SET subtotal_cents=b.subtotal_cents,shipping_cents=b.shipping_cents,
+  tax_cents=b.tax_cents,commission_cents=b.commission_cents FROM bags b
+  WHERE r.bag_id=b.id AND r.status='approved' AND r.amount_cents=b.total_cents
+  AND r.subtotal_cents IS NULL AND r.shipping_cents IS NULL AND r.tax_cents IS NULL AND r.commission_cents IS NULL;
 CREATE TABLE IF NOT EXISTS ledger_journals (
   id TEXT PRIMARY KEY, business_key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, bag_id TEXT REFERENCES bags(id),
   brand_id TEXT REFERENCES brands(id), total_debit_cents INTEGER NOT NULL CHECK(total_debit_cents>0),

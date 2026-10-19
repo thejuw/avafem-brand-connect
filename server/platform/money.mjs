@@ -58,34 +58,51 @@ export function createBeautyBank(db, { clock, earnBps = 300, expiryDays = 365 })
     },
     /** LAB -> VAULT when the Bag is delivered and its return window is over. */
     async mature() {
-      const due = await rows(db, `SELECT l.*, b.status AS bag_status, b.delivered_at, b.return_window_days FROM bank_lots l JOIN bags b ON b.id=l.bag_id
-        WHERE l.state='LAB' AND b.status='delivered' AND b.delivered_at IS NOT NULL`);
-      let moved = 0;
-      for (const lot of due) {
-        const matures = new Date(Date.parse(lot.deliveredAt) + lot.returnWindowDays * DAY);
-        if (matures > now()) continue;
-        const r = await db.query("UPDATE bank_lots SET state='VAULT',matures_at=$2,expires_at=$3,updated_at=$4 WHERE id=$1 AND state='LAB' RETURNING id", [lot.id, matures, new Date(now().getTime() + expiryDays * DAY), now()]);
-        if (r.rows.length) { await ev(db, lot, 'matured', 'LAB', 'VAULT', lot.remainingCents); moved++; }
-      }
-      return moved;
+      return db.transaction(async tx => {
+        const due = await rows(tx, `SELECT l.*, b.delivered_at, b.return_window_days, b.payout_due_at,
+          br.return_window_days AS current_return_window_days,t.due_at AS transfer_due_at,j.due_at AS job_due_at
+          FROM bank_lots l JOIN bags b ON b.id=l.bag_id JOIN brands br ON br.id=b.brand_id
+          LEFT JOIN transfers t ON t.bag_id=b.id LEFT JOIN jobs j ON j.bag_id=b.id AND j.kind='sandbox_payout'
+          WHERE l.state='LAB' AND b.status='delivered' AND b.delivered_at IS NOT NULL
+          AND COALESCE(t.status,'')<>'held' AND COALESCE(j.status,'')<>'held'
+          AND NOT EXISTS(SELECT 1 FROM refunds r WHERE r.bag_id=b.id AND r.status='proposed')
+          AND NOT EXISTS(SELECT 1 FROM disputes d WHERE d.bag_id=b.id AND d.status IN ('needs_response','under_review','lost'))
+          FOR UPDATE OF l`);
+        let moved = 0;
+        for (const lot of due) {
+          const days = Math.max(7,lot.returnWindowDays ?? 30,lot.currentReturnWindowDays ?? 30);
+          const matures = new Date(Math.max(Date.parse(lot.deliveredAt) + days * DAY,
+            ...[lot.maturesAt,lot.payoutDueAt,lot.transferDueAt,lot.jobDueAt].filter(Boolean).map(Date.parse)));
+          if (!Number.isFinite(matures.getTime()) || matures > now()) continue;
+          const r = await tx.query("UPDATE bank_lots SET state='VAULT',matures_at=$2,expires_at=$3,updated_at=$4 WHERE id=$1 AND state='LAB' RETURNING id", [lot.id, matures, new Date(now().getTime() + expiryDays * DAY), now()]);
+          if (r.rows.length) { await ev(tx, lot, 'matured', 'LAB', 'VAULT', lot.remainingCents); moved++; }
+        }
+        return moved;
+      });
     },
     async expire() {
-      const due = await rows(db, "SELECT * FROM bank_lots WHERE state='VAULT' AND expires_at IS NOT NULL AND expires_at<=$1", [now()]);
-      for (const lot of due) {
-        await db.query("UPDATE bank_lots SET state='EXPIRED',remaining_cents=0,updated_at=$2 WHERE id=$1 AND state='VAULT'", [lot.id, now()]);
-        await ev(db, lot, 'expired', 'VAULT', 'EXPIRED', lot.remainingCents);
-      }
-      return due.length;
+      return db.transaction(async tx => {
+        const due = await rows(tx, "SELECT * FROM bank_lots WHERE state='VAULT' AND expires_at IS NOT NULL AND expires_at<=$1 FOR UPDATE", [now()]);
+        let expired = 0;
+        for (const lot of due) {
+          const r = await tx.query("UPDATE bank_lots SET state='EXPIRED',remaining_cents=0,updated_at=$2 WHERE id=$1 AND state='VAULT' RETURNING id", [lot.id, now()]);
+          if (r.rows.length) { await ev(tx, lot, 'expired', 'VAULT', 'EXPIRED', lot.remainingCents); expired++; }
+        }
+        return expired;
+      });
     },
     /** Reverse unspent LAB/VAULT credit for refunded/cancelled Bags (idempotent). */
     async reverseRefunded(bagId) {
-      const lots = await rows(db, `SELECT l.* FROM bank_lots l JOIN bags b ON b.id=l.bag_id WHERE l.state IN ('LAB','VAULT') AND b.status IN ('refunded','cancelled')${bagId ? ' AND b.id=$1' : ''}`, bagId ? [bagId] : []);
-      for (const lot of lots) {
-        const spent = lot.amountCents - lot.remainingCents;
-        await db.query("UPDATE bank_lots SET state='REVERSED',remaining_cents=0,note=$2,updated_at=$3 WHERE id=$1", [lot.id, spent ? `Refunded after ${spent} cents were redeemed; review clawback.` : 'Earning Bag refunded.', now()]);
-        await ev(db, lot, 'reversed', lot.state, 'REVERSED', lot.remainingCents, lot.bagId);
-      }
-      return lots.length;
+      return db.transaction(async tx => {
+        const lots = await rows(tx, `SELECT l.* FROM bank_lots l JOIN bags b ON b.id=l.bag_id WHERE l.state IN ('LAB','VAULT') AND b.status IN ('refunded','cancelled')${bagId ? ' AND b.id=$1' : ''} FOR UPDATE OF l`, bagId ? [bagId] : []);
+        let reversed = 0;
+        for (const lot of lots) {
+          const spent = lot.amountCents - lot.remainingCents;
+          const r = await tx.query("UPDATE bank_lots SET state='REVERSED',remaining_cents=0,note=$2,updated_at=$3 WHERE id=$1 AND state IN ('LAB','VAULT') RETURNING id", [lot.id, spent ? `Refunded after ${spent} cents were redeemed; review clawback.` : 'Earning Bag refunded.', now()]);
+          if (r.rows.length) { await ev(tx, lot, 'reversed', lot.state, 'REVERSED', lot.remainingCents, lot.bagId); reversed++; }
+        }
+        return reversed;
+      });
     },
     async run() { return { reversed: await bank.reverseRefunded(), matured: await bank.mature(), expired: await bank.expire() }; },
     async liabilityReport() {
@@ -188,7 +205,7 @@ export function createConsole(db, { clock, domain, risk }) {
         const d = await first(tx, 'SELECT * FROM disputes WHERE id=$1 FOR UPDATE', [disputeId]); if (!d) fail('Dispute not found.', 404, 'NOT_FOUND');
         if (['won', 'lost'].includes(d.status)) return d;
         const r = await first(tx, "UPDATE disputes SET status=$2,updated_at=$3 WHERE id=$1 RETURNING *", [disputeId, outcome, now()]);
-        const blockers = await first(tx, "SELECT (SELECT COUNT(*) FROM refunds WHERE bag_id=$1 AND status='proposed')::int + (SELECT COUNT(*) FROM disputes WHERE bag_id=$1 AND status IN ('needs_response','under_review'))::int AS c", [d.bagId]);
+        const blockers = await first(tx, "SELECT (SELECT COUNT(*) FROM refunds WHERE bag_id=$1 AND status='proposed')::int + (SELECT COUNT(*) FROM disputes WHERE bag_id=$1 AND status IN ('needs_response','under_review','lost'))::int AS c", [d.bagId]);
         if (outcome === 'won' && blockers.c === 0) {
           await tx.query("UPDATE transfers SET status='scheduled' WHERE bag_id=$1 AND status='held'", [d.bagId]);
           await tx.query("UPDATE jobs SET status='scheduled' WHERE bag_id=$1 AND status='held' AND kind='sandbox_payout'", [d.bagId]);
@@ -201,15 +218,16 @@ export function createConsole(db, { clock, domain, risk }) {
     async holds() {
       return rows(db, `SELECT t.id AS transfer_id,t.bag_id,t.brand_id,t.amount_cents,t.due_at,
         (SELECT COUNT(*) FROM refunds r WHERE r.bag_id=t.bag_id AND r.status='proposed')::int AS open_refunds,
-        (SELECT COUNT(*) FROM disputes d WHERE d.bag_id=t.bag_id AND d.status IN ('needs_response','under_review'))::int AS open_disputes
+        (SELECT COUNT(*) FROM disputes d WHERE d.bag_id=t.bag_id AND d.status IN ('needs_response','under_review'))::int AS open_disputes,
+        (SELECT COUNT(*) FROM disputes d WHERE d.bag_id=t.bag_id AND d.status='lost')::int AS lost_disputes
         FROM transfers t WHERE t.status='held' ORDER BY t.due_at NULLS LAST`);
     },
     async releaseHold(transferId) {
       return db.transaction(async tx => {
         const t = await first(tx, "SELECT * FROM transfers WHERE id=$1 FOR UPDATE", [transferId]); if (!t) fail('Transfer not found.', 404, 'NOT_FOUND');
         if (t.status !== 'held') fail('Transfer is not held.', 409, 'NOT_HELD');
-        const b = await first(tx, "SELECT (SELECT COUNT(*) FROM refunds WHERE bag_id=$1 AND status='proposed')::int AS r, (SELECT COUNT(*) FROM disputes WHERE bag_id=$1 AND status IN ('needs_response','under_review'))::int AS d", [t.bagId]);
-        if (b.r || b.d) fail('Resolve the open refund proposal or dispute before releasing this hold.', 409, 'HOLD_BLOCKED');
+        const b = await first(tx, "SELECT (SELECT COUNT(*) FROM refunds WHERE bag_id=$1 AND status='proposed')::int AS r, (SELECT COUNT(*) FROM disputes WHERE bag_id=$1 AND status IN ('needs_response','under_review','lost'))::int AS d", [t.bagId]);
+        if (b.r || b.d) fail('Resolve refund proposals and dispute recovery before releasing this hold.', 409, 'HOLD_BLOCKED');
         await tx.query("UPDATE transfers SET status='scheduled' WHERE id=$1", [transferId]);
         await tx.query("UPDATE jobs SET status='scheduled' WHERE bag_id=$1 AND status='held' AND kind='sandbox_payout'", [t.bagId]);
         return { transferId, status: 'scheduled' };
@@ -263,6 +281,27 @@ export function createConsole(db, { clock, domain, risk }) {
 /** Reports: state sales-tax summary and brand annual payout (1099-K style) export. */
 export function createReports(db, { domain }) {
   const csv = (header, list) => [header.join(','), ...list.map(r => header.map(h => { const v = r[h] ?? ''; return /[",\n]/.test(String(v)) ? `"${String(v).replaceAll('"', '""')}"` : String(v); }).join(','))].join('\n');
+  // Refund components are persisted from the exact native refund allocation,
+  // not inferred from Bag status or pro-rated from a cash total. Older partial
+  // refunds without evidence must be reconciled, never silently reported as 0.
+  const refundAllocation = async bag => {
+    const refunds = await rows(db,"SELECT * FROM refunds WHERE bag_id=$1 AND status='approved'",[bag.id]);
+    const totals = { amount: 0, subtotal: 0, shipping: 0, tax: 0, commission: 0 };
+    let allocated = 0;
+    for (const refund of refunds) {
+      const parts = refund.amountCents===bag.totalCents && [refund.subtotalCents,refund.shippingCents,refund.taxCents,refund.commissionCents].every(v=>v==null)
+        ? { subtotalCents:bag.subtotalCents,shippingCents:bag.shippingCents,taxCents:bag.taxCents,commissionCents:bag.commissionCents }
+        : refund;
+      totals.amount += refund.amountCents;
+      if (![parts.subtotalCents,parts.shippingCents,parts.taxCents,parts.commissionCents].every(v=>Number.isSafeInteger(v) && v>=0)
+        || parts.subtotalCents+parts.shippingCents+parts.taxCents!==refund.amountCents || parts.commissionCents>parts.subtotalCents) continue;
+      allocated += refund.amountCents;
+      for (const key of ['subtotal','shipping','tax','commission']) totals[key] += parts[`${key}Cents`];
+    }
+    const complete = totals.amount===bag.refundedCents && allocated===totals.amount
+      && totals.subtotal<=bag.subtotalCents && totals.shipping<=bag.shippingCents && totals.tax<=bag.taxCents && totals.commission<=bag.commissionCents;
+    return { ...totals,complete,unallocated:Math.max(0,bag.refundedCents-allocated) };
+  };
   return {
     async salesTax({ from, to } = {}) {
       const params = []; const where = [];
@@ -273,15 +312,18 @@ export function createReports(db, { domain }) {
       for (const { id: bagId } of bags) {
         const bag = await domain.getBag(bagId);
         const st = bag.shipTo?.region || 'UNKNOWN';
-        const row = states.get(st) || { state: st, bags: 0, grossSalesCents: 0, shippingCents: 0, taxCollectedCents: 0, refundedCents: 0, taxRefundedCents: 0, refundedSalesCents: 0 };
+        const row = states.get(st) || { state: st, bags: 0, grossSalesCents: 0, shippingCents: 0, taxCollectedCents: 0, refundedCents: 0, taxRefundedCents: 0, refundedSalesCents: 0, refundedShippingCents: 0, refundAllocationComplete: true, unallocatedRefundCents: 0 };
         row.bags += 1; row.grossSalesCents += bag.subtotalCents; row.shippingCents += bag.shippingCents; row.taxCollectedCents += bag.taxCents;
-        row.refundedCents += bag.refundedCents; if (bag.status === 'refunded') { row.taxRefundedCents += bag.taxCents; row.refundedSalesCents += bag.subtotalCents; }
+        const allocation = await refundAllocation(bag);
+        row.refundedCents += bag.refundedCents; row.taxRefundedCents += allocation.tax; row.refundedSalesCents += allocation.subtotal; row.refundedShippingCents += allocation.shipping;
+        row.refundAllocationComplete &&= allocation.complete; row.unallocatedRefundCents += allocation.unallocated;
         states.set(st, row);
       }
-      const list = [...states.values()].map(r => ({ ...r, netSalesCents: r.grossSalesCents - r.refundedSalesCents, netTaxCents: r.taxCollectedCents - r.taxRefundedCents }))
+      const list = [...states.values()].map(r => ({ ...r, netSalesCents: r.refundAllocationComplete ? r.grossSalesCents - r.refundedSalesCents : null,
+        netTaxCents: r.refundAllocationComplete ? r.taxCollectedCents - r.taxRefundedCents : null, reconciliationRequired: !r.refundAllocationComplete }))
         .sort((a, b) => a.state.localeCompare(b.state));
       return { from: from || null, to: to || null, states: list, note: 'Sandbox marketplace-facilitator summary by ship-to state; confirm nexus and filing with a tax advisor.',
-        csv: csv(['state', 'bags', 'grossSalesCents', 'shippingCents', 'taxCollectedCents', 'refundedCents', 'taxRefundedCents', 'netSalesCents', 'netTaxCents'], list) };
+        csv: csv(['state', 'bags', 'grossSalesCents', 'shippingCents', 'taxCollectedCents', 'refundedCents', 'taxRefundedCents', 'refundedSalesCents', 'refundedShippingCents', 'netSalesCents', 'netTaxCents', 'refundAllocationComplete', 'unallocatedRefundCents', 'reconciliationRequired'], list) };
     },
     async brandAnnualPayouts(year, brandId) {
       const y = int(Number(year), 'year', 2000, 2100);
@@ -290,15 +332,18 @@ export function createReports(db, { domain }) {
       const out = [];
       for (const b of brands) {
         const bags = await rows(db, 'SELECT * FROM bags WHERE brand_id=$1 AND created_at>=$2 AND created_at<$3', [b.id, start, end]);
+        const allocations = await Promise.all(bags.map(refundAllocation));
+        const refundAllocationComplete = allocations.every(a=>a.complete);
         const monthly = Array(12).fill(0);
         for (const bag of bags) monthly[new Date(bag.createdAt).getUTCMonth()] += bag.totalCents;
         const paid = await first(db, "SELECT COALESCE(SUM(amount_cents-reversed_cents),0)::int AS c FROM transfers WHERE brand_id=$1 AND status IN ('paid','reversed') AND paid_at>=$2 AND paid_at<$3", [b.id, start, end]);
         out.push({ brandId: b.id, brandName: b.name, connectedAccount: b.stripeAccountId || null, year: y,
           grossPaymentVolumeCents: bags.reduce((s, x) => s + x.totalCents, 0), transactionCount: bags.length,
-          refundsCents: bags.reduce((s, x) => s + x.refundedCents, 0), commissionCents: bags.reduce((s, x) => s + (x.status === 'refunded' ? 0 : x.commissionCents), 0),
+          refundsCents: bags.reduce((s, x) => s + x.refundedCents, 0), commissionCents: refundAllocationComplete ? bags.reduce((s,x,i)=>s+x.commissionCents-allocations[i].commission,0) : null,
+          refundAllocationComplete, reconciliationRequired: !refundAllocationComplete, unallocatedRefundCents: allocations.reduce((s,a)=>s+a.unallocated,0),
           netTransfersPaidCents: paid.c, monthlyGrossCents: monthly });
       }
-      const header = ['brandId', 'brandName', 'connectedAccount', 'year', 'grossPaymentVolumeCents', 'transactionCount', 'refundsCents', 'commissionCents', 'netTransfersPaidCents', ...Array.from({ length: 12 }, (_, i) => `m${String(i + 1).padStart(2, '0')}`)];
+      const header = ['brandId', 'brandName', 'connectedAccount', 'year', 'grossPaymentVolumeCents', 'transactionCount', 'refundsCents', 'commissionCents', 'netTransfersPaidCents', 'refundAllocationComplete', 'unallocatedRefundCents', 'reconciliationRequired', ...Array.from({ length: 12 }, (_, i) => `m${String(i + 1).padStart(2, '0')}`)];
       return { year: y, brands: out, note: '1099-K style data only. Under Stripe Connect, Stripe may file 1099-Ks for connected accounts; confirm responsibilities before filing.',
         csv: csv(header, out.map(r => ({ ...r, ...Object.fromEntries(r.monthlyGrossCents.map((v, i) => [`m${String(i + 1).padStart(2, '0')}`, v])) }))) };
     },

@@ -1,8 +1,11 @@
 # Avafem backend + CRM features (branch `ava/backend-crm`)
 
-Everything here is **local-only and sandbox**: email/SMS go to a simulated outbox
-(`message_outbox`, status `simulated`), Stripe/Shopify/WooCommerce/BigCommerce calls are
-mocked, and no live credentials are read. Platform modules live in `server/platform/`,
+These modules are **sandbox features, not a production-completion claim**. Email/SMS
+go to a simulated outbox (`message_outbox`, status `simulated`), subscription charges
+and self-serve Express onboarding are mocked. WooCommerce/BigCommerce adapters can make
+real HTTPS requests when explicitly connected; automated tests inject fake transports
+and never use provider credentials. The existing provider-backed Shopify/Stripe unified
+checkout remains separate. Platform modules live in `server/platform/`,
 their tables in `server/platform/schema.sql` (created idempotently on boot), REST routes in
 `server/platform/routes.mjs`, OpenAPI additions in `server/platform/openapi.mjs`, and brand
 MCP tools are appended to the existing `/mcp` server. The operator UI is the
@@ -67,11 +70,11 @@ Tests: `tests/platform-money.test.mjs`.
 | Onboarding checklist: signup → agreement → profile (ship-from, shipping table, support email) → store connection → Stripe Express → catalog submitted → catalog approved → live, plus the core `onboardingRequirements` | `GET /api/portal/:brandId/status`, `PATCH …/profile`, MCP `get_onboarding_status` |
 | Stripe Express onboarding (**mocked** AccountLink + simulated `account.updated`; uses `acct_sandbox_…` ids) | `POST /api/portal/:brandId/stripe/link`, `…/stripe/return` |
 | Store connection: WooCommerce (consumer key/secret), BigCommerce (store hash + token), CSV, or Shopify (hands off to the existing OAuth install). Credentials are verified, then stored AES‑GCM encrypted; disconnect wipes them | `POST /api/portal/:brandId/connect`, `GET …/connectors`, `DELETE …/connectors/:platform` |
-| Connector adapters behind one interface (`verify`, `listProducts`, `createOrder`), all HTTP via injected `fetch` | `server/platform/connectors.mjs` |
+| Connector adapters behind one interface (`verify`, `listProducts`, `createOrder`); default HTTPS transport pins public DNS, rejects redirects and bounds request time/response size; tests inject fake transports and DNS | `server/platform/connectors.mjs` |
 | Catalog sync from Woo/BigCommerce and CSV fallback (Avafem columns or Shopify product export) into the core catalog (products land in draft/in_review with validation issues) | `POST …/connectors/:platform/sync`, `POST /api/portal/:brandId/catalog/csv`, `POST /v1/catalog/csv`, MCP `upload_catalog_csv` |
 | Catalog approval queue (validation issues + Phase 4 compliance flags); approve with the existing `POST /api/products/:id/review` | `GET /api/portal/review-queue` |
 | Operator activation (refuses while core requirements remain) | `POST /api/portal/:brandId/activate` |
-| Push a Bag to the brand's Woo/BigCommerce store (idempotent per Bag) | `POST /api/connectors/orders/:bagId/push` |
+| Push an unowned Bag to the brand's selected Woo/BigCommerce store: durable cross-workflow reservation before one create, replay of verified receipts, no resend after uncertain results; provider-bound/already-mapped Bags are rejected | `POST /api/connectors/orders/:bagId/push` |
 | Brand analytics: sales (gross, net, AOV, commission), returns (rate), conversion (swipes, likes, liked→purchased rate, placement impressions/clicks/CTR), top products | `GET /api/brands/:id/analytics`, `GET /v1/analytics`, MCP `get_brand_analytics` |
 | Paid placements: `featured_spot` ($25/day), `sponsored_swipe` ($10 per 1,000 impressions), `sampling_box` ($1.50/unit); approved product only; operator approval creates an `invoiced` billing record (`invoice` or `payout_offset`); cancel before start voids it; shopper feed caps sponsored swipes at purchased impressions | `/api/placements…`, `/api/billing…`, `/v1/placements`, `/v1/billing`, MCP `list_placements`, `request_placement` |
 
@@ -81,15 +84,30 @@ Tests: `tests/platform-brands.test.mjs` (WooCommerce/BigCommerce HTTP fully mock
 
 | Capability | Where |
 |---|---|
-| Cross-brand subscriptions / auto-replenish: one subscription holds items from several brands; each renewal creates one canonical sandbox order (core splits into per-brand Bags), a **mocked** Stripe charge (`pm_…` test method; ids `sub_sim_…`/`pi_sim_…`), links the order to the shopper and earns Beauty Bank credit. Declines release the renewal Bags (sandbox refund), retry daily, and after 3 failures go `past_due` with a service notice in the simulated outbox. Optional `alignToCycle` schedules the next box 3 days before the next period (health consent; access logged). Ship-to is encrypted. | `server/platform/commerce.mjs`, `POST /api/crm/shoppers/:id/subscriptions`, `GET /api/subscriptions`, `POST /api/subscriptions/:id/status`, `GET …/runs`, `POST /api/subscriptions/run`, background worker |
-| Shipping rules: free-shipping threshold on cart merchandise subtotal; the waived shipping is funded from each Bag's commission, capped at that commission (any excess is reported as `absorbedCents`). Quote API for checkout; per-order booking of subsidies (idempotent) and a subsidy report. The core order/transfer math is unchanged — brands still receive their shipping; the shopper discount is applied at charge time. | `GET/PUT /api/shipping/rules`, `POST /api/shipping/quote`, `POST /api/shipping/orders/:orderId/apply`, `GET /api/shipping/subsidies` |
-| Health data separation: intake + cycle live only in `health_records`, encrypted with a dedicated purpose-bound AES-256-GCM key (separate from shopper-PII and credential keys); every read/write needs a declared purpose and is written to `health_access_log`; reads require `health` consent (except DSAR export) | `server/platform/health.mjs`, `GET /api/privacy/shoppers/:id/health-access-log` |
+| Cross-brand subscriptions / auto-replenish: a durable per-cycle attempt claims the work, obtains a canonical read-only quote, and runs a **mocked** charge (`pi_sim_…`). Only confirmed success creates a paid sandbox order, split into per-brand Bags. Known declines create no orders, retry daily, and go `past_due` after 3 failures. Unknown/crashed charge attempts or post-charge persistence failures require operator review and cannot automatically re-charge. Optional cycle alignment requires health consent; ship-to is encrypted. Not integrated with real Stripe subscriptions or hosted unified checkout. | `server/platform/commerce.mjs`, `POST /api/crm/shoppers/:id/subscriptions`, `GET /api/subscriptions`, `POST /api/subscriptions/:id/status`, `GET …/runs`, `POST /api/subscriptions/run`, background worker |
+| Shipping-policy simulation: threshold quotes and idempotent per-order subsidy plans show the proposed commission funding/absorbed cost. **No real charge discount or general-ledger subsidy is applied.** Responses explicitly report `appliedToCharge:false` / `ledgerBooked:false`; provider checkout integration is still required. | `GET/PUT /api/shipping/rules`, `POST /api/shipping/quote`, `POST /api/shipping/orders/:orderId/apply`, `GET /api/shipping/subsidies` |
+| Health data separation: intake/cycle in `health_records` and health-derived outbox content/campaign linkage are encrypted with separate purpose-bound keys. Health-message dedupe keys are HMACs, not raw dates/segment membership. Reads require a declared purpose and current health consent (except explicit DSAR export), with an access log; withdrawal redacts outbox reads. Legacy outbox rows are protected on migration. | `server/platform/health.mjs`, `GET /api/privacy/shoppers/:id/health-access-log` |
 | DSAR export (profile, orders, health, access log, reviews, tickets, messages, Beauty Bank, subscriptions) and erasure (`confirm: "DELETE"`): deletes health and swipes, wipes PII/consent, redacts tickets/outbox, hides reviews and removes them from the brand feed, cancels subscriptions, forfeits open credits (journaled), keeps de-identified orders/Bags for tax and accounting | `POST /api/privacy/shoppers/:id/export`, `POST /api/privacy/shoppers/:id/delete`, `GET /api/privacy/requests` |
 | Listing compliance check: rule-based flags for disease claims (verb + condition, e.g. "treats bacterial vaginosis"), drug/regulatory claims ("antibiotic", "FDA approved"), risky claims (warn), supplements missing the DSHEA disclaimer or contraindications, banned/restricted ingredients. **Approval gate:** `POST /api/products/:id/review` with `approved` returns `409 COMPLIANCE_BLOCKED` while blocking flags remain, unless an operator records an override (reason ≥ 10 chars) that is bound to the exact listing content (any edit invalidates it) | `server/platform/compliance.mjs`, `POST /api/compliance/check`, `GET /api/products/:id/compliance`, `POST …/compliance/override`, `GET /api/compliance/brands/:id`, `GET /v1/compliance`, MCP `check_product_compliance`, `get_compliance_report` |
 
 The rule lists are a screening aid, not legal advice; keep a human reviewer and counsel in the loop.
 
 Tests: `tests/platform-commerce.test.mjs`.
+
+## PR review hardening
+
+Regression coverage includes internal-network/redirect/DNS-rebinding rejection, durable
+connector dispatch uncertainty, decline-then-success and concurrent renewal claims,
+encrypted/consent-gated health outbox reads, historical erasure cleanup, atomic credit
+expiry/reversal, extended return holds, lost-dispute holds and exact partial-refund
+allocations. Approved refunds now persist merchandise/shipping/tax/commission components.
+Historical partial refunds lacking that evidence return reconciliation flags and null net
+figures rather than fabricated allocations. The migration does not contact providers.
+
+Unknown connector/renewal outcomes deliberately remain blocked for manual reconciliation;
+there is no automatic recovery endpoint. Beauty Bank redemption, checkout risk enforcement,
+shipping discounts and subscriptions still need explicit provider-backed checkout wiring.
+Passing isolated tests does not certify those integrations or production readiness.
 
 ## Running locally
 
