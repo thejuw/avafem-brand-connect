@@ -696,9 +696,16 @@ export async function createApp(options = {}) {
     if (request.method === 'GET' && !/^\/(api|v1|oauth|webhooks|mcp)(\/|$)/.test(request.url) && existsSync(resolve(dist, 'index.html'))) return reply.sendFile('index.html');
     return reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'Route not found.' } });
   });
-  let interval;
+  let interval; let lastAlertKey = '';
   if (options.worker !== false) { interval = setInterval(async () => {
-    try { await providerJobs.run(); await operations.runJobs(); }
+    try {
+      const result = await providerJobs.run(); await operations.runJobs();
+      // Swallowed per-run failures (e.g. nightly_reconciliation_pending) must reach an operator.
+      const pending = [...new Set((result?.lifecycle ?? []).map(entry => entry.state).filter(state => /_pending$|_review$/.test(String(state))))].sort();
+      const key = pending.join(',');
+      if (key && key !== lastAlertKey) app.log.warn({ code: 'WORKER_ATTENTION_REQUIRED', states: pending }, 'Background jobs need attention');
+      lastAlertKey = key;
+    }
     catch (error) { app.log.error({ code: error.code || 'WORKER_ERROR' }, 'Background job failed'); }
   }, 5000); interval.unref(); }
   app.addHook('onClose', async () => { if (interval) clearInterval(interval); await providerFailureCheckouts.close(); operations.clearLocalStripeCredentials(); if (!options.db) await db.close(); });
