@@ -51,7 +51,44 @@ export function registerPlatformRoutes(app, h) {
   app.get('/v1/tickets', async r => { const ctx = await context(r, { scope: 'orders:read' }); return data(await crm.listTickets({ brandId: ctx.brandId, status: r.query.status })); });
   app.post('/v1/tickets/:id/replies', (r, reply) => apiMutation(r, reply, (ctx, input) => crm.replyTicket(input.id, input.body, ctx.brandId), { id: r.params.id, body: r.body || {} }, 'orders:read'));
 
+  registerMoneyRoutes(app, h, admin);
   for (const extra of h.extra || []) extra(app, h);
+}
+
+function registerMoneyRoutes(app, h, admin) {
+  const { platform, browserRoute, context, brandScope, data } = h;
+  const { bank, console: con, risk, reports } = platform;
+  const sendReport = (reply, r, report) => r.query.format === 'csv' ? reply.type('text/csv; charset=utf-8').send(report.csv) : data(report);
+  // ---- Phase 2: Beauty Bank ----
+  app.get('/api/bank/shoppers/:id', async r => { await admin(r); await platform.crm.summary(r.params.id); return data({ balance: await bank.balance(r.params.id), lots: await bank.lots(r.params.id), history: await bank.history(r.params.id) }); });
+  app.post('/api/bank/shoppers/:id/earn', async r => { await admin(r); return data(await bank.earnForOrder(r.params.id, z.object({ orderId: z.string().min(1) }).parse(r.body).orderId)); });
+  app.post('/api/bank/shoppers/:id/goodwill', async r => { const ctx = await admin(r); await platform.crm.summary(r.params.id); const i = z.object({ amountCents: z.number().int(), reason: z.string().max(300).optional() }).parse(r.body); const lot = await bank.grantGoodwill(r.params.id, i); await platform.auth.audit(ctx, 'bank.goodwill', lot.id); return data(lot); });
+  app.post('/api/bank/shoppers/:id/redeem', async r => { await admin(r); await platform.crm.summary(r.params.id); const i = z.object({ amountCents: z.number().int(), orderRef: z.string().max(100).optional() }).parse(r.body); return data(await bank.redeem(r.params.id, { ...i, idempotencyKey: r.headers['idempotency-key'] })); });
+  app.get('/api/bank/liability', async r => { await admin(r); return data(await bank.liabilityReport()); });
+  app.post('/api/bank/run', async r => { await admin(r); return data(await bank.run()); });
+  // ---- Admin console ----
+  app.get('/api/admin/console', async r => { await admin(r); return data(await con.summary()); });
+  app.get('/api/admin/disputes', async r => { const ctx = await browserRoute(r, 'payouts:read'); return data(await con.listDisputes(brandScope(ctx, r.query.brandId))); });
+  app.post('/api/admin/disputes', async r => { const ctx = await admin(r); const d = await con.openDispute(r.body); await platform.auth.audit(ctx, 'dispute.opened', d.id); return data(d); });
+  app.post('/api/admin/disputes/:id/evidence', async r => { await admin(r); return data(await con.submitEvidence(r.params.id, r.body || {})); });
+  app.post('/api/admin/disputes/:id/resolve', async r => { const ctx = await admin(r); const d = await con.resolveDispute(r.params.id, r.body?.outcome); await platform.auth.audit(ctx, `dispute.${d.status}`, d.id); return data(d); });
+  app.get('/api/admin/holds', async r => { await admin(r); return data(await con.holds()); });
+  app.post('/api/admin/holds/:id/release', async r => { const ctx = await admin(r); const out = await con.releaseHold(r.params.id); await platform.auth.audit(ctx, 'transfer.hold_released', r.params.id); return data(out); });
+  app.get('/api/admin/stuck-transfers', async r => { await admin(r); return data(await con.stuckTransfers()); });
+  app.post('/api/admin/stuck-transfers/:id/retry', async r => { await admin(r); return data(await con.retryStuck(r.params.id)); });
+  app.get('/api/admin/alerts', async r => { await admin(r); return data(await con.alerts({ all: r.query.all === 'true' })); });
+  app.post('/api/admin/alerts/scan', async r => { await admin(r); return data(await con.scan()); });
+  app.post('/api/admin/alerts/:id/ack', async r => { await admin(r); return data(await con.acknowledge(r.params.id)); });
+  app.post('/api/admin/payout-checks', async r => { const ctx = await admin(r); const out = await con.payoutChecks({ enforce: r.body?.enforce === true }); await platform.auth.audit(ctx, 'payout_checks.run', null); return data(out); });
+  // ---- Risk ----
+  app.post('/api/risk/checkout', async r => { await admin(r); return data(await risk.scoreCheckout(r.body || {})); });
+  app.get('/api/risk/assessments', async r => { await admin(r); return data(await risk.list(r.query.type)); });
+  app.get('/api/brands/:id/payout-check', async r => { const ctx = await browserRoute(r, 'payouts:read'); brandScope(ctx, r.params.id); return data(await risk.brandPayoutCheck(r.params.id)); });
+  // ---- Reports ----
+  app.get('/api/reports/sales-tax', async (r, reply) => { await admin(r); return sendReport(reply, r, await reports.salesTax({ from: r.query.from, to: r.query.to })); });
+  app.get('/api/reports/brand-payouts', async (r, reply) => { const ctx = await browserRoute(r, 'payouts:read'); return sendReport(reply, r, await reports.brandAnnualPayouts(r.query.year || new Date().getUTCFullYear(), brandScope(ctx, r.query.brandId))); });
+  app.get('/v1/disputes', async r => { const ctx = await context(r, { scope: 'payouts:read' }); return data(await con.listDisputes(ctx.brandId)); });
+  app.get('/v1/reports/payouts', async (r, reply) => { const ctx = await context(r, { scope: 'payouts:read' }); return sendReport(reply, r, await reports.brandAnnualPayouts(r.query.year || new Date().getUTCFullYear(), ctx.brandId)); });
 }
 
 /** MCP tools added to the brand MCP server (tenant-scoped). */
@@ -61,6 +98,8 @@ export function platformMcpTools(platform) {
     read('list_reviews', 'Read verified-purchase reviews synced to your brand (no shopper PII).', {}, () => { need('orders:read'); return platform.crm.brandReviews(ctx.brandId); });
     read('list_support_tickets', 'List support tickets linked to your brand’s Bags.', { status: zz.enum(['open', 'pending_brand', 'resolved']).optional() }, input => { need('orders:read'); return platform.crm.listTickets({ brandId: ctx.brandId, status: input.status }); });
     write('reply_support_ticket', 'Reply to a support ticket linked to one of your Bags. The shopper is notified via the simulated outbox.', { id: zz.string(), body: zz.string().min(1).max(4000) }, 'mcp:reply_support_ticket', input => { need('orders:read'); return platform.crm.replyTicket(input.id, { body: input.body }, ctx.brandId); });
+    read('list_disputes', 'List chargeback disputes on your Bags (simulated Stripe disputes).', {}, () => { need('payouts:read'); return platform.console.listDisputes(ctx.brandId); });
+    read('get_annual_payout_report', 'Read your 1099-K style annual gross volume and net transfer data.', { year: zz.number().int().min(2000).max(2100) }, async input => { need('payouts:read'); const r = await platform.reports.brandAnnualPayouts(input.year, ctx.brandId); return r.brands[0]; });
     for (const extra of platform.mcpExtras || []) extra({ read, write, ctx, z: zz, need });
   };
 }

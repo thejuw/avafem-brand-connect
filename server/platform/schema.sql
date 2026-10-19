@@ -34,3 +34,20 @@ CREATE TABLE IF NOT EXISTS reviews (
   UNIQUE(shopper_id,bag_id,product_id)
 );
 CREATE TABLE IF NOT EXISTS brand_sync_feed (id TEXT PRIMARY KEY, brand_id TEXT NOT NULL, kind TEXT NOT NULL, resource_id TEXT NOT NULL, payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL, UNIQUE(kind,resource_id));
+CREATE TABLE IF NOT EXISTS bank_lots (
+  id TEXT PRIMARY KEY, shopper_id TEXT NOT NULL REFERENCES shoppers(id), bag_id TEXT, source TEXT NOT NULL CHECK (source IN ('purchase','goodwill','promo')),
+  state TEXT NOT NULL CHECK (state IN ('LAB','VAULT','REVERSED','EXPIRED')),
+  amount_cents INTEGER NOT NULL CHECK (amount_cents>0), remaining_cents INTEGER NOT NULL CHECK (remaining_cents BETWEEN 0 AND amount_cents),
+  matures_at TIMESTAMPTZ, expires_at TIMESTAMPTZ, source_key TEXT NOT NULL UNIQUE, note TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS bank_lots_shopper ON bank_lots(shopper_id,state);
+CREATE TABLE IF NOT EXISTS bank_events (id BIGSERIAL PRIMARY KEY, lot_id TEXT, shopper_id TEXT NOT NULL, kind TEXT NOT NULL, from_state TEXT, to_state TEXT, amount_cents INTEGER NOT NULL, ref TEXT, created_at TIMESTAMPTZ NOT NULL);
+CREATE TABLE IF NOT EXISTS bank_redemptions (id TEXT PRIMARY KEY, shopper_id TEXT NOT NULL, amount_cents INTEGER NOT NULL CHECK (amount_cents>0), idempotency_key TEXT NOT NULL UNIQUE, allocations JSONB NOT NULL, order_ref TEXT, created_at TIMESTAMPTZ NOT NULL);
+CREATE TABLE IF NOT EXISTS disputes (
+  id TEXT PRIMARY KEY, external_id TEXT NOT NULL UNIQUE, bag_id TEXT NOT NULL, brand_id TEXT NOT NULL, amount_cents INTEGER NOT NULL CHECK (amount_cents>0),
+  reason TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('needs_response','under_review','won','lost')),
+  evidence JSONB NOT NULL DEFAULT '{}', respond_by TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS platform_alerts (id TEXT PRIMARY KEY, kind TEXT NOT NULL, severity TEXT NOT NULL, resource_id TEXT, message TEXT NOT NULL, dedupe_key TEXT NOT NULL UNIQUE, acknowledged_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL);
+CREATE TABLE IF NOT EXISTS risk_assessments (id TEXT PRIMARY KEY, subject_type TEXT NOT NULL, subject_id TEXT, score INTEGER NOT NULL, decision TEXT NOT NULL, signals JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL);

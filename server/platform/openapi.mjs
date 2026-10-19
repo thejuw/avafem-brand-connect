@@ -29,6 +29,34 @@ addPaths([
   ['get', '/api/crm/brand/reviews', 'brandSessionReviews', 'orders:read'],
   ['post', '/api/crm/jobs/run', 'adminRunPlatformJobs', 'admin'],
 ]);
+addPaths([
+  ['get', '/api/bank/shoppers/{id}', 'adminBankAccount', 'admin'],
+  ['post', '/api/bank/shoppers/{id}/earn', 'adminBankEarn', 'admin', { type: 'object', required: ['orderId'] }],
+  ['post', '/api/bank/shoppers/{id}/goodwill', 'adminBankGoodwill', 'admin', { type: 'object', required: ['amountCents'] }],
+  ['post', '/api/bank/shoppers/{id}/redeem', 'adminBankRedeem', 'admin', { type: 'object', required: ['amountCents'] }],
+  ['get', '/api/bank/liability', 'adminBankLiability', 'admin'],
+  ['post', '/api/bank/run', 'adminBankRun', 'admin'],
+  ['get', '/api/admin/console', 'adminConsole', 'admin'],
+  ['get', '/api/admin/disputes', 'listDisputes', 'payouts:read'],
+  ['post', '/api/admin/disputes', 'adminOpenDispute', 'admin', { type: 'object', required: ['externalId', 'bagId'] }],
+  ['post', '/api/admin/disputes/{id}/evidence', 'adminDisputeEvidence', 'admin', { type: 'object' }],
+  ['post', '/api/admin/disputes/{id}/resolve', 'adminResolveDispute', 'admin', { type: 'object', required: ['outcome'] }],
+  ['get', '/api/admin/holds', 'adminHolds', 'admin'],
+  ['post', '/api/admin/holds/{id}/release', 'adminReleaseHold', 'admin'],
+  ['get', '/api/admin/stuck-transfers', 'adminStuckTransfers', 'admin'],
+  ['post', '/api/admin/stuck-transfers/{id}/retry', 'adminRetryStuck', 'admin'],
+  ['get', '/api/admin/alerts', 'adminAlerts', 'admin'],
+  ['post', '/api/admin/alerts/scan', 'adminScanAlerts', 'admin'],
+  ['post', '/api/admin/alerts/{id}/ack', 'adminAckAlert', 'admin'],
+  ['post', '/api/admin/payout-checks', 'adminPayoutChecks', 'admin', { type: 'object', properties: { enforce: { type: 'boolean' } } }],
+  ['post', '/api/risk/checkout', 'adminScoreCheckout', 'admin', { type: 'object' }],
+  ['get', '/api/risk/assessments', 'adminRiskAssessments', 'admin'],
+  ['get', '/api/brands/{id}/payout-check', 'brandPayoutCheck', 'payouts:read'],
+  ['get', '/api/reports/sales-tax', 'adminSalesTaxReport', 'admin'],
+  ['get', '/api/reports/brand-payouts', 'brandAnnualPayouts', 'payouts:read'],
+  ['get', '/v1/disputes', 'listBrandDisputes', 'payouts:read'],
+  ['get', '/v1/reports/payouts', 'brandAnnualPayoutReport', 'payouts:read'],
+]);
 export function mergePlatformPaths(doc, operation) {
   for (const [method, path, operationId, scope, body] of PLATFORM_PATHS) {
     const params = [...path.matchAll(/\{(\w+)\}/g)].map(m => ({ name: m[1], in: 'path', required: true, schema: { type: 'string' } }));
