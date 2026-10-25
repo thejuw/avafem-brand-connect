@@ -71,6 +71,19 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
     return row;
   };
   async function requirements(tx, brand) {
+    if((await first(tx,"SELECT to_regclass('commerce_brand_policy_versions') AS relation")).relation){
+      const policy=await first(tx,'SELECT config FROM commerce_brand_policy_versions WHERE brand_id=$1 ORDER BY version DESC LIMIT 1',[brand.id]);
+      if(policy?.config?.model==='first_party'){
+        const missing=[];
+        if(!brand.shipFromAddress?.line1||!brand.shipFromAddress?.postal)missing.push('Avafem warehouse ship-from address');
+        if(!brand.supportEmail)missing.push('Support contact');
+        const nativeTable=(await first(tx,"SELECT to_regclass('commerce_native_variants') AS relation")).relation;
+        const approved=nativeTable?await first(tx,`SELECT COUNT(*)::int AS count FROM products p
+          JOIN commerce_native_variants v ON v.product_id=p.id WHERE p.brand_id=$1 AND p.status='approved' AND p.source_deleted_at IS NULL`,[brand.id]):{count:0};
+        if(!approved.count)missing.push('Approved product with a native variant');
+        return missing;
+      }
+    }
     if (brand.onboardingMode === 'two_step') {
       const missing = [];
       if (!brand.agreementSigned) missing.push('Signed brand agreement');
@@ -153,6 +166,12 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
     if (!Array.isArray(input.items) || !input.items.length || input.items.length>100) fail('Provide 1–100 catalog items.');
     const grouped=new Map(), allocations=new Map();
     for (const line of input.items) {
+      // Native stock has its own atomic reservation authority. Legacy fixtures
+      // must never sell a second copy through the old product scalar counter.
+      if ((await first(tx,"SELECT to_regclass('commerce_brand_policy_versions') AS relation")).relation) {
+        const policy=await first(tx,'SELECT config FROM commerce_brand_policy_versions WHERE brand_id=$1 ORDER BY version DESC LIMIT 1',[line.brandId]);
+        if(policy?.config?.model==='first_party')fail('Use the native commerce checkout for Avafem inventory.',409,'COMMERCE_WORKFLOW_REQUIRED');
+      }
       const qty=integer(line.qty ?? line.quantity ?? 1,'qty',1,1000);
       const brand=await brandRow(tx,line.brandId);
       if (brand.status==='disconnected' || brand.status==='paused') fail('This brand is unavailable for new sandbox orders.',409,'BRAND_UNAVAILABLE');
@@ -192,7 +211,7 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
   async function bagView(tx, bag) {
     const order = await first(tx, 'SELECT order_ref FROM orders WHERE id=$1', [bag.orderId]);
     const brand = await brandRow(tx, bag.brandId);
-    return { ...bag, shipTo:await revealAddress(bag.shipTo), orderRef: order.orderRef, brandName: brand.name,
+    return { ...bag, items:bag.items.map(({unitCostCents,units,...item})=>item),shipTo:await revealAddress(bag.shipTo), orderRef: order.orderRef, brandName: brand.name,
       shipments: await rows(tx, 'SELECT * FROM shipments WHERE bag_id=$1 ORDER BY created_at,id', [bag.id]),
       credit: await first(tx, 'SELECT * FROM credits WHERE bag_id=$1', [bag.id]),
       transfer: await first(tx, 'SELECT * FROM transfers WHERE bag_id=$1', [bag.id]) };
@@ -512,6 +531,7 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
     async recordShipment(bagId,input = {},brandId,options = {}) {
       return db.transaction(async tx => {
         const bag=await owned(tx,'bags',bagId,brandId);
+        if (bag.commerceManaged) fail('Use the commerce fulfillment workflow for this Bag.',409,'COMMERCE_WORKFLOW_REQUIRED');
         if (bag.providerBound) fail('Use the provider-backed fulfillment workflow for this Bag.',409,'PROVIDER_WORKFLOW_REQUIRED');
         let handoff;
         if (options.handoffTokenHash) {
@@ -556,6 +576,7 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
     async markDelivered(bagId,input = {},brandId) {
       return db.transaction(async tx => {
         const bag=await owned(tx,'bags',bagId,brandId);
+        if (bag.commerceManaged) fail('Use the commerce delivery workflow for this Bag.',409,'COMMERCE_WORKFLOW_REQUIRED');
         if (bag.providerBound) fail('Provider delivery evidence is required for this Bag.',409,'PROVIDER_WORKFLOW_REQUIRED');
         const brand=await brandRow(tx,bag.brandId);
         if (bag.status==='delivered') return bagView(tx,await extendScheduledWindow(tx,bag,brand));
@@ -583,6 +604,7 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
     async requestRefund(bagId,input = {},brandId) {
       return db.transaction(async tx => {
         const bag=await owned(tx,'bags',bagId,brandId);
+        if (bag.commerceManaged) fail('Use the commerce refund workflow for this Bag.',409,'COMMERCE_WORKFLOW_REQUIRED');
         if (bag.providerBound) fail('Use the provider-backed refund workflow for this Bag.',409,'PROVIDER_WORKFLOW_REQUIRED');
         const existing=await first(tx,"SELECT * FROM refunds WHERE bag_id=$1 AND status IN ('proposed','approved') ORDER BY created_at LIMIT 1",[bagId]);
         if (existing) return existing;
@@ -604,6 +626,7 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
         if (refund.status==='approved') return refund;
         if (refund.status!=='proposed') fail('Refund is no longer awaiting approval.',409,'REFUND_CLOSED');
         const bag=await owned(tx,'bags',refund.bagId);
+        if (bag.commerceManaged) fail('Use the commerce refund workflow for this Bag.',409,'COMMERCE_WORKFLOW_REQUIRED');
         if (bag.providerBound) fail('A synthetic refund cannot change a provider-backed Bag.',409,'PROVIDER_WORKFLOW_REQUIRED');
         if (bag.status==='refunded') fail('Bag has already been refunded.',409,'REFUND_CLOSED');
         const transfer=await first(tx,'SELECT * FROM transfers WHERE bag_id=$1',[bag.id]);
@@ -640,7 +663,7 @@ export function createDomain(db, { clock = () => new Date(), protectShipping, re
         const paid=[];
         for (const job of due) {
           let bag=await owned(tx,'bags',job.bagId);
-          if (bag.providerBound) {
+          if (bag.providerBound || bag.commerceManaged) {
             await tx.query("UPDATE jobs SET status='held',last_error='Provider-backed settlement required' WHERE id=$1",[job.id]);
             continue;
           }

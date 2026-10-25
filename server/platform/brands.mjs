@@ -33,11 +33,22 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
     return { ...bag, shipTo: shipping, orderRef: order?.orderRef };
   }
   async function assertOpen(tx, bag) {
-    if (bag.providerBound) fail('Use the provider-backed fulfillment workflow for this Bag.', 409, 'PROVIDER_WORKFLOW_REQUIRED');
+    assertLegacyWorkflow(bag);
     const blocked = await first(tx, `SELECT EXISTS(SELECT 1 FROM refunds WHERE bag_id=$1 AND status='proposed') AS refund_pending,
       EXISTS(SELECT 1 FROM shipments WHERE bag_id=$1) AS shipment_exists`, [bag.id]);
     if (bag.status !== 'awaiting_shipment' || bag.refundedCents > 0 || blocked.refundPending || blocked.shipmentExists)
       fail('Only unshipped, unrefunded Bags without refund proposals can be dispatched or recovered.', 409, 'INVALID_BAG_STATE');
+  }
+  function assertLegacyWorkflow(bag) {
+    if (bag.providerBound) fail('Use the provider-backed fulfillment workflow for this Bag.', 409, 'PROVIDER_WORKFLOW_REQUIRED');
+    if (bag.commerceManaged) fail('Use the commerce fulfillment workflow; simulated commerce Bags cannot be sent to an external store.',409,'COMMERCE_WORKFLOW_REQUIRED');
+  }
+  async function assertExternalCatalog(tx,brandId) {
+    if(!(await tx.query('SELECT id FROM brands WHERE id=$1 FOR UPDATE',[brandId])).rows.length)fail('Brand not found.',404,'NOT_FOUND');
+    if(!(await first(tx,"SELECT to_regclass('commerce_brand_policy_versions') AS relation"))?.relation)return;
+    const policy=await first(tx,'SELECT config FROM commerce_brand_policy_versions WHERE brand_id=$1 ORDER BY version DESC LIMIT 1',[brandId]);
+    if(policy?.config?.model==='first_party'||policy?.config?.inventoryAuthority==='native')
+      fail('Native first-party catalog and stock cannot be replaced by an external connector or legacy import.',409,'COMMERCE_WORKFLOW_REQUIRED');
   }
   async function selectedConnector(tx, bag, expectedTarget) {
     const brand = await first(tx, 'SELECT * FROM brands WHERE id=$1', [bag.brandId]);
@@ -107,10 +118,11 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
   }
   async function sendAttempt(reservation) {
     const { attempt, frozen, connector } = reservation, bag = frozen.bag;
+    await db.transaction(async tx=>assertOpen(tx,await lockedBag(tx,bag.id)));
     try {
       const { externalId } = await adapters[connector.platform].createOrder(connector.credentials, bag, { dispatchId: attempt.id });
       return await db.transaction(async tx => {
-        await lockedBag(tx, bag.id);
+        assertLegacyWorkflow(await lockedBag(tx, bag.id));
         const external = await first(tx, 'SELECT * FROM external_orders WHERE bag_id=$1 FOR UPDATE', [bag.id]);
         const current = await first(tx, 'SELECT * FROM connector_dispatch_attempts WHERE id=$1 FOR UPDATE', [attempt.id]);
         if (!current || current.state !== 'pending' || !external || external.shop !== connector.marker || external.state !== 'connector_pending')
@@ -123,7 +135,8 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
       });
     } catch {
       try { await db.transaction(async tx => {
-        await tx.query('SELECT id FROM bags WHERE id=$1 FOR UPDATE', [bag.id]);
+        const current=await first(tx,'SELECT commerce_managed,provider_bound FROM bags WHERE id=$1 FOR UPDATE',[bag.id]);
+        if(current?.commerceManaged||current?.providerBound)return;
         await tx.query("UPDATE connector_dispatch_attempts SET state='uncertain',updated_at=$2 WHERE id=$1 AND state='pending'", [attempt.id, wall()]);
         await tx.query("UPDATE external_orders SET state='connector_uncertain',last_error='CONNECTOR_CREATE_NOT_VERIFIED',updated_at=$2 WHERE bag_id=$1 AND state='connector_pending' AND shop=$3", [bag.id, wall(), connector.marker]);
       }); } catch { /* A committed pending reservation still blocks every replay. */ }
@@ -131,7 +144,7 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
     }
   }
   async function assertCatalogLease(tx,brandId,lease) {
-    await tx.query('SELECT id FROM brands WHERE id=$1 FOR UPDATE',[brandId]);
+    await assertExternalCatalog(tx,brandId);
     const brand=await first(tx,'SELECT onboarding_state,status FROM brands WHERE id=$1',[brandId]),current=brand?.onboardingState?.catalogLease;
     if(!lease || current?.token!==lease.token || current.provider!==lease.provider || current.catalogKey!==lease.catalogKey || !current.expiresAt || new Date(current.expiresAt)<=wall())
       fail('The catalog import lease expired or was replaced; refresh the source snapshot.',409,'CATALOG_IMPORT_STALE');
@@ -144,7 +157,7 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
     if(!['shopify','woocommerce','bigcommerce','csv','feed'].includes(provider) || typeof catalogKey!=='string' || !catalogKey || catalogKey.length>500 || typeof fetchRows!=='function') fail('Use a bounded server-owned catalog source.');
     const lease={token:id('catalog'),provider,catalogKey,expiresAt:new Date(wall().getTime()+5*60_000).toISOString()};
     await db.transaction(async tx=>{
-      await tx.query('SELECT id FROM brands WHERE id=$1 FOR UPDATE',[brandId]);
+      await assertExternalCatalog(tx,brandId);
       const brand=await first(tx,'SELECT onboarding_state FROM brands WHERE id=$1',[brandId]);if(!brand)fail('Brand not found.',404,'NOT_FOUND');
       const previous=brand.onboardingState?.catalogLease;
       if(previous?.token && new Date(previous.expiresAt)>wall())fail('A catalog import is already reading or applying this brand’s snapshot.',409,'CATALOG_IMPORT_BUSY');
@@ -221,6 +234,7 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
       return side.status(brandId);
     },
     async stripeLink(brandId) {
+      await db.transaction(tx=>assertExternalCatalog(tx,brandId));
       const brand=await domain.getBrand(brandId);
       if(brand.onboardingMode==='two_step' || brand.onboardingState?.platform || brand.onboardingState?.connected)
         fail('Use the configured onboarding payout flow for this brand.',409,'USE_ONBOARDING_PAYOUT_FLOW');
@@ -231,6 +245,7 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
       return { account, url: `https://connect.stripe.com/setup/e/${account}/simulated`, type: 'account_onboarding', simulated: true, expiresAt: new Date(now().getTime() + 300_000).toISOString() };
     },
     async stripeReturn(brandId) {
+      await db.transaction(tx=>assertExternalCatalog(tx,brandId));
       const brand=await domain.getBrand(brandId);
       if(brand.onboardingMode==='two_step' || brand.onboardingState?.platform || brand.onboardingState?.connected)
         fail('Use the configured onboarding payout flow for this brand.',409,'USE_ONBOARDING_PAYOUT_FLOW');
@@ -242,6 +257,7 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
       return side.status(brandId);
     },
     async connect(brandId, platform, credentials = {}, {onboardingFlow=false} = {}) {
+      await db.transaction(tx=>assertExternalCatalog(tx,brandId));
       const brand = await domain.getBrand(brandId);
       if(!onboardingFlow && (brand.onboardingMode==='two_step' || brand.onboardingState?.platform || brand.onboardingState?.connected))
         fail('Use the two-step onboarding connection flow for this brand.',409,'USE_ONBOARDING_CONNECT_FLOW');
@@ -262,6 +278,7 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
     },
     async connectors(brandId) { return rows(db, 'SELECT brand_id,platform,store_ref,status,last_sync_at,last_result,created_at FROM brand_connectors WHERE brand_id=$1 ORDER BY platform', [brandId]); },
     async connectedProfile(brandId, platform) {
+      await db.transaction(tx=>assertExternalCatalog(tx,brandId));
       const c=await first(db,"SELECT * FROM brand_connectors WHERE brand_id=$1 AND platform=$2 AND status='connected'",[brandId,platform]);
       if(!c || !adapters[platform]?.profile) fail('This connected store cannot provide authenticated profile metadata.',409,'PROFILE_CAPABILITY_UNAVAILABLE');
       return adapters[platform].profile(creds.decrypt(c.credentialsEnc));
@@ -311,6 +328,8 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
       await domain.getBag(bagId);
       const reservation = await db.transaction(async tx => {
         const current = await lockedBag(tx, bagId);
+        // Receipt replay must not bypass ownership, even if old/stale rows exist.
+        assertLegacyWorkflow(current);
         const receipt = await first(tx, 'SELECT * FROM connector_orders WHERE bag_id=$1', [bagId]);
         if (receipt) {
           const external = await first(tx, 'SELECT * FROM external_orders WHERE bag_id=$1', [bagId]);
@@ -382,7 +401,8 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
     async listRecovery({ bagId, limit = 100 } = {}) {
       const cap = int(limit, 'limit', 1, 100);
       const list = await rows(db, `SELECT e.bag_id,e.brand_id,e.shop,e.state,e.external_order_id,e.updated_at
-        FROM external_orders e WHERE e.state IN ('connector_pending','connector_uncertain','connector_retry_authorized')
+        FROM external_orders e JOIN bags b ON b.id=e.bag_id WHERE NOT b.commerce_managed AND NOT b.provider_bound
+        AND e.state IN ('connector_pending','connector_uncertain','connector_retry_authorized')
         AND ($1::text IS NULL OR e.bag_id=$1) ORDER BY e.updated_at,e.bag_id LIMIT $2`, [bagId || null, cap]);
       return Promise.all(list.map(async row => {
         const attempts = await rows(db, `SELECT id,state,platform,external_id,created_at,updated_at FROM connector_dispatch_attempts
@@ -404,6 +424,7 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
       const requestHash = digest({ bagId, operationId, action, externalId, reason: reason.trim(), actor });
       const claim = await db.transaction(async tx => {
         const bag = await lockedBag(tx, bagId);
+        assertLegacyWorkflow(bag);
         const previous = await first(tx, 'SELECT *,lease_expires_at>NOW() AS lease_valid FROM connector_order_recoveries WHERE operation_id=$1 FOR UPDATE', [operationId]);
         if (previous && previous.requestHash !== requestHash) fail('The operation ID was already used for a different recovery.', 422, 'IDEMPOTENCY_CONFLICT');
         if (previous?.result) return { replay: { ...previous.result, replayed: true } };
@@ -443,6 +464,7 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
       }
       return db.transaction(async tx => {
         const bag = await lockedBag(tx, bagId);
+        assertLegacyWorkflow(bag);
         const review = await first(tx, 'SELECT *,lease_expires_at>NOW() AS lease_valid FROM connector_order_recoveries WHERE operation_id=$1 FOR UPDATE', [operationId]);
         if (!review || review.leaseToken !== claim.token || !review.leaseValid || review.status !== 'processing')
           fail('The recovery verification lease expired or changed. No dispatch was released.', 409, 'RECOVERY_LEASE_LOST');
@@ -472,7 +494,7 @@ export function createBrandSide(db, { clock, domain, auth, secret, shopifyConnec
         await audit(tx, actor, `connector.recovery_${status}`, bag);
         return result;
       }).catch(error => {
-        if (error?.code === 'RECOVERY_LEASE_LOST') throw error;
+        if (['RECOVERY_LEASE_LOST','COMMERCE_WORKFLOW_REQUIRED','PROVIDER_WORKFLOW_REQUIRED'].includes(error?.code)) throw error;
         fail('Recovery could not be committed. The dispatch remains reserved; retry only the same review operation after its lease expires.', 503, 'RECOVERY_COMMIT_FAILED');
       });
     },

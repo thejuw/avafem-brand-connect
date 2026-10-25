@@ -160,3 +160,25 @@ UPDATE transfers t SET due_at=GREATEST(t.due_at,b.payout_due_at)
 UPDATE jobs j SET due_at=GREATEST(j.due_at,b.payout_due_at)
   FROM bags b WHERE b.id=j.bag_id AND b.payout_due_at IS NOT NULL
   AND j.kind='sandbox_payout' AND j.status IN ('scheduled','held','failed');
+
+-- Hybrid commerce keeps legacy records and their money unchanged. A first-party
+-- Bag has retained retail proceeds, never a payable or a transfer to itself.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_cents INTEGER NOT NULL DEFAULT 0 CHECK(discount_cents>=0 AND discount_cents<=subtotal_cents);
+ALTER TABLE bags ADD COLUMN IF NOT EXISTS discount_cents INTEGER NOT NULL DEFAULT 0 CHECK(discount_cents>=0 AND discount_cents<=subtotal_cents);
+ALTER TABLE bags ADD COLUMN IF NOT EXISTS settlement_model TEXT NOT NULL DEFAULT 'commission' CHECK(settlement_model IN ('commission','retail'));
+ALTER TABLE bags ADD COLUMN IF NOT EXISTS settlement_subsidy_cents INTEGER NOT NULL DEFAULT 0 CHECK(settlement_subsidy_cents>=0);
+ALTER TABLE bags ADD COLUMN IF NOT EXISTS commerce_managed BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE refunds ADD COLUMN IF NOT EXISTS discount_cents INTEGER NOT NULL DEFAULT 0 CHECK(discount_cents>=0);
+ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_check;
+ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_commerce_total;
+ALTER TABLE orders ADD CONSTRAINT orders_commerce_total CHECK(total_cents=subtotal_cents-discount_cents+shipping_cents+tax_cents);
+ALTER TABLE bags DROP CONSTRAINT IF EXISTS bags_check1;
+ALTER TABLE bags DROP CONSTRAINT IF EXISTS bags_check2;
+ALTER TABLE bags DROP CONSTRAINT IF EXISTS bags_commerce_total;
+ALTER TABLE bags ADD CONSTRAINT bags_commerce_total CHECK(total_cents=subtotal_cents-discount_cents+shipping_cents+tax_cents);
+ALTER TABLE bags DROP CONSTRAINT IF EXISTS bags_commerce_settlement;
+ALTER TABLE bags ADD CONSTRAINT bags_commerce_settlement CHECK(
+  (settlement_model='retail' AND commerce_managed AND transfer_cents=0 AND commission_cents=0 AND settlement_subsidy_cents=0)
+  OR (settlement_model='commission' AND transfer_cents>=0
+    AND transfer_cents=subtotal_cents-discount_cents-commission_cents+shipping_cents+settlement_subsidy_cents)
+);

@@ -47,12 +47,15 @@ import BrandPortal from './BrandPortal.jsx';
 import {createScopeFence} from './lib/scope-fence.mjs';
 import { resolveUnifiedCheckoutReturn } from './lib/unified-checkout.mjs';
 
+const CommercePanel=React.lazy(()=>import('./CommercePanel.jsx'));
+
 const NAV = [
   ["overview", "Overview", LayoutDashboard],
   ["brands", "Brands", Store],
   ["catalog", "Catalog", Package],
   ["orders", "Orders & bags", ShoppingBag],
   ["finance", "Finance", WalletCards],
+  ["commerce", "Commerce controls", Zap],
   ["connections", "Connections", Plug],
   ["events", "Events & jobs", Activity],
   ["platform", "Backend & CRM", ShieldCheck],
@@ -3214,7 +3217,7 @@ function App() {
         </a>
         <div className="workspace-label">BRAND CONNECT</div>
         <nav aria-label="Main navigation">
-          {NAV.filter(([id]) => owner || id !== "connections").map(
+          {NAV.filter(([id]) => owner || !["connections","commerce"].includes(id)).map(
             ([id, name, Icon]) => (
               <button
                 className={cls("nav-item", page === id && "active")}
@@ -3343,6 +3346,7 @@ function App() {
               {page === "catalog" && Catalog()}
               {page === "orders" && Orders()}
               {page === "finance" && Finance()}
+              {page === "commerce" && owner && <React.Suspense fallback={<div className="loading-screen" role="status"><LoaderCircle className="spin" size={26}/><h2>Opening commerce controls</h2><p>Loading the local admin interface…</p></div>}><CommercePanel key={`${session?.brandId || 'owner'}:${session?.role || ''}`} request={request} owner={owner} session={session}/></React.Suspense>}
               {page === "connections" && Connections()}
               {page === "events" && Events()}
               {page === "platform" && <PlatformPanel key={`${session?.brandId || 'owner'}:${session?.role || ''}`} request={request} owner={owner} session={session} />}

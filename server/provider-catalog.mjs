@@ -30,6 +30,14 @@ export async function createProviderCatalog(db, domain, { stores } = {}) {
   await db.query(`CREATE TABLE IF NOT EXISTS provider_catalog_locks (
     shop TEXT PRIMARY KEY,token TEXT NOT NULL,lease_until TIMESTAMPTZ NOT NULL
   )`);
+  async function assertExternalCatalog(tx,brandId) {
+    if(!(await tx.query('SELECT id FROM brands WHERE id=$1 FOR UPDATE',[brandId])).rows.length)
+      fail('CATALOG_TENANT_MISMATCH','The catalog brand no longer exists.');
+    if(!(await tx.query("SELECT to_regclass('commerce_brand_policy_versions') AS relation")).rows[0]?.relation)return;
+    const config=(await tx.query('SELECT config FROM commerce_brand_policy_versions WHERE brand_id=$1 ORDER BY version DESC LIMIT 1',[brandId])).rows[0]?.config;
+    if(config?.model==='first_party'||config?.inventoryAuthority==='native')
+      fail('COMMERCE_WORKFLOW_REQUIRED','The native first-party catalog cannot be replaced by an external provider snapshot.');
+  }
 
   function validateProduct(product, shop, seen) {
     const sourceId = product?.source?.productId;
@@ -72,6 +80,7 @@ export async function createProviderCatalog(db, domain, { stores } = {}) {
     const row = await stores.row(shop);
     if (!row || row.shop !== shop || !row.brand_id || row.state === 'disconnected')
       fail('CATALOG_TENANT_MISMATCH', 'A connected immutable store-to-brand binding is required.');
+    await db.transaction(tx=>assertExternalCatalog(tx,row.brand_id));
     const brand = await domain.getBrand(row.brand_id);
     if (brand.id !== row.brand_id || brand.status === 'disconnected') fail('CATALOG_TENANT_MISMATCH', 'The canonical brand is disconnected or mismatched.');
     return row;
@@ -146,8 +155,10 @@ export async function createProviderCatalog(db, domain, { stores } = {}) {
 
       let importedCount = 0, retiredCount = 0; const products = [];
       const retire = async (prior, sourceId, sourceStatus) => {
-        const retired = await domain.upsertProduct(registry.brand_id, prior.sku, { inventoryQty: 0, variants: zeroVariants(prior.variants) });
+        const retired = await domain.upsertProduct(registry.brand_id, prior.sku, { inventoryQty: 0, variants: zeroVariants(prior.variants) },
+          {beforeUpsert:tx=>assertExternalCatalog(tx,registry.brand_id)});
         await db.transaction(async tx => {
+          await assertExternalCatalog(tx,registry.brand_id);
           await tx.query("UPDATE products SET status='draft',review_note='Source inactive or deleted; unavailable until source restoration and human review.',updated_at=now() WHERE id=$1 AND brand_id=$2", [prior.id, registry.brand_id]);
           await tx.query(`UPDATE provider_catalog_products SET source_status=$3,retired_at=COALESCE(retired_at,now()),last_seen_at=now()
             WHERE shop=$1 AND source_product_id=$2`, [shop, sourceId, sourceStatus]);
@@ -160,17 +171,23 @@ export async function createProviderCatalog(db, domain, { stores } = {}) {
         if (plan.prior && plan.prior.sku !== plan.product.sku) {
           // Rename the same canonical row first so upsertProduct preserves its
           // evidence/tax/review metadata rather than creating an SKU duplicate.
-          await db.query('UPDATE products SET sku=$3 WHERE id=$1 AND brand_id=$2', [plan.prior.id, registry.brand_id, plan.product.sku]);
+          await db.transaction(async tx=>{
+            await assertExternalCatalog(tx,registry.brand_id);
+            await tx.query('UPDATE products SET sku=$3 WHERE id=$1 AND brand_id=$2', [plan.prior.id, registry.brand_id, plan.product.sku]);
+          });
         }
         const product = await domain.upsertProduct(registry.brand_id, plan.product.sku, {
           title: plan.product.title, description: plan.product.description, priceCents: plan.product.priceCents,
           inventoryQty: plan.product.inventoryQty, images: plan.product.images, variants: plan.product.variants,
-        });
+        },{beforeUpsert:tx=>assertExternalCatalog(tx,registry.brand_id)});
         if (plan.prior && product.id !== plan.prior.id) fail('CATALOG_SOURCE_AMBIGUOUS', 'The canonical product identity changed unexpectedly.');
-        await db.query(`INSERT INTO provider_catalog_products(shop,source_product_id,brand_id,product_id,source_sku,source_status)
+        await db.transaction(async tx=>{
+          await assertExternalCatalog(tx,registry.brand_id);
+          await tx.query(`INSERT INTO provider_catalog_products(shop,source_product_id,brand_id,product_id,source_sku,source_status)
           VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(shop,source_product_id) DO UPDATE SET
           source_sku=$5,source_status=$6,last_seen_at=now(),retired_at=NULL`,
         [shop, plan.sourceId, registry.brand_id, product.id, plan.product.sku, plan.product.sourceStatus]);
+        });
         importedCount++; products.push({ id: product.id, sourceProductId: plan.sourceId, sku: product.sku, status: product.status });
       }
       for (const mapping of deleted) { await hold(); await retire(byId.get(mapping.product_id), mapping.source_product_id, 'DELETED'); }

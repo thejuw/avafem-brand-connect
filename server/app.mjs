@@ -35,6 +35,11 @@ import { createProviderPlatformSwitch, APPROVED_TEST_PLATFORM_SWITCH } from './p
 import { createProviderAutomation } from './provider-automation.mjs';
 import { createPlatform } from './platform/index.mjs';
 import { registerPlatformRoutes, platformMcpTools } from './platform/routes.mjs';
+import {createCommercePolicies} from './commerce/policies.mjs';
+import {createNativeInventory} from './commerce/inventory.mjs';
+import {createCommerceCheckout} from './commerce/checkout.mjs';
+import {registerCommerceRoutes} from './commerce/routes.mjs';
+import {createCommerceCatalog} from './commerce/catalog.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const fail = (statusCode, code, message) => Object.assign(new Error(message), { statusCode, code });
@@ -105,10 +110,16 @@ export async function createApp(options = {}) {
     catalog: providerCatalog, reconciliation: providerReconciliation, taxReconciliation: providerTaxReconciliation, automation: providerAutomation });
   platform = await createPlatform(db, { domain, auth, shopifyConnections,publicBaseUrl:config.publicBaseUrl, secret: config.encryptionKey, ...(options.domainOptions?.clock ? { clock: options.domainOptions.clock } : {}), ...(options.platform || {}) });
   if (options.seed !== false) await seedDatabase(db, domain);
+  const commerceClock=options.platform?.clock||options.domainOptions?.clock||(()=>new Date());
+  const commercePolicies=await createCommercePolicies(db,{clock:commerceClock});
+  const nativeInventory=await createNativeInventory(db,{clock:commerceClock,policies:commercePolicies});
+  const commerce={policies:commercePolicies,inventory:nativeInventory,
+    checkout:await createCommerceCheckout(db,{policies:commercePolicies,inventory:nativeInventory,auth,domain,clock:commerceClock})};
+  commerce.catalog=createCommerceCatalog({policies:commercePolicies,inventory:nativeInventory});
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: 3 * 1024 * 1024, trustProxy: false });
   await app.register(cookie);
   await app.register(rateLimit, { max: 300, timeWindow: '1 minute' });
-  app.decorate('avafem', { db, domain, auth, operations, config, shopifyConnections, testCheckout,
+  app.decorate('avafem', { db, domain, auth, operations, config, shopifyConnections, testCheckout,commerce,
     testStores, unifiedCheckout, providerMoney, providerFulfillment, providerEvents, providerJobs, providerFixtures, providerFailureFixtures, providerFailureCheckouts, providerFailureReadbacks, providerCatalog, providerReconciliation, providerTaxReconciliation, providerPlatformSwitch, providerAutomation, platform });
   app.removeContentTypeParser('application/json');
   app.addContentTypeParser('application/json', { parseAs: 'buffer' }, (request, body, done) => {
@@ -211,7 +222,7 @@ export async function createApp(options = {}) {
   app.get('/api/brands', async request => { const ctx = await browserRoute(request,'catalog:read'); return data(ctx.brandId ? [await domain.getBrand(ctx.brandId)] : await domain.listBrands()); });
   app.post('/api/brands', async request => { const ctx = await browserRoute(request); requireAdmin(ctx); const created = await domain.createBrand(request.body); const result = await domain.updateBrand(created.id, request.body); await auth.audit(ctx, 'brand.created', result.id); return data(result); });
   app.patch('/api/brands/:id', async request => { const ctx = await browserRoute(request); requireAdmin(ctx); return data(await domain.updateBrand(request.params.id, request.body)); });
-  app.get('/api/products', async request => { const ctx = await browserRoute(request, 'catalog:read'); return data(await domain.listProducts({ brandId: brandScope(ctx, request.query.brandId), status: request.query.status || undefined })); });
+  app.get('/api/products', async request => { const ctx = await browserRoute(request, 'catalog:read'); return data(await commerce.catalog(await domain.listProducts({ brandId: brandScope(ctx, request.query.brandId), status: request.query.status || undefined }))); });
   app.put('/api/brands/:id/products/:sku', async request => { const ctx = await browserRoute(request, 'catalog:write'); brandScope(ctx, request.params.id); return data(await domain.upsertProduct(request.params.id, request.params.sku, productSchema.parse(request.body))); });
   app.post('/api/products/:id/review', async request => { const ctx = await browserRoute(request); requireAdmin(ctx); const input = z.object({ decision: z.enum(['approved','rejected']), reason: z.string().max(3000).optional() }).parse(request.body); return data(await domain.reviewProduct(request.params.id, { status: input.decision, note: input.reason || '' })); });
   app.get('/api/bags', async request => { const ctx = await browserRoute(request, 'orders:read'); return data(await domain.listBags({ brandId: brandScope(ctx, request.query.brandId), status: request.query.status || undefined })); });
@@ -671,13 +682,13 @@ export async function createApp(options = {}) {
   const actions = {
     listBags: (ctx, input = {}) => { requireScope(ctx, 'orders:read'); return domain.listBags({ brandId: ctx.brandId, status: input.status }); },
     getBag: (ctx, input) => { requireScope(ctx, 'orders:read'); return domain.getBag(input.id, ctx.brandId); },
-    listProducts: ctx => { requireScope(ctx, 'catalog:read'); return domain.listProducts({ brandId: ctx.brandId }); },
+    listProducts: async ctx => { requireScope(ctx, 'catalog:read'); return commerce.catalog(await domain.listProducts({ brandId: ctx.brandId })); },
     upsertProduct: (ctx, input) => { requireScope(ctx, 'catalog:write'); return domain.upsertProduct(ctx.brandId, input.sku, productSchema.parse(input.product)); },
     shipment: (ctx, input) => { requireScope(ctx, 'orders:fulfill'); return domain.recordShipment(input.id, shipmentSchema.parse(input.shipment), ctx.brandId); },
     refund: (ctx, input) => { requireScope(ctx, 'refunds:write'); return domain.requestRefund(input.id, refundSchema.parse(input.refund), ctx.brandId); },
     payouts: async ctx => { requireScope(ctx, 'payouts:read'); return { transfers: await domain.listTransfers({ brandId: ctx.brandId }), credits: await domain.listCredits({ brandId: ctx.brandId }), sandbox: true }; },
     importProducts: (ctx, input) => { requireScope(ctx, 'catalog:write'); return operations.enqueueImport(ctx.brandId, input); },
-    inventory: async (ctx, input) => { requireScope(ctx, 'catalog:write'); const product = (await domain.listProducts({ brandId: ctx.brandId })).find(p => p.sku === input.sku); if (!product) throw fail(404,'NOT_FOUND','Product not found.'); return domain.upsertProduct(ctx.brandId, input.sku, { ...product, inventoryQty: z.number().int().min(0).max(1_000_000).parse(input.qty) }); },
+    inventory: async (ctx, input) => { requireScope(ctx, 'catalog:write'); const product = (await domain.listProducts({ brandId: ctx.brandId })).find(p => p.sku === input.sku); if (!product) throw fail(404,'NOT_FOUND','Product not found.'); if((await commerce.policies.getBrand(ctx.brandId)).inventoryAuthority==='native')throw fail(409,'COMMERCE_WORKFLOW_REQUIRED','Use an audited native stock adjustment in the operations backend.'); return domain.upsertProduct(ctx.brandId, input.sku, { ...product, inventoryQty: z.number().int().min(0).max(1_000_000).parse(input.qty) }); },
   };
   async function apiMutation(request, reply, action, input, scope) {
     const ctx = await context(request, { scope });
@@ -752,6 +763,7 @@ export async function createApp(options = {}) {
   registerPlatformRoutes(app, { platform, browserRoute, context, brandScope, requireAdmin, data, apiMutation, setSessionCookie,
     allowAuthOutbox:config.allowAuthOutbox===true && config.mode==='sandbox' && !config.publicBaseUrl && ['127.0.0.1','localhost','::1'].includes(config.host),
     clearSessionCookie: reply => reply.clearCookie('avf_session', { path: '/', httpOnly: true, sameSite: 'strict', secure: Boolean(config.publicBaseUrl?.startsWith('https:')) }) });
+  registerCommerceRoutes(app,{commerce,domain,browserRoute,requireAdmin,localTestOwner,data});
   await registerMcp(app, { auth, context, actions, extraTools: platformMcpTools(platform) });
   const dist = resolve(ROOT, 'dist');
   if (existsSync(dist)) await app.register(staticFiles, { root: dist, prefix: '/' });
@@ -763,6 +775,7 @@ export async function createApp(options = {}) {
   if (options.worker !== false) { interval = setInterval(async () => {
     try {
       const result = await providerJobs.run(); await operations.runJobs();
+      await commerce.checkout.run();
       await platform.jobs().catch(error => app.log.error({ code: error.code || 'PLATFORM_JOB_ERROR' }, 'Platform job failed'));
       // Swallowed per-run failures (e.g. nightly_reconciliation_pending) must reach an operator.
       const pending = [...new Set((result?.lifecycle ?? []).map(entry => entry.state).filter(state => /_pending$|_review$/.test(String(state))))].sort();
