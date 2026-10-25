@@ -190,7 +190,7 @@ Examples are JSON request bodies. First read the current settings/brand version 
 
 ## Acceptance and remaining provider work
 
-Final branch integration results are recorded separately after the complete focused/full test run. Policy tests cover strict defaults, combinations, version races, structural locks and atomic audit; they are in-memory tests, not provider acceptance.
+Local verification on 2026-10-25 used Node.js 24: the full regression run passed 898 tests with zero failures and 14 PostgreSQL skips. Follow-up runs passed 21 policy/workflow guard tests and 24 checkout/API tests after final hardening. A separate temporary PostgreSQL 17 server passed all 14 concurrency tests with zero skips, including competing native reservations and duplicate payment booking across independent pools. These run counts overlap. The dashboard build and isolated desktop/mobile browser checks also passed. GitHub Actions jobs could not start because of the account billing/spending-limit restriction; no hosted CI pass is claimed. None of these local results certifies the pending provider acceptance below.
 
 | Area | Scope of this engine | Actual-provider acceptance for the new mixed flow |
 |---|---|---|

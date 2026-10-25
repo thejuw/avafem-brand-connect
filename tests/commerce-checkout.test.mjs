@@ -228,3 +228,15 @@ test('a fully Avafem-funded zero-cash cart still fulfills and refunds exact reta
   for(const g of q.groups)await f.checkout.refund(g.id,{operationId:`free_cart_ref_${g.id}`,reason:'Refund a zero-cash funded synthetic allocation',items:g.items.map(l=>({reference:l.reference,qty:l.qty})),refundShipping:true});
   await f.ledger();
 });
+
+test('explicit non-USD partner variant currency is rejected at quote and rechecked before payment',async t=>{
+  const f=await fixture(t),sku='PARTNER-CURRENCY';
+  const variants=currency=>[{id:'stable_currency_variant',sku,price:{amount:1000,currency},inventory:{qty:5}}];
+  await f.domain.upsertProduct(f.partner.brandId,f.partner.sku,{variants:variants('CAD')});await f.domain.reviewProduct(f.partner.id,{status:'approved'});
+  const items=[{variantId:f.variant.id,qty:1},{productId:f.partner.id,variantSku:sku,qty:1}];
+  await assert.rejects(f.cart('currency_bad_quote',items),e=>e.code==='COMMERCE_CURRENCY_MISMATCH');assert.equal((await f.inventory.get(f.variant.id)).reserved,0);
+  await f.domain.upsertProduct(f.partner.brandId,f.partner.sku,{variants:variants('USD')});
+  const q=await f.cart('currency_good_quote',items);
+  await f.domain.upsertProduct(f.partner.brandId,f.partner.sku,{variants:variants('CAD')});
+  await assert.rejects(f.checkout.simulatePayment(q.id),e=>e.code==='COMMERCE_CURRENCY_MISMATCH');assert.equal((await f.inventory.get(f.variant.id)).onHand,8);
+});

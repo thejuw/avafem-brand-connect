@@ -103,6 +103,7 @@ export async function createCommerceCheckout(db,{policies,inventory,auth,domain,
           if(variants.length && !variantKey)fail('Select an explicit variant; parent stock is not a second stock pool.','COMMERCE_VARIANT_REQUIRED',409);
           const external=variantKey?variants.find(v=>v.sku===variantKey):null;
           if(variantKey&&!external)fail('Partner variant not found.','COMMERCE_PRODUCT_UNAVAILABLE',409);
+          if(external?.price?.currency!==undefined&&external.price.currency!=='USD')fail('Partner variant currency must match the USD checkout.','COMMERCE_CURRENCY_MISMATCH',409);
           price=external?.price?.amount??product.priceCents;sku=external?.sku??product.sku;
           available=external?.inventory?.qty??product.inventoryQty;
           const held=await first(tx,"SELECT COALESCE(SUM(qty),0)::int AS qty FROM commerce_external_holds WHERE product_id=$1 AND variant_key=$2 AND state IN ('reserved','committed')",[product.id,variantKey]);
@@ -163,6 +164,7 @@ export async function createCommerceCheckout(db,{policies,inventory,auth,domain,
           fail('A cart product changed or needs review.','COMMERCE_PRODUCT_UNAVAILABLE',409);
         if(!line.variantId){const variant=line.variantKey?(p.variants||[]).find(v=>v.sku===line.variantKey):null;
           if(line.variantKey&&!variant||(p.variants||[]).length&&!line.variantKey)fail('A partner variant changed.','COMMERCE_PRODUCT_UNAVAILABLE',409);
+          if(variant?.price?.currency!==undefined&&variant.price.currency!=='USD')fail('Partner variant currency no longer matches the USD quote.','COMMERCE_CURRENCY_MISMATCH',409);
           const qty=variant?.inventory?.qty??p.inventoryQty;
           const held=await first(tx,"SELECT COALESCE(SUM(qty),0)::int AS qty FROM commerce_external_holds WHERE product_id=$1 AND variant_key=$2 AND state IN ('reserved','committed')",[p.id,line.variantKey]);
           if(!Number.isSafeInteger(qty)||qty<held.qty)fail('Partner shadow availability fell below the reserved cart.','COMMERCE_OUT_OF_STOCK',409);
