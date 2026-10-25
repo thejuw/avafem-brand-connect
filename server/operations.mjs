@@ -65,6 +65,27 @@ export async function createOperations(db, domain, auth, config = {}) {
   const originalStripeEnvironment = { secretKey: serverEnv.STRIPE_SECRET_KEY, webhookSecret: serverEnv.STRIPE_WEBHOOK_SECRET };
   let localStripeConfigured = false;
   let running = false;
+  function assertLegacyBag(bag) {
+    if(bag?.providerBound||bag?.provider_bound)throw fail(409,'PROVIDER_WORKFLOW_REQUIRED','Use the provider-backed workflow for this Bag.');
+    if(bag?.commerceManaged||bag?.commerce_managed)throw fail(409,'COMMERCE_WORKFLOW_REQUIRED','Use the commerce workflow. Simulated commerce Bags cannot be dispatched through a legacy store or handoff.');
+  }
+  async function assertExternalCatalog(brandId,tx) {
+    if(!tx)return db.transaction(q=>assertExternalCatalog(brandId,q));
+    if(!(await tx.query('SELECT id FROM brands WHERE id=$1 FOR UPDATE',[brandId])).rows.length)throw fail(404,'NOT_FOUND','Brand not found.');
+    if(!(await tx.query("SELECT to_regclass('commerce_brand_policy_versions') AS relation")).rows[0]?.relation)return;
+    const policy=(await tx.query('SELECT config FROM commerce_brand_policy_versions WHERE brand_id=$1 ORDER BY version DESC LIMIT 1',[brandId])).rows[0]?.config;
+    if(policy?.model==='first_party'||policy?.inventoryAuthority==='native')throw fail(409,'COMMERCE_WORKFLOW_REQUIRED','Native first-party catalog and stock cannot be replaced by a legacy external import.');
+  }
+  async function commerceEvent(event,tx=db) {
+    if(event.type?.startsWith('commerce.'))return true;
+    if(event.brand_id&&['product','inventory'].includes(event.type?.split('.')[0])
+      &&(await tx.query("SELECT to_regclass('commerce_brand_policy_versions') AS relation")).rows[0]?.relation) {
+      const config=(await tx.query('SELECT config FROM commerce_brand_policy_versions WHERE brand_id=$1 ORDER BY version DESC LIMIT 1',[event.brand_id])).rows[0]?.config;
+      if(config?.model==='first_party'||config?.inventoryAuthority==='native')return true;
+    }
+    const bagId=event.type?.startsWith('bag.')?event.aggregate_id:event.payload?.bagId||event.payload?.bag_id;
+    return bagId?Boolean((await tx.query('SELECT commerce_managed FROM bags WHERE id=$1',[bagId])).rows[0]?.commerce_managed):false;
+  }
 
   async function connections() {
     const stored = (await db.query("SELECT * FROM connector_state WHERE provider='shopify'")).rows[0];
@@ -126,16 +147,21 @@ export async function createOperations(db, domain, auth, config = {}) {
       connectionTier: 'shopify', supportEmail: 'sandbox@example.com', shippingTable: [{ country: 'US', priceCents: 0 }] });
   }
   async function preflightShopify() {
+    const previous=(await db.query("SELECT brand_id FROM connector_state WHERE provider='shopify'")).rows[0];
+    if(previous?.brand_id)await assertExternalCatalog(previous.brand_id);
     const details = await shopify.preflight();
     if (details.missingScopes?.length) throw fail(409, 'MISSING_SHOPIFY_SCOPES', 'The installed app is missing required scopes.');
     if (details.unexpectedScopes?.length) throw fail(409, 'UNAPPROVED_SHOPIFY_SCOPES', 'The installed app has scopes outside the approved allowlist. Review and reinstall before acceptance testing.');
     const brand = await ensureShopifyBrand();
+    await assertExternalCatalog(brand.id);
     await db.query(`INSERT INTO connector_state(provider,brand_id,details) VALUES('shopify',$1,$2)
       ON CONFLICT(provider) DO UPDATE SET brand_id=$1,details=$2,updated_at=now()`, [brand.id, JSON.stringify(details)]);
     await domain.updateBrand(brand.id, { connectionHealthy: true, connectionTier: 'shopify' });
     return { ...details, brandId: brand.id };
   }
   async function importShopify(brandId) {
+    const ownBrand=!brandId?(await db.query("SELECT brand_id FROM connector_state WHERE provider='shopify'")).rows[0]?.brand_id:null;
+    if(brandId||ownBrand)await assertExternalCatalog(brandId||ownBrand);
     const adapter = brandId ? await config.shopifyConnections.forBrand(brandId) : shopify;
     const verified = brandId ? { ...await adapter.preflight(), brandId } : await preflightShopify();
     if (verified.missingScopes?.length || verified.unexpectedScopes?.length) throw fail(409, 'SHOPIFY_SCOPE_POLICY', 'Reauthorize this store with the approved permissions before syncing.');
@@ -151,7 +177,7 @@ export async function createOperations(db, domain, auth, config = {}) {
           ...product, description: String(product.description).replace(/<[^>]*>/g, '').slice(0, 20_000),
           category: prior?.category || 'uncategorized', taxCode: prior?.taxCode || '',
           evidence: prior?.evidence || { ingredients_inci: [], certifications: [], claims: [] },
-        }));
+        },{beforeUpsert:tx=>assertExternalCatalog(verified.brandId,tx)}));
       }
       if (!result.pageInfo.hasNextPage) return { brandId: verified.brandId, imported: imported.length, products: imported, issues };
       after = result.pageInfo.endCursor;
@@ -161,13 +187,15 @@ export async function createOperations(db, domain, auth, config = {}) {
   async function pushShopify(bagId) {
     const connection = (await db.query("SELECT * FROM connector_state WHERE provider='shopify'")).rows[0];
     const bag = await domain.getBag(bagId);
+    assertLegacyBag(bag);
     if (!connection || bag.brandId !== connection.brand_id) throw fail(409, 'WRONG_SHOPIFY_BRAND', 'This Bag is not assigned to the connected test store.');
     if (bag.taxCents > 0) throw fail(409, 'AUTHORITATIVE_TAX_REQUIRED', 'Configure authoritative Stripe Tax lines before pushing a taxable Bag. The local tax fixture must not be sent as a real tax calculation.');
     if (bag.status !== 'awaiting_shipment' || bag.refundedCents > 0) throw fail(409, 'BAG_NOT_PUSHABLE', 'Only an unpaid-out, unshipped, unrefunded fulfillment instruction can be pushed.');
     const reserved = await db.transaction(async tx => {
-      const current = (await tx.query(`SELECT b.status,b.refunded_cents,
+      const current = (await tx.query(`SELECT b.status,b.refunded_cents,b.commerce_managed,b.provider_bound,
         EXISTS(SELECT 1 FROM refunds r WHERE r.bag_id=b.id AND r.status='proposed') AS refund_pending
         FROM bags b WHERE b.id=$1 FOR UPDATE`, [bag.id])).rows[0];
+      assertLegacyBag(current);
       if (current.status !== 'awaiting_shipment' || current.refunded_cents > 0 || current.refund_pending)
         throw fail(409, 'BAG_NOT_PUSHABLE', 'This Bag is shipped, refunded or held for refund review.');
       const inserted = await tx.query(`INSERT INTO external_orders(bag_id,brand_id,shop,state) VALUES($1,$2,$3,'pending')
@@ -186,7 +214,10 @@ export async function createOperations(db, domain, auth, config = {}) {
       if (reserved.row.external_order_id) return { orderId: reserved.row.external_order_id, alreadyExists: true };
       const found = await shopify.findOrder(bag.id);
       if (found) {
-        await db.query("UPDATE external_orders SET external_order_id=$1,state='created',updated_at=now() WHERE bag_id=$2", [found.id, bag.id]);
+        await db.transaction(async tx=>{
+          assertLegacyBag((await tx.query('SELECT commerce_managed,provider_bound FROM bags WHERE id=$1 FOR UPDATE',[bag.id])).rows[0]);
+          await tx.query("UPDATE external_orders SET external_order_id=$1,state='created',updated_at=now() WHERE bag_id=$2", [found.id, bag.id]);
+        });
         return { order: found, alreadyExists: true };
       }
       throw fail(409, 'SHOPIFY_OUTCOME_UNCERTAIN', 'A previous push needs reconciliation. Dashboard fallback must not send a second fulfillment instruction.');
@@ -199,14 +230,22 @@ export async function createOperations(db, domain, auth, config = {}) {
       if (!variant?.shopifyVariantId) throw fail(409, 'VARIANT_MAPPING_REQUIRED', 'Map the exact Shopify variant before pushing this Bag.');
       return { ...item, shopifyVariantId: variant.shopifyVariantId };
     }) };
+    await db.transaction(async tx=>assertLegacyBag((await tx.query('SELECT commerce_managed,provider_bound FROM bags WHERE id=$1 FOR UPDATE',[bag.id])).rows[0]));
     try {
       const result = await shopify.createOrder(enriched, { paid: true, test: true, inventoryBehaviour: 'BYPASS', taxLines: [] });
-      await db.query("UPDATE external_orders SET external_order_id=$1,state='created',updated_at=now() WHERE bag_id=$2", [result.order.id, bag.id]);
+      await db.transaction(async tx=>{
+        assertLegacyBag((await tx.query('SELECT commerce_managed,provider_bound FROM bags WHERE id=$1 FOR UPDATE',[bag.id])).rows[0]);
+        await tx.query("UPDATE external_orders SET external_order_id=$1,state='created',updated_at=now() WHERE bag_id=$2", [result.order.id, bag.id]);
+      });
       return result;
     } catch (error) {
       // A persistent uncertain state survives process restarts. Never turn this into a duplicate email handoff.
-      await db.query('UPDATE external_orders SET state=$1,last_error=$2,updated_at=now() WHERE bag_id=$3',
-        [error.code === 'OUTCOME_UNCERTAIN' ? 'uncertain' : 'needs_review', text(error.message), bag.id]);
+      await db.transaction(async tx=>{
+        const current=(await tx.query('SELECT commerce_managed,provider_bound FROM bags WHERE id=$1 FOR UPDATE',[bag.id])).rows[0];
+        if(current?.commerce_managed||current?.provider_bound)return;
+        await tx.query('UPDATE external_orders SET state=$1,last_error=$2,updated_at=now() WHERE bag_id=$3',
+          [error.code === 'OUTCOME_UNCERTAIN' ? 'uncertain' : 'needs_review', text(error.message), bag.id]);
+      });
       throw error;
     }
   }
@@ -229,6 +268,7 @@ export async function createOperations(db, domain, auth, config = {}) {
     return (await db.query('SELECT id,brand_id,url,active,created_at FROM outbound_webhook_endpoints WHERE brand_id=$1', [brandId])).rows;
   }
   async function enqueueImport(brandId, input) {
+    await assertExternalCatalog(brandId);
     const rows = Array.isArray(input.rows) ? input.rows : typeof input.csv === 'string'
       ? parse(input.csv, { columns: true, skip_empty_lines: true, trim: true, max_record_size: 100_000 }) : null;
     if (!rows || !rows.length || rows.length > 5000) throw fail(422, 'INVALID_IMPORT', 'Provide 1–5,000 catalog rows.');
@@ -246,7 +286,7 @@ export async function createOperations(db, domain, auth, config = {}) {
             inventoryQty: Number(row.inventoryQty ?? row.inventory_qty ?? row.inventory?.qty ?? 0) };
           if (typeof row.evidence === 'string') input.evidence = JSON.parse(row.evidence);
           if (typeof row.images === 'string') input.images = row.images.split('|').filter(Boolean);
-          await domain.upsertProduct(job.brand_id, row.sku, input); accepted++;
+          await domain.upsertProduct(job.brand_id, row.sku, input,{beforeUpsert:tx=>assertExternalCatalog(job.brand_id,tx)}); accepted++;
         } catch (error) { errors.push({ row: cursor + 2, sku: text(row.sku), message: text(error.message) }); }
         cursor++;
       }
@@ -267,11 +307,11 @@ export async function createOperations(db, domain, auth, config = {}) {
         const safe = bag ? projectBrandBag(bag, { paid: true }) : null;
         await db.transaction(async tx => {
           // Lock and recheck lifecycle inside the transaction: stale events cannot re-open a refunded handoff.
-          const eligible = bag ? (await tx.query(`SELECT b.status,b.refunded_cents,
+          const eligible = bag ? (await tx.query(`SELECT b.status,b.refunded_cents,b.commerce_managed,b.provider_bound,
             EXISTS(SELECT 1 FROM external_orders e WHERE e.bag_id=b.id) AS external_reserved,
             EXISTS(SELECT 1 FROM refunds r WHERE r.bag_id=b.id AND r.status='proposed') AS refund_pending
             FROM bags b WHERE b.id=$1 FOR UPDATE`, [bag.id])).rows[0] : null;
-          if (bag && eligible?.status === 'awaiting_shipment' && eligible.refunded_cents === 0 && !eligible.refund_pending && !eligible.external_reserved) {
+          if (bag && !eligible?.commerce_managed && !eligible?.provider_bound && eligible?.status === 'awaiting_shipment' && eligible.refunded_cents === 0 && !eligible.refund_pending && !eligible.external_reserved) {
             const existing = (await tx.query('SELECT id FROM sandbox_inbox WHERE event_id=$1', [event.id])).rows[0];
             if (!existing) {
               const token = randomBytes(32).toString('base64url');
@@ -286,7 +326,7 @@ export async function createOperations(db, domain, auth, config = {}) {
             const bagId = event.payload.bagId || event.payload.bag_id || event.aggregate_id;
             await tx.query("UPDATE sandbox_inbox SET status='closed' WHERE bag_id=$1", [bagId]);
           }
-          if (event.brand_id) {
+          if (event.brand_id && !await commerceEvent(event,tx)) {
             const endpoints = (await tx.query('SELECT id,scopes FROM outbound_webhook_endpoints WHERE brand_id=$1 AND active=true', [event.brand_id])).rows;
             const family = event.type.split('.')[0];
             const scope = ['product','inventory'].includes(family) ? 'catalog:read' : ['transfer','payout','credit'].includes(family) ? 'payouts:read' : family === 'refund' ? 'refunds:write' : 'orders:read';
@@ -307,6 +347,10 @@ export async function createOperations(db, domain, auth, config = {}) {
       FROM webhook_deliveries d JOIN outbound_webhook_endpoints e ON e.id=d.endpoint_id
       JOIN outbox_events o ON o.id=d.event_id WHERE d.status='pending' AND d.available_at<=now() AND e.active=true LIMIT 10`)).rows;
     for (const delivery of deliveries) {
+      if(await commerceEvent(delivery)) {
+        await db.query("UPDATE webhook_deliveries SET status='failed',last_error='COMMERCE_WORKFLOW_REQUIRED' WHERE id=$1",[delivery.id]);
+        continue;
+      }
       if (new Date(delivery.expires_at) < new Date()) {
         await db.query("UPDATE webhook_deliveries SET status='failed',last_error='72-hour retry window expired' WHERE id=$1", [delivery.id]); continue;
       }
@@ -346,6 +390,7 @@ export async function createOperations(db, domain, auth, config = {}) {
           const connection = (await db.query("SELECT * FROM connector_state WHERE provider='shopify'")).rows[0];
           const installed = event.brand_id && config.shopifyConnections ? await config.shopifyConnections.findShop(event.shop) : null;
           if (event.brand_id && installed?.brandId !== event.brand_id) throw fail(409, 'SHOPIFY_TENANT_MISMATCH', 'The webhook store is not bound to its recorded brand.');
+          if(event.brand_id||connection?.brand_id)await assertExternalCatalog(event.brand_id||connection.brand_id);
           if (event.topic === 'app/uninstalled') {
             if (installed) {
               if (!event.occurred_at) throw fail(409, 'INSTALLATION_EVENT_REVIEW', 'Uninstall event has no occurrence time; review before invalidating a newer installation.');
@@ -358,6 +403,7 @@ export async function createOperations(db, domain, auth, config = {}) {
             const mapping = (await db.query('SELECT * FROM external_orders WHERE external_order_id=$1 AND shop=$2 AND ($3::text IS NULL OR brand_id=$3)', [`gid://shopify/Order/${payload.order_id}`, event.shop, event.brand_id || null])).rows[0];
             if (mapping && payload.tracking_number) {
               const bag = await domain.getBag(mapping.bag_id, mapping.brand_id);
+              assertLegacyBag(bag);
               const actual = new Map((payload.line_items || []).map(item => [item.sku, item.quantity]));
               if (actual.size !== bag.items.length || bag.items.some(item => actual.get(item.variantSku || item.sku) !== item.qty))
                 throw fail(409,'PARTIAL_FULFILLMENT_REVIEW','Partial or unmapped fulfillment requires review; it must not mark the whole Bag shipped.');
@@ -385,6 +431,9 @@ export async function createOperations(db, domain, auth, config = {}) {
     } finally { running = false; }
   }
   async function replayEvent(eventId, brandId) {
+    const event=(await db.query('SELECT type,aggregate_id,brand_id,payload FROM outbox_events WHERE id=$1 AND ($2::text IS NULL OR brand_id=$2)',[eventId,brandId||null])).rows[0];
+    if(!event)throw fail(404,'NOT_FOUND','Event not found.');
+    if(await commerceEvent(event))throw fail(409,'COMMERCE_WORKFLOW_REQUIRED','Commerce simulation events cannot be replayed through legacy external delivery.');
     const result = await db.query("UPDATE outbox_events SET status='pending',available_at=now(),last_error=NULL WHERE id=$1 AND ($2::text IS NULL OR brand_id=$2) RETURNING id", [eventId, brandId || null]);
     if (!result.rows.length) throw fail(404, 'NOT_FOUND', 'Event not found.');
     await db.query("UPDATE webhook_deliveries SET status='pending',available_at=now(),last_error=NULL,expires_at=now()+interval '72 hours' WHERE event_id=$1 AND ($2::text IS NULL OR brand_id=$2)", [eventId, brandId || null]);
@@ -394,6 +443,7 @@ export async function createOperations(db, domain, auth, config = {}) {
     const link = (await db.query('SELECT bag_id,brand_id,expires_at FROM handoff_links WHERE token_hash=$1 AND used_at IS NULL AND expires_at>now()', [hash(token)])).rows[0];
     if (!link) throw fail(401, 'HANDOFF_EXPIRED', 'This shipping link has expired or has already been used.');
     const bag = await domain.getBag(link.bag_id, link.brand_id);
+    assertLegacyBag(bag);
     const external = (await db.query('SELECT state FROM external_orders WHERE bag_id=$1', [bag.id])).rows[0];
     if (external) throw fail(409, 'EXTERNAL_FULFILLMENT_RESERVED', 'This Bag is reserved for Shopify fulfillment. Do not create a second shipment instruction.');
     if (bag.status !== 'awaiting_shipment' || bag.refundedCents > 0) throw fail(401, 'HANDOFF_EXPIRED', 'This shipping link is no longer available.');

@@ -13,6 +13,9 @@ import {platformFixture} from './helpers/platform-fixture.mjs';
 import {createBrandPortal} from '../server/platform/brand-portal.mjs';
 import {createAuth,hash} from '../server/auth.mjs';
 import {createBrandAuthDelivery} from '../server/platform/brand-auth-delivery.mjs';
+import {createCommercePolicies} from '../server/commerce/policies.mjs';
+import {createNativeInventory} from '../server/commerce/inventory.mjs';
+import {createCommerceCheckout} from '../server/commerce/checkout.mjs';
 
 const postgresUrl=process.env.AVAFEM_TEST_POSTGRES_URL;
 if (process.env.AVAFEM_REQUIRE_POSTGRES==='1' && !postgresUrl) throw new Error('AVAFEM_TEST_POSTGRES_URL is required for the PostgreSQL job.');
@@ -362,4 +365,38 @@ test('real Postgres: independently pooled auth email workers claim one dispatch 
   assert.equal((await f.db.query('SELECT state FROM brand_auth_deliveries WHERE mail_id=$1',[mail.id])).rows[0].state,'uncertain');
   const stored=JSON.stringify((await f.db.query('SELECT * FROM brand_auth_deliveries')).rows);
   assert.ok(!stored.includes('pg-mail@'));assert.ok(!stored.includes('#invite='));
+});
+
+async function nativeFixture(f) {
+  const brand=await f.domain.createBrand({name:'Postgres owned fixture',slug:'pg-owned-fixture'});
+  await f.commerce.policies.saveBrand(brand.id,{expectedVersion:0,reason:'Isolated PostgreSQL first-party fixture',model:'first_party',inventoryAuthority:'native',inventoryOwner:'avafem',fulfiller:'avafem',settlementModel:'retail',commissionBps:0});
+  const product=await f.domain.upsertProduct(brand.id,'PG-OWNED',curationListing({priceCents:1000,inventoryQty:999}));
+  await f.domain.reviewProduct(product.id,{status:'approved'});
+  const variant=await f.commerce.inventory.createVariant({productId:product.id,sku:'PG-OWNED',unitCostCents:300},'test-owner');
+  await f.commerce.inventory.adjust({variantId:variant.id,delta:1,operationId:'pg_native_opening_stock',reason:'One isolated physical test unit'},'test-owner');
+  await f.domain.updateBrand(brand.id,{shipFromAddress:{line1:'100 Synthetic Warehouse',postal:'78701',country:'US'},supportEmail:'pg@example.invalid',status:'ready'});
+  const policies=await createCommercePolicies(f.db2,{clock:f.clock}),inventory=await createNativeInventory(f.db2,{clock:f.clock,policies});
+  const checkout=await createCommerceCheckout(f.db2,{policies,inventory,auth:f.auth,domain:f.domain,clock:f.clock});
+  return {brand,product,variant,policies,inventory,checkout};
+}
+test('real Postgres: native last-unit reservations across pools and versioned settings reject competing writers',options,async t=>{
+  const f=await fixture(t),n=await nativeFixture(f),expiresAt=new Date(f.clock().getTime()+600_000).toISOString();
+  const results=await Promise.allSettled([
+    f.commerce.inventory.reserve({checkoutId:'pg_stock_cart_one',items:[{variantId:n.variant.id,qty:1}],expiresAt}),
+    n.inventory.reserve({checkoutId:'pg_stock_cart_two',items:[{variantId:n.variant.id,qty:1}],expiresAt})]);
+  assert.equal(results.filter(r=>r.status==='fulfilled').length,1);assert.equal(results.filter(r=>r.status==='rejected'&&r.reason.code==='NATIVE_STOCK_UNAVAILABLE').length,1);
+  assert.equal((await n.inventory.get(n.variant.id)).reserved,1);
+  const writes=await Promise.allSettled([f.commerce.policies.save({expectedVersion:0,discountBps:100,reason:'First concurrent policy writer'}),n.policies.save({expectedVersion:0,discountBps:200,reason:'Second concurrent policy writer'})]);
+  assert.equal(writes.filter(r=>r.status==='fulfilled').length,1);assert.equal(writes.filter(r=>r.status==='rejected'&&r.reason.code==='COMMERCE_POLICY_VERSION_CONFLICT').length,1);
+});
+test('real Postgres: duplicate mixed-engine simulation payment across pools consumes stock and books retail once',options,async t=>{
+  const f=await fixture(t),n=await nativeFixture(f);
+  const q=await f.commerce.checkout.quote({operationId:'pg_native_checkout_once',items:[{variantId:n.variant.id,qty:1}],shipTo:{name:'Synthetic',line1:'123 Test Street',city:'Austin',region:'TX',postal:'78701',country:'US'}});
+  const result=await Promise.all([f.commerce.checkout.simulatePayment(q.id),n.checkout.simulatePayment(q.id)]);
+  assert.equal(result[0].orderId,result[1].orderId);
+  assert.equal((await n.inventory.get(n.variant.id)).onHand,0);assert.equal((await n.inventory.get(n.variant.id)).reserved,0);
+  const bags=(await f.db.query('SELECT * FROM bags WHERE order_id=$1',[result[0].orderId])).rows;assert.equal(bags.length,1);assert.equal(bags[0].settlement_model,'retail');
+  assert.equal((await f.db.query('SELECT COUNT(*)::int AS n FROM transfers WHERE bag_id=$1',[bags[0].id])).rows[0].n,0);
+  assert.equal((await f.db.query("SELECT COUNT(*)::int AS n FROM ledger_journals WHERE bag_id=$1 AND kind='commerce_simulated_payment'",[bags[0].id])).rows[0].n,1);
+  assert.equal((await n.checkout.reconciliation()).ok,true);
 });

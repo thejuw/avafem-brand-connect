@@ -28,6 +28,7 @@ export function createBeautyBank(db, { clock, domain, earnBps = 300, expiryDays 
         if (!shopper || shopper.deletedAt) fail('Shopper not found.', 404, 'NOT_FOUND');
         const bags = await rows(tx, 'SELECT b.* FROM bags b JOIN shopper_orders so ON so.bag_id=b.id WHERE so.shopper_id=$1 AND b.order_id=$2 FOR UPDATE OF b', [shopperId, orderId]);
         if (!bags.length) fail('No linked Bags for this shopper and order.', 404, 'NOT_FOUND');
+        if (bags.some(bag => bag.commerceManaged)) fail('Use commerce-managed credit accounting for this order.', 409, 'COMMERCE_WORKFLOW_REQUIRED');
         const created = [];
         for (const bag of bags) {
           const amount = Math.floor(bag.subtotalCents * earnBps / 10_000);
@@ -81,7 +82,7 @@ export function createBeautyBank(db, { clock, domain, earnBps = 300, expiryDays 
           WHERE l.state='LAB' AND b.status='delivered' AND b.delivered_at IS NOT NULL
           AND COALESCE(t.status,'')<>'held' AND COALESCE(j.status,'')<>'held'
           AND NOT EXISTS(SELECT 1 FROM refunds r WHERE r.bag_id=b.id AND r.status='proposed')
-          AND NOT b.provider_bound AND br.status IN ('ready','live') AND br.connection_healthy AND br.payouts_enabled
+          AND NOT b.provider_bound AND NOT b.commerce_managed AND br.status IN ('ready','live') AND br.connection_healthy AND br.payouts_enabled
           AND NOT EXISTS(SELECT 1 FROM disputes d WHERE d.bag_id=b.id AND (d.status IN ('needs_response','under_review')
             OR (d.status='lost' AND NOT EXISTS(SELECT 1 FROM financial_resolutions f WHERE f.dispute_id=d.id AND f.kind='lost_dispute' AND f.action='operator_verified_recovery'))))
           FOR UPDATE OF l`);
@@ -112,7 +113,7 @@ export function createBeautyBank(db, { clock, domain, earnBps = 300, expiryDays 
     /** Reverse unspent LAB/VAULT credit for refunded/cancelled Bags (idempotent). */
     async reverseRefunded(bagId) {
       return db.transaction(async tx => {
-        const lots = await rows(tx, `SELECT l.* FROM bank_lots l JOIN bags b ON b.id=l.bag_id WHERE l.state IN ('LAB','VAULT') AND b.status IN ('refunded','cancelled')${bagId ? ' AND b.id=$1' : ''} FOR UPDATE OF l`, bagId ? [bagId] : []);
+        const lots = await rows(tx, `SELECT l.* FROM bank_lots l JOIN bags b ON b.id=l.bag_id WHERE l.state IN ('LAB','VAULT') AND NOT b.commerce_managed AND b.status IN ('refunded','cancelled')${bagId ? ' AND b.id=$1' : ''} FOR UPDATE OF l`, bagId ? [bagId] : []);
         let reversed = 0;
         for (const lot of lots) {
           const spent = lot.amountCents - lot.remainingCents;
@@ -247,6 +248,7 @@ export function createConsole(db, { clock, domain, risk, secret, creditExpiryDay
   }
   function eligibility(s, { credit = false, lot = null } = {}) {
     const reasons = [];
+    if (s.bag.commerceManaged) reasons.push('COMMERCE_WORKFLOW_REQUIRED');
     if (s.bag.providerBound || s.bag.sandbox !== true || s.brand?.sandbox !== true) reasons.push('PROVIDER_WORKFLOW_REQUIRED');
     if (s.bag.status !== 'delivered' || !s.bag.deliveredAt) reasons.push('DELIVERY_REQUIRED');
     if (s.bag.refundedCents > 0 || s.refunds.some(r => r.status === 'proposed' || r.status === 'approved')) reasons.push('REFUND_REVIEW_REQUIRED');
@@ -323,6 +325,7 @@ export function createConsole(db, { clock, domain, risk, secret, creditExpiryDay
         if (!d) fail('Dispute not found.', 404, 'NOT_FOUND');
         if (d.status !== 'lost') fail('Only a lost dispute has a recovery decision.', 409, 'DISPUTE_NOT_LOST');
         const s = await state(tx, d.bagId);
+        if (s.bag.commerceManaged) fail('Use the commerce-managed financial workflow.', 409, 'COMMERCE_WORKFLOW_REQUIRED');
         if (s.bag.providerBound || s.bag.sandbox !== true || s.brand?.sandbox !== true) fail('Use the provider-backed dispute workflow.', 409, 'PROVIDER_WORKFLOW_REQUIRED');
         if (s.resolutions.some(r => r.kind === 'lost_dispute' && r.disputeId === d.id)) fail('This lost dispute already has an immutable recovery resolution.', 409, 'DISPUTE_RECOVERY_RESOLVED');
         const resolutionId = id('fres');
@@ -365,6 +368,7 @@ export function createConsole(db, { clock, domain, risk, secret, creditExpiryDay
         if (!credit && !lot) fail('Pending credit not found.', 404, 'NOT_FOUND');
         if ((credit && credit.status !== 'pending') || (lot && (lot.state !== 'LAB' || !lot.bagId))) fail('Only pending Bag-earned credits can be resolved.', 409, 'CREDIT_NOT_PENDING');
         const s = await state(tx, credit?.bagId || lot.bagId);
+        if (s.bag.commerceManaged) fail('Use commerce-managed credit accounting.', 409, 'COMMERCE_WORKFLOW_REQUIRED');
         if (s.bag.providerBound || s.bag.sandbox !== true || s.brand?.sandbox !== true) fail('Use provider-backed credit accounting.', 409, 'PROVIDER_WORKFLOW_REQUIRED');
         const resolutionId = id('fres');
         const result = { creditId, bagId: s.bag.id, kind: credit ? 'canonical' : 'beauty_bank', action: input.action,
@@ -427,14 +431,14 @@ export function createConsole(db, { clock, domain, risk, secret, creditExpiryDay
       return db.transaction(async tx => {
         const d = await first(tx, 'SELECT * FROM disputes WHERE id=$1 FOR UPDATE', [disputeId]); if (!d) fail('Dispute not found.', 404, 'NOT_FOUND');
         if (['won', 'lost'].includes(d.status)) return d;
-        const bag = await first(tx, 'SELECT provider_bound FROM bags WHERE id=$1', [d.bagId]);
+        const bag = await first(tx, 'SELECT provider_bound,commerce_managed FROM bags WHERE id=$1', [d.bagId]);
         if (bag.providerBound) fail('Use the provider-backed dispute workflow.', 409, 'PROVIDER_WORKFLOW_REQUIRED');
         const r = await first(tx, "UPDATE disputes SET status=$2,updated_at=$3 WHERE id=$1 RETURNING *", [disputeId, outcome, now()]);
         // A separate won dispute never implicitly releases a Bag with a lost
         // history, even after recovery: that needs the explicit audited release.
         const blockers = await first(tx, "SELECT (SELECT COUNT(*) FROM refunds WHERE bag_id=$1 AND status='proposed')::int + (SELECT COUNT(*) FROM disputes WHERE bag_id=$1 AND status IN ('needs_response','under_review','lost'))::int AS c", [d.bagId]);
         const brand = await first(tx, 'SELECT * FROM brands WHERE id=$1 FOR UPDATE', [d.brandId]);
-        if (outcome === 'won' && blockers.c === 0 && ['ready', 'live'].includes(brand?.status) && brand.connectionHealthy && await payoutProofReady(brand,domain,tx)) {
+        if (!bag.commerceManaged && outcome === 'won' && blockers.c === 0 && ['ready', 'live'].includes(brand?.status) && brand.connectionHealthy && await payoutProofReady(brand,domain,tx)) {
           await tx.query("UPDATE transfers SET status='scheduled' WHERE bag_id=$1 AND status='held'", [d.bagId]);
           await tx.query("UPDATE jobs SET status='scheduled' WHERE bag_id=$1 AND status='held' AND kind='sandbox_payout'", [d.bagId]);
         }
@@ -465,6 +469,7 @@ export function createConsole(db, { clock, domain, risk, secret, creditExpiryDay
         if (audit) { const prior = await replay(tx, audit); if (prior) return prior; }
         const t = await first(tx, 'SELECT * FROM transfers WHERE id=$1 FOR UPDATE', [transferId]); if (!t) fail('Transfer not found.', 404, 'NOT_FOUND');
         const s = await state(tx, t.bagId);
+        if (s.bag.commerceManaged) fail('Use commerce-managed settlement.', 409, 'COMMERCE_WORKFLOW_REQUIRED');
         if (t.status !== 'held') fail('Transfer is not held.', 409, 'NOT_HELD');
         const gate = eligibility(s);
         if (gate.holdReasons.length) fail(`Hold release blocked: ${gate.holdReasons.join(', ')}.`, 409, 'HOLD_BLOCKED');
@@ -484,13 +489,15 @@ export function createConsole(db, { clock, domain, risk, secret, creditExpiryDay
     },
     async retryStuck(transferId) {
       const t = await first(db, 'SELECT * FROM transfers WHERE id=$1', [transferId]); if (!t) fail('Transfer not found.', 404, 'NOT_FOUND');
+      if ((await first(db, 'SELECT commerce_managed FROM bags WHERE id=$1', [t.bagId]))?.commerceManaged)
+        fail('Use commerce-managed settlement.', 409, 'COMMERCE_WORKFLOW_REQUIRED');
       const r = await db.query("UPDATE jobs SET status='scheduled',due_at=$2 WHERE bag_id=$1 AND kind='sandbox_payout' AND status='failed' RETURNING id", [t.bagId, now()]);
       return { transferId, requeued: r.rows.length };
     },
     async scan() {
       const dash = await domain.dashboard();
       if (!dash.summary.ledgerBalanced) await alert('reconciliation', 'critical', null, 'Ledger journals are not balanced.', `ledger:${now().toISOString().slice(0, 10)}`);
-      const mismatches = await rows(db, 'SELECT b.id,b.transfer_cents,t.amount_cents FROM bags b JOIN transfers t ON t.bag_id=b.id WHERE b.transfer_cents<>t.amount_cents');
+      const mismatches = await rows(db, 'SELECT b.id,b.transfer_cents,t.amount_cents FROM bags b JOIN transfers t ON t.bag_id=b.id WHERE NOT b.commerce_managed AND b.transfer_cents<>t.amount_cents');
       for (const m of mismatches) await alert('reconciliation', 'high', m.id, `Bag transfer ${m.transferCents} ≠ transfer ${m.amountCents}.`, `transfer-mismatch:${m.id}`);
       for (const s of await con.stuckTransfers()) await alert('stuck_transfer', 'medium', s.transferId, `Transfer ${s.transferId} is overdue or its payout job failed.`, `stuck:${s.transferId}:${s.jobStatus || s.status}`);
       for (const d of await rows(db, "SELECT * FROM disputes WHERE status='needs_response' AND respond_by<$1", [new Date(now().getTime() + 2 * DAY)]))
@@ -508,7 +515,7 @@ export function createConsole(db, { clock, domain, risk, secret, creditExpiryDay
       for (const b of await rows(db, 'SELECT id FROM brands ORDER BY id')) {
         const check = await risk.brandPayoutCheck(b.id);
         if (enforce && !check.pass) {
-          const held = await db.query("UPDATE transfers SET status='held' WHERE brand_id=$1 AND status='scheduled' AND NOT EXISTS (SELECT 1 FROM bags WHERE bags.id=transfers.bag_id AND bags.provider_bound) RETURNING id", [b.id]);
+          const held = await db.query("UPDATE transfers SET status='held' WHERE brand_id=$1 AND status='scheduled' AND NOT EXISTS (SELECT 1 FROM bags WHERE bags.id=transfers.bag_id AND (bags.provider_bound OR bags.commerce_managed)) RETURNING id", [b.id]);
           await db.query("UPDATE jobs SET status='held' WHERE kind='sandbox_payout' AND status='scheduled' AND bag_id IN (SELECT bag_id FROM transfers WHERE brand_id=$1 AND status='held')", [b.id]);
           check.heldTransfers = held.rows.map(r => r.id);
           if (held.rows.length) await alert('payout_check', 'high', b.id, `Pre-payout check failed (${check.reasons.join(', ')}); ${held.rows.length} transfer(s) held.`, `payout-check:${b.id}:${now().toISOString().slice(0, 10)}`);
@@ -524,25 +531,69 @@ export function createConsole(db, { clock, domain, risk, secret, creditExpiryDay
 /** Reports: state sales-tax summary and brand annual payout (1099-K style) export. */
 export function createReports(db, { domain }) {
   const csv = (header, list) => [header.join(','), ...list.map(r => header.map(h => { const v = r[h] ?? ''; return /[",\n]/.test(String(v)) ? `"${String(v).replaceAll('"', '""')}"` : String(v); }).join(','))].join('\n');
+  const cents = value => Number.isSafeInteger(value) && value >= 0;
+  const emptyAllocation = () => ({ amount: 0, subtotal: 0, discount: 0, shipping: 0, tax: 0, commission: 0 });
+  // Commerce may refund a fully discounted unit with zero customer cash while
+  // reversing a real simulated payable/commission. Such an operation has no
+  // positive-amount refunds row. Its authoritative per-unit flags are required,
+  // rather than concluding "no refunds" from refunded_cents=0.
+  async function commerceRefundAllocation(bag, tx) {
+    const totals = emptyAllocation();
+    const invalid = () => ({ ...totals, complete: false, unallocated: Math.max(0, bag.refundedCents - totals.amount) });
+    const row = await first(tx, 'SELECT brand_id,model,allocation FROM commerce_bag_allocations WHERE bag_id=$1', [bag.id]);
+    const g = row?.allocation;
+    if (!g || row.brandId !== bag.brandId || !['partner', 'first_party'].includes(row.model)
+      || !Array.isArray(g.items) || !g.items.length || g.items.length > 100
+      || !cents(g.shippingCents) || !cents(g.shippingTaxCents)
+      || g.shippingCents !== bag.shippingCents || g.shippingRefunded !== undefined && typeof g.shippingRefunded !== 'boolean') return invalid();
+    const original = emptyAllocation();
+    for (const line of g.items) {
+      if (!Number.isSafeInteger(line.qty) || line.qty < 1 || line.qty > 100 || !Array.isArray(line.units) || line.units.length !== line.qty) return invalid();
+      let refundedQty = 0;
+      for (const unit of line.units) {
+        if (!['grossCents', 'discountCents', 'netCents', 'partnerDiscountCents', 'commissionCents', 'taxCents'].every(key => cents(unit?.[key]))
+          || typeof unit.refunded !== 'boolean' || unit.discountCents > unit.grossCents
+          || unit.netCents !== unit.grossCents - unit.discountCents || unit.partnerDiscountCents > unit.discountCents
+          || unit.commissionCents > unit.grossCents - unit.partnerDiscountCents) return invalid();
+        original.subtotal += unit.grossCents; original.discount += unit.discountCents;
+        original.commission += unit.commissionCents; original.tax += unit.taxCents;
+        if (unit.refunded) {
+          refundedQty++;
+          totals.subtotal += unit.grossCents; totals.discount += unit.discountCents;
+          totals.commission += unit.commissionCents; totals.tax += unit.taxCents;
+        }
+      }
+      if (refundedQty !== line.refundedQty) return invalid();
+    }
+    if (original.subtotal !== bag.subtotalCents || original.discount !== (bag.discountCents ?? 0)
+      || original.commission !== bag.commissionCents || original.tax + g.shippingTaxCents !== bag.taxCents) return invalid();
+    if (g.shippingRefunded) { totals.shipping = g.shippingCents; totals.tax += g.shippingTaxCents; }
+    totals.amount = totals.subtotal - totals.discount + totals.shipping + totals.tax;
+    const cash = await first(tx, "SELECT COALESCE(SUM(amount_cents),0)::bigint AS amount FROM refunds WHERE bag_id=$1 AND status='approved'", [bag.id]);
+    const complete = Object.values(totals).every(cents) && totals.amount === bag.refundedCents
+      && Number(cash.amount) === totals.amount && totals.tax <= bag.taxCents && totals.shipping <= bag.shippingCents;
+    return { ...totals, complete, unallocated: Math.max(0, bag.refundedCents - totals.amount) };
+  }
   // Refund components are persisted from the exact native refund allocation,
   // not inferred from Bag status or pro-rated from a cash total. Older partial
   // refunds without evidence must be reconciled, never silently reported as 0.
-  const refundAllocation = async bag => {
-    const refunds = await rows(db,"SELECT * FROM refunds WHERE bag_id=$1 AND status='approved'",[bag.id]);
-    const totals = { amount: 0, subtotal: 0, shipping: 0, tax: 0, commission: 0 };
+  const refundAllocation = async (bag, tx = db) => {
+    if (bag.commerceManaged) return commerceRefundAllocation(bag, tx);
+    const refunds = await rows(tx,"SELECT * FROM refunds WHERE bag_id=$1 AND status='approved'",[bag.id]);
+    const totals = emptyAllocation();
     let allocated = 0;
     for (const refund of refunds) {
       const parts = refund.amountCents===bag.totalCents && [refund.subtotalCents,refund.shippingCents,refund.taxCents,refund.commissionCents].every(v=>v==null)
-        ? { subtotalCents:bag.subtotalCents,shippingCents:bag.shippingCents,taxCents:bag.taxCents,commissionCents:bag.commissionCents }
-        : refund;
+        ? { subtotalCents:bag.subtotalCents,discountCents:bag.discountCents ?? 0,shippingCents:bag.shippingCents,taxCents:bag.taxCents,commissionCents:bag.commissionCents }
+        : { ...refund, discountCents: refund.discountCents ?? 0 };
       totals.amount += refund.amountCents;
-      if (![parts.subtotalCents,parts.shippingCents,parts.taxCents,parts.commissionCents].every(v=>Number.isSafeInteger(v) && v>=0)
-        || parts.subtotalCents+parts.shippingCents+parts.taxCents!==refund.amountCents || parts.commissionCents>parts.subtotalCents) continue;
+      if (![parts.subtotalCents,parts.discountCents,parts.shippingCents,parts.taxCents,parts.commissionCents].every(cents)
+        || parts.discountCents>parts.subtotalCents || parts.subtotalCents-parts.discountCents+parts.shippingCents+parts.taxCents!==refund.amountCents || parts.commissionCents>parts.subtotalCents) continue;
       allocated += refund.amountCents;
-      for (const key of ['subtotal','shipping','tax','commission']) totals[key] += parts[`${key}Cents`];
+      for (const key of ['subtotal','discount','shipping','tax','commission']) totals[key] += parts[`${key}Cents`];
     }
     const complete = totals.amount===bag.refundedCents && allocated===totals.amount
-      && totals.subtotal<=bag.subtotalCents && totals.shipping<=bag.shippingCents && totals.tax<=bag.taxCents && totals.commission<=bag.commissionCents;
+      && totals.subtotal<=bag.subtotalCents && totals.discount<=(bag.discountCents ?? 0) && totals.shipping<=bag.shippingCents && totals.tax<=bag.taxCents && totals.commission<=bag.commissionCents;
     return { ...totals,complete,unallocated:Math.max(0,bag.refundedCents-allocated) };
   };
   return {
@@ -550,45 +601,57 @@ export function createReports(db, { domain }) {
       const params = []; const where = [];
       if (from) { params.push(new Date(from)); where.push(`created_at>=$${params.length}`); }
       if (to) { params.push(new Date(to)); where.push(`created_at<$${params.length}`); }
-      const bags = await rows(db, `SELECT id FROM bags${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY created_at`, params);
+      const selected = await rows(db, `SELECT id FROM bags${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY created_at`, params);
+      // Domain owns address decryption. Only immutable region is used outside
+      // the report transaction; mutable money/flags are freshly read together.
+      const regions = new Map();
+      for (const { id: bagId } of selected) regions.set(bagId, (await domain.getBag(bagId)).shipTo?.region || 'UNKNOWN');
+      return db.transaction(async tx => {
+      const bags = selected.length ? await rows(tx, 'SELECT * FROM bags WHERE id=ANY($1::text[]) ORDER BY created_at', [selected.map(b => b.id)]) : [];
       const states = new Map();
-      for (const { id: bagId } of bags) {
-        const bag = await domain.getBag(bagId);
-        const st = bag.shipTo?.region || 'UNKNOWN';
-        const row = states.get(st) || { state: st, bags: 0, grossSalesCents: 0, shippingCents: 0, taxCollectedCents: 0, refundedCents: 0, taxRefundedCents: 0, refundedSalesCents: 0, refundedShippingCents: 0, refundAllocationComplete: true, unallocatedRefundCents: 0 };
-        row.bags += 1; row.grossSalesCents += bag.subtotalCents; row.shippingCents += bag.shippingCents; row.taxCollectedCents += bag.taxCents;
-        const allocation = await refundAllocation(bag);
-        row.refundedCents += bag.refundedCents; row.taxRefundedCents += allocation.tax; row.refundedSalesCents += allocation.subtotal; row.refundedShippingCents += allocation.shipping;
+      for (const bag of bags) {
+        const st = regions.get(bag.id);
+        const row = states.get(st) || { state: st, bags: 0, grossSalesCents: 0, discountCents: 0, shippingCents: 0, taxCollectedCents: 0, refundedCents: 0, taxRefundedCents: 0, refundedSalesCents: 0, refundedDiscountCents: 0, refundedShippingCents: 0, refundAllocationComplete: true, unallocatedRefundCents: 0 };
+        row.bags += 1; row.grossSalesCents += bag.subtotalCents; row.discountCents += bag.discountCents ?? 0; row.shippingCents += bag.shippingCents; row.taxCollectedCents += bag.taxCents;
+        const allocation = await refundAllocation(bag, tx);
+        row.refundedCents += bag.refundedCents; row.taxRefundedCents += allocation.tax; row.refundedSalesCents += allocation.subtotal; row.refundedDiscountCents += allocation.discount; row.refundedShippingCents += allocation.shipping;
         row.refundAllocationComplete &&= allocation.complete; row.unallocatedRefundCents += allocation.unallocated;
         states.set(st, row);
       }
-      const list = [...states.values()].map(r => ({ ...r, netSalesCents: r.refundAllocationComplete ? r.grossSalesCents - r.refundedSalesCents : null,
+      const list = [...states.values()].map(r => ({ ...r, netSalesCents: r.refundAllocationComplete ? r.grossSalesCents - r.discountCents - r.refundedSalesCents + r.refundedDiscountCents : null,
         netTaxCents: r.refundAllocationComplete ? r.taxCollectedCents - r.taxRefundedCents : null, reconciliationRequired: !r.refundAllocationComplete }))
         .sort((a, b) => a.state.localeCompare(b.state));
       return { from: from || null, to: to || null, states: list, note: 'Sandbox marketplace-facilitator summary by ship-to state; confirm nexus and filing with a tax advisor.',
-        csv: csv(['state', 'bags', 'grossSalesCents', 'shippingCents', 'taxCollectedCents', 'refundedCents', 'taxRefundedCents', 'refundedSalesCents', 'refundedShippingCents', 'netSalesCents', 'netTaxCents', 'refundAllocationComplete', 'unallocatedRefundCents', 'reconciliationRequired'], list) };
+        csv: csv(['state', 'bags', 'grossSalesCents', 'discountCents', 'shippingCents', 'taxCollectedCents', 'refundedCents', 'taxRefundedCents', 'refundedSalesCents', 'refundedDiscountCents', 'refundedShippingCents', 'netSalesCents', 'netTaxCents', 'refundAllocationComplete', 'unallocatedRefundCents', 'reconciliationRequired'], list) };
+      });
     },
     async brandAnnualPayouts(year, brandId) {
       const y = int(Number(year), 'year', 2000, 2100);
       const start = new Date(Date.UTC(y, 0, 1)); const end = new Date(Date.UTC(y + 1, 0, 1));
-      const brands = await rows(db, `SELECT id,name,stripe_account_id FROM brands${brandId ? ' WHERE id=$1' : ''} ORDER BY id`, brandId ? [brandId] : []);
+      return db.transaction(async tx => {
+      const brands = await rows(tx, `SELECT id,name,stripe_account_id FROM brands${brandId ? ' WHERE id=$1' : ''} ORDER BY id`, brandId ? [brandId] : []);
       const out = [];
+      let firstPartyExcluded = 0;
       for (const b of brands) {
-        const bags = await rows(db, 'SELECT * FROM bags WHERE brand_id=$1 AND created_at>=$2 AND created_at<$3', [b.id, start, end]);
-        const allocations = await Promise.all(bags.map(refundAllocation));
+        const allBags = await rows(tx, 'SELECT * FROM bags WHERE brand_id=$1 AND created_at>=$2 AND created_at<$3', [b.id, start, end]);
+        const excluded = allBags.filter(bag => bag.settlementModel === 'retail').length;
+        firstPartyExcluded += excluded;
+        const bags = allBags.filter(bag => bag.settlementModel !== 'retail');
+        const allocations = await Promise.all(bags.map(bag => refundAllocation(bag, tx)));
         const refundAllocationComplete = allocations.every(a=>a.complete);
         const monthly = Array(12).fill(0);
         for (const bag of bags) monthly[new Date(bag.createdAt).getUTCMonth()] += bag.totalCents;
-        const paid = await first(db, "SELECT COALESCE(SUM(amount_cents-reversed_cents),0)::int AS c FROM transfers WHERE brand_id=$1 AND status IN ('paid','reversed') AND paid_at>=$2 AND paid_at<$3", [b.id, start, end]);
+        const paid = await first(tx, "SELECT COALESCE(SUM(t.amount_cents-t.reversed_cents),0)::int AS c FROM transfers t JOIN bags b ON b.id=t.bag_id WHERE t.brand_id=$1 AND b.settlement_model='commission' AND t.status IN ('paid','reversed') AND t.paid_at>=$2 AND t.paid_at<$3", [b.id, start, end]);
         out.push({ brandId: b.id, brandName: b.name, connectedAccount: b.stripeAccountId || null, year: y,
           grossPaymentVolumeCents: bags.reduce((s, x) => s + x.totalCents, 0), transactionCount: bags.length,
           refundsCents: bags.reduce((s, x) => s + x.refundedCents, 0), commissionCents: refundAllocationComplete ? bags.reduce((s,x,i)=>s+x.commissionCents-allocations[i].commission,0) : null,
           refundAllocationComplete, reconciliationRequired: !refundAllocationComplete, unallocatedRefundCents: allocations.reduce((s,a)=>s+a.unallocated,0),
-          netTransfersPaidCents: paid.c, monthlyGrossCents: monthly });
+          firstPartyExcluded: excluded, netTransfersPaidCents: paid.c, monthlyGrossCents: monthly });
       }
-      const header = ['brandId', 'brandName', 'connectedAccount', 'year', 'grossPaymentVolumeCents', 'transactionCount', 'refundsCents', 'commissionCents', 'netTransfersPaidCents', 'refundAllocationComplete', 'unallocatedRefundCents', 'reconciliationRequired', ...Array.from({ length: 12 }, (_, i) => `m${String(i + 1).padStart(2, '0')}`)];
-      return { year: y, brands: out, note: '1099-K style data only. Under Stripe Connect, Stripe may file 1099-Ks for connected accounts; confirm responsibilities before filing.',
+      const header = ['brandId', 'brandName', 'connectedAccount', 'year', 'grossPaymentVolumeCents', 'transactionCount', 'refundsCents', 'commissionCents', 'netTransfersPaidCents', 'refundAllocationComplete', 'unallocatedRefundCents', 'reconciliationRequired', 'firstPartyExcluded', ...Array.from({ length: 12 }, (_, i) => `m${String(i + 1).padStart(2, '0')}`)];
+      return { year: y, brands: out, firstPartyExcluded, scope: 'partner_commission_only', note: '1099-K style data only; first-party retail is excluded. Under Stripe Connect, Stripe may file 1099-Ks for connected accounts; confirm responsibilities before filing.',
         csv: csv(header, out.map(r => ({ ...r, ...Object.fromEntries(r.monthlyGrossCents.map((v, i) => [`m${String(i + 1).padStart(2, '0')}`, v])) }))) };
+      });
     },
   };
 }

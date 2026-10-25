@@ -6,6 +6,8 @@ The owner-only three-store TEST cash lifecycle is now **completed**: one actual 
 
 The user chose **local-only testing**: no public tunnel is authorized or running. Local polling can reconcile checkout/Shopify changes; real webhook delivery and public OAuth callbacks remain untested. The isolated app test clock simulates the return-window hold, not provider/calendar time. Shipping notices use a simulated inbox, not external email delivery. Never point a tunnel at the owner dashboard on port 4317; the optional webhook-only proxy is not started automatically.
 
+The **Commerce & inventory** operations tab adds explicit Avafem-owned products with native variant stock, versioned commercial settings and a catalog-driven mixed-order simulation. Avafem handles owned-product fulfillment/returns and retains its retail proceeds without a partner transfer. Discounts, shipping funding, partner terms, return holds and canonical rewards are configurable in the backend; orders freeze their original allocations. This new mixed flow is a **local simulation**, separate from the existing actual-provider test harness. See [native commerce configuration, API workflow and remaining provider acceptance](docs/native-commerce.md).
+
 ## Run locally
 
 Requires Node.js **24 or newer** and npm. Run these commands from this project directory:
